@@ -9,7 +9,7 @@ an end-to-end audio fixture test.
 
 | Model | Upstream artifact | Native integration gap | Status |
 |---|---|---|---|
-| BSRNN | PyTorch implementations and checkpoints | Complex STFT band splitting, recurrent model port, and a stable redistributable speech-enhancement checkpoint | Researching |
+| BSRNN | [ESPnet VCTK+DEMAND xtiny checkpoint](https://huggingface.co/wyz/vctk_bsrnn_xtiny_causal) (CC-BY-4.0) | External conversion is required because upstream publishes PyTorch only | Implemented |
 | MP-SENet | [Official MIT repository](https://github.com/yxlu-0102/MP-SENet) with PyTorch checkpoints | Numerical parity and quality fixture for the converted graph | Adapter implemented |
 | MossFormer2 | [Official MIT repository](https://github.com/alibabasglab/MossFormer2), now directing users to ClearerVoice-Studio | Speech-enhancement checkpoint export, segmentation, and overlap reconstruction | Researching |
 | SGMSE+ | [Official MIT repository](https://github.com/sp-uhh/sgmse) with PyTorch Lightning checkpoints | Complex STFT transforms plus an iterative predictor/corrector or ODE sampler; it is not a one-pass waveform graph | Researching |
@@ -56,6 +56,36 @@ by phase wrapping in low-energy FFT bins across the two FFT implementations.
 On the repository's synthetic tone-plus-noise fixture, the converted VoiceBank
 model improved global SNR from `-0.01 dB` to `0.24 dB`; this manual result is not
 yet the automated speech-quality gate required for completion.
+
+## BSRNN adapter
+
+The `bsrnn` feature implements the causal ESPnet BSRNN frontend and inference
+contract at 48 kHz: per-channel sample-standard-deviation normalization,
+centered 960-point periodic-Hann STFT with a 480-sample hop, whole-utterance
+recurrent inference, inverse STFT, de-normalization, and exact input channel
+count/rate/duration restoration. `scripts/export-bsrnn.py` converts the pinned
+`wyz/vctk_bsrnn_xtiny_causal` checkpoint into a dynamic-frame
+`[1, frames, 481, 2]` ONNX graph and can verify it against PyTorch using ONNX
+Runtime.
+
+The model revision is `59e1f2263b7946b1970a222d1beef9adc5a67eaa`, the
+checkpoint SHA-256 is
+`e3cb771a452e0503144af74720b476e81b57f518b789b37ba2c253c6cc22d70b`,
+and the reference architecture is pinned to Apache-2.0 ESPnet revision
+`5208894ceaa534732164212357b63d83dd137eab`. The model is CC-BY-4.0 and the
+adapted reference implementation is Apache-2.0; denoize does not bundle its
+weights.
+
+On the fixed 67-frame numerical fixture, PyTorch and ONNX Runtime correlation
+was `0.999999999998` (MSE `1.88e-11`, maximum absolute error `2.34e-4`). On the
+same fixture's PyTorch and Rust waveforms, after the CLI's documented PCM
+clipping and quantization, correlated at `0.99999999958` (MSE `2.18e-10`,
+maximum absolute error `1.85e-4`). On the pinned two-second Apache-2.0 ESPnet
+speech fixture, the Rust end-to-end quality gate improved SI-SNR from
+`2.719 dB` to `9.612 dB` (`+6.892 dB`). A release build on the reference x86-64
+Linux host processed it in 1.58 seconds (1.3x realtime) with 44,628 KiB maximum
+RSS. The model is about 2.4 MiB; memory and latency grow with utterance length
+because upstream inference is recurrent and whole-utterance.
 
 ## Completion gates
 

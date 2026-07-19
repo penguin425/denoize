@@ -15,7 +15,7 @@ fn usage() -> String {
         "\
 denoize {VERSION} — pure-Rust audio denoiser engineered for the world's highest sound quality
 
-Classical DSP + optional AI backends (RNNoise, DeepFilterNet v3, MP-SENet).
+Classical DSP + optional AI backends (RNNoise, DeepFilterNet v3, MP-SENet, BSRNN).
 Input: WAV, MP3, M4A (built-in Pure Rust decode).
 Output: WAV, MP3 (shine-rs), M4A (oxideav-aac Pure-Rust AAC-LC).
 
@@ -61,6 +61,7 @@ BACKENDS (build with --features full for all):
     deepfilter  DeepFilterNet v3 (requires --features deepfilter)
     onnx        External waveform ONNX model (requires --features onnx)
     mpsenet     MP-SENet magnitude/phase model (requires --features mpsenet)
+    bsrnn       ESPnet BSRNN spectral model (requires --features bsrnn)
 
 PRESETS:
     hifi        Flagship transparency: OMLSA + protections + advanced DSP

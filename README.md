@@ -25,6 +25,7 @@ preserving timbre, transients, dynamics, stereo imaging, and natural "air".
 | `deepfilter` | `--features deepfilter` | DeepFilterNet v3 (tract ONNX, embedded model) |
 | `onnx` | `--features onnx` | External waveform-to-waveform ONNX model (tract, Pure Rust) |
 | `mpsenet` | `--features mpsenet` | MP-SENet magnitude/phase enhancement adapter (external converted model) |
+| `bsrnn` | `--features bsrnn` | ESPnet BSRNN spectral enhancement adapter (external converted model) |
 
 Build everything: `cargo build --release --features full`
 
@@ -34,7 +35,8 @@ models; spectral models and diffusion samplers require dedicated adapters.
 
 > The prebuilt GitHub binaries include every backend. Because DeepFilterNet
 > 0.5.6 is not available from crates.io, the crates.io package's `full` feature
-> currently includes RNNoise, generic ONNX, and MP-SENet, but not DeepFilterNet.
+> currently includes RNNoise, generic ONNX, MP-SENet, and BSRNN, but not
+> DeepFilterNet.
 
 ## Supported input formats
 
@@ -65,6 +67,10 @@ denoize noisy.wav clean.wav -b onnx \
 # Official MP-SENet checkpoint converted with scripts/export-mpsenet.py
 denoize noisy.wav clean.wav -b mpsenet \
   --onnx-model mp-senet-vb.onnx --onnx-rate 16000
+
+# ESPnet BSRNN xtiny checkpoint converted with scripts/export-bsrnn.py
+denoize noisy.wav clean.wav -b bsrnn \
+  --onnx-model bsrnn-xtiny.onnx --onnx-rate 48000
 ```
 
 To prepare the pinned official MP-SENet VoiceBank model:
@@ -77,6 +83,36 @@ python3 scripts/export-mpsenet.py \
   --repo MP-SENet \
   --checkpoint MP-SENet/best_ckpt/g_best_vb \
   --output mp-senet-vb.onnx
+```
+
+To prepare the pinned ESPnet BSRNN xtiny model (CC-BY-4.0):
+
+```sh
+curl -L \
+  'https://huggingface.co/wyz/vctk_bsrnn_xtiny_causal/resolve/59e1f2263b7946b1970a222d1beef9adc5a67eaa/exp_vctk/enh_train_enh_bsrnn_xtiny_raw/58epoch.pth' \
+  -o 58epoch.pth
+echo 'e3cb771a452e0503144af74720b476e81b57f518b789b37ba2c253c6cc22d70b  58epoch.pth' \
+  | sha256sum -c -
+python3 -m pip install torch onnx onnxruntime
+python3 scripts/export-bsrnn.py \
+  --checkpoint 58epoch.pth \
+  --output bsrnn-xtiny.onnx \
+  --verify
+```
+
+The adapter resamples to 48 kHz and reproduces the published model's
+variance normalization, centered 960-point Hann STFT with a 480-sample hop,
+whole-utterance recurrent inference, and inverse STFT. The converted model is
+about 2.4 MiB. On a release build on the project reference x86-64 Linux host,
+the fixed two-second regression fixture took 1.58 seconds (1.3x realtime) and
+used 44,628 KiB maximum RSS. Runtime and memory grow with utterance length.
+
+Run the reproducible real-speech quality gate after conversion:
+
+```sh
+python3 scripts/validate-bsrnn.py \
+  --denoize target/release/denoize \
+  --model bsrnn-xtiny.onnx
 ```
 
 ## Quick start
@@ -179,7 +215,7 @@ denoise_file_with_backend("noisy.wav", "clean.wav", cfg, Backend::DeepFilter)?;
 | 4 | Multiband / nonlinear SpecSub | ✅ |
 | 5 | Perceptual weighting + musical-noise PF | ✅ |
 | 6 | Pure-Rust external ONNX inference foundation | 🟨 waveform contract implemented |
-| 7 | BSRNN / MP-SENet / MossFormer2 adapters | 🔲 Model-specific preprocessing/export |
+| 7 | BSRNN / MP-SENet / MossFormer2 adapters | 🟨 BSRNN implemented; MP-SENet partial; MossFormer2 researching |
 | 8 | SGMSE+ | 🔲 Diffusion sampler + score-model port |
 
 See [ROADMAP.md](ROADMAP.md) for the implementation audit and the acceptance
@@ -187,4 +223,5 @@ criteria for marking each named model complete.
 
 ## License
 
-MIT.
+The Rust project is MIT licensed. See [THIRD_PARTY.md](THIRD_PARTY.md) for the
+Apache-2.0 BSRNN conversion code and CC-BY-4.0 model attribution.

@@ -25,9 +25,12 @@ include = [
     "Cargo.lock",
     "LICENSE",
     "README.md",
+    "THIRD_PARTY.md",
     "src/**/*.rs",
     "examples/**/*.rs",
     "scripts/export-mpsenet.py",
+    "scripts/export-bsrnn.py",
+    "scripts/validate-bsrnn.py",
 ]
 
 [lib]
@@ -53,18 +56,19 @@ default = []
 rnnoise = ["dep:nnnoiseless"]
 onnx = ["dep:tract-onnx"]
 mpsenet = ["onnx", "dep:rustfft"]
-full = ["rnnoise", "onnx", "mpsenet"]
+bsrnn = ["onnx", "dep:rustfft"]
+full = ["rnnoise", "onnx", "mpsenet", "bsrnn"]
 
 [dev-dependencies]
 prost = "0.11"
 
 [package.metadata.docs.rs]
-features = ["rnnoise", "mpsenet"]
+features = ["rnnoise", "mpsenet", "bsrnn"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [
-    'cfg(feature, values("deepfilter", "m4a-encode", "onnx", "mpsenet"))',
+    'cfg(feature, values("deepfilter", "m4a-encode", "onnx", "mpsenet", "bsrnn"))',
 ] }
 
 [profile.release]
