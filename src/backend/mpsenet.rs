@@ -5,7 +5,7 @@
 //! STFT, normalization, phase reconstruction, and duration preservation happen
 //! in Rust so the runtime does not depend on Python or PyTorch.
 
-use super::{onnx::resample_linear, OnnxModelConfig};
+use super::OnnxModelConfig;
 use rustfft::{num_complex::Complex32, FftPlanner};
 use tract_onnx::prelude::*;
 
@@ -51,7 +51,7 @@ fn process_channel(
         return Ok(Vec::new());
     }
 
-    let at_model_rate = resample_linear(input, input_sample_rate, MODEL_RATE);
+    let at_model_rate = crate::resample::resample(input, input_sample_rate, MODEL_RATE)?;
     let energy: f64 = at_model_rate.iter().map(|sample| sample * sample).sum();
     if energy <= f64::EPSILON {
         return Ok(vec![0.0; input.len()]);
@@ -66,7 +66,7 @@ fn process_channel(
         .iter()
         .map(|sample| *sample as f64 / normalization)
         .collect();
-    let at_input_rate = resample_linear(&denormalized, MODEL_RATE, input_sample_rate);
+    let at_input_rate = crate::resample::resample(&denormalized, MODEL_RATE, input_sample_rate)?;
     let mut output = at_input_rate;
     output.truncate(input.len());
     output.resize(input.len(), 0.0);

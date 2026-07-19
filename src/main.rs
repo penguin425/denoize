@@ -1,10 +1,10 @@
 //! `denoize` command-line interface.
 
-use denoize::audio::read_audio;
+use denoize::audio::{read_audio, read_wav_bytes, write_audio, write_wav_bytes};
 use denoize::denoiser::{DenoiserConfig, Preset};
 use denoize::{
-    denoise_file_with_backend_config, Algorithm, Backend, BackendOptions, EncodeOptions,
-    OnnxModelConfig, WindowType,
+    denoise_audio_with_backend_config, Algorithm, Backend, BackendOptions, ChannelMode,
+    EncodeOptions, OnnxModelConfig, SgmseProfile, WindowType,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -16,11 +16,12 @@ fn usage() -> String {
 denoize {VERSION} — pure-Rust audio denoiser engineered for the world's highest sound quality
 
 Classical DSP + optional AI backends (RNNoise, DeepFilterNet v3, MP-SENet, BSRNN).
-Input: WAV, MP3, M4A (built-in Pure Rust decode).
-Output: WAV, MP3 (shine-rs), M4A (oxideav-aac Pure-Rust AAC-LC).
+Input/output: WAV, FLAC, Ogg Opus, MP3, M4A (built in; no ffmpeg).
 
 USAGE:
-    denoize <INPUT> <OUTPUT.wav|mp3|m4a> [OPTIONS]
+    denoize <INPUT> <OUTPUT.wav|flac|opus|ogg|mp3|m4a> [OPTIONS]
+    denoize models <list|install|verify|path> [MODEL]
+    denoize metrics <REFERENCE> <TEST> [--json|--markdown]
 
 OPTIONS:
     -b, --backend <NAME>     {backends}  (default: classical)
@@ -52,6 +53,11 @@ OPTIONS:
         --m4a-bitrate <KBPS> M4A/AAC CBR bitrate (default: 192)
         --onnx-model <PATH>   waveform ONNX model (required for -b onnx)
         --onnx-rate <HZ>      ONNX model sample rate (default: 16000)
+        --channels <MODE>     independent|linked|mid-side (default: independent)
+        --sgmse-profile <P>   fast|balanced|quality (default: balanced)
+        --batch               process files in INPUT directory into OUTPUT directory
+        --force               allow replacing existing output files
+        --json                emit a machine-readable result
     -h, --help               show this help
     -V, --version            show version
 
@@ -64,6 +70,7 @@ BACKENDS (build with --features full for all):
     bsrnn       ESPnet BSRNN spectral model (requires --features bsrnn)
     mossformer2 ClearerVoice MossFormer2 model (requires --features mossformer2)
     sgmse       SGMSE+ diffusion model (requires --features sgmse)
+    gtcrn       Official low-complexity streaming GTCRN (requires --features gtcrn)
 
 PRESETS:
     hifi        Flagship transparency: OMLSA + protections + advanced DSP
@@ -73,7 +80,7 @@ PRESETS:
     )
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Overrides {
     backend: Option<Backend>,
     algorithm: Option<Algorithm>,
@@ -104,6 +111,11 @@ struct Overrides {
     m4a_bitrate_kbps: Option<u32>,
     onnx_model: Option<String>,
     onnx_sample_rate: Option<u32>,
+    channel_mode: Option<ChannelMode>,
+    sgmse_profile: Option<SgmseProfile>,
+    batch: bool,
+    force: bool,
+    json: bool,
 }
 
 fn parse_value<T>(args: &[String], i: &mut usize, flag: &str) -> Result<T, String>
@@ -191,6 +203,34 @@ fn parse_args(args: &[String]) -> Result<(String, String, Overrides), String> {
             "--m4a-bitrate" => ov.m4a_bitrate_kbps = Some(parse_value(args, &mut i, a)?),
             "--onnx-model" => ov.onnx_model = Some(parse_value(args, &mut i, a)?),
             "--onnx-rate" => ov.onnx_sample_rate = Some(parse_value(args, &mut i, a)?),
+            "--channels" => {
+                let mode: String = parse_value(args, &mut i, a)?;
+                ov.channel_mode = Some(ChannelMode::parse(&mode).ok_or_else(|| {
+                    format!(
+                        "unknown channel mode: {mode} (expected independent, linked, or mid-side)"
+                    )
+                })?);
+            }
+            "--sgmse-profile" => {
+                let profile: String = parse_value(args, &mut i, a)?;
+                ov.sgmse_profile = Some(SgmseProfile::parse(&profile).ok_or_else(|| {
+                    format!(
+                        "unknown SGMSE profile: {profile} (expected fast, balanced, or quality)"
+                    )
+                })?);
+            }
+            "--batch" => ov.batch = true,
+            "--force" => ov.force = true,
+            "--json" => ov.json = true,
+            "-" => {
+                if input.is_none() {
+                    input = Some(a.clone());
+                } else if output.is_none() {
+                    output = Some(a.clone());
+                } else {
+                    return Err("unexpected extra argument: -".into());
+                }
+            }
             other if other.starts_with('-') => {
                 return Err(format!("unknown option: {other}"));
             }
@@ -371,14 +411,39 @@ fn print_report(input: &str, audio: &denoize::Audio, cfg: &DenoiserConfig, backe
 }
 
 fn run(args: &[String]) -> Result<(), String> {
+    if args.first().map(String::as_str) == Some("models") {
+        return run_models(&args[1..]);
+    }
+    if args.first().map(String::as_str) == Some("metrics") {
+        return run_metrics(&args[1..]);
+    }
     let (input, output, ov) = parse_args(args)?;
-    let audio = read_audio(&input)?;
+    if ov.batch {
+        return run_batch(&input, &output, &ov);
+    }
+    run_one(&input, &output, ov)
+}
+
+fn run_one(input: &str, output: &str, ov: Overrides) -> Result<(), String> {
+    let mut audio = if input == "-" {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::stdin(), &mut bytes)
+            .map_err(|error| format!("failed to read stdin: {error}"))?;
+        read_wav_bytes(bytes)?
+    } else {
+        read_audio(input)?
+    };
     let cfg = build_config(&ov, audio.sample_rate);
     let backend = ov.backend.unwrap_or(Backend::Classical);
 
     if ov.report {
-        print_report(&input, &audio, &cfg, backend);
+        print_report(input, &audio, &cfg, backend);
         return Ok(());
+    }
+    if output != "-" && std::path::Path::new(output).exists() && !ov.force {
+        return Err(format!(
+            "output already exists: {output} (use --force to replace it)"
+        ));
     }
 
     let mut enc = EncodeOptions::default();
@@ -389,13 +454,146 @@ fn run(args: &[String]) -> Result<(), String> {
         enc.m4a_bitrate_bps = kbps.saturating_mul(1000);
     }
 
-    let backend_options = BackendOptions {
+    #[allow(unused_mut)]
+    let mut backend_options = BackendOptions {
         onnx: ov.onnx_model.map(|path| OnnxModelConfig {
             path: path.into(),
             sample_rate: ov.onnx_sample_rate.unwrap_or(16_000),
         }),
+        channel_mode: ov.channel_mode.unwrap_or_default(),
+        sgmse_profile: ov.sgmse_profile.unwrap_or_default(),
     };
-    denoise_file_with_backend_config(&input, &output, cfg, backend, enc, backend_options)?;
+    #[cfg(feature = "gtcrn")]
+    if backend == Backend::Gtcrn && backend_options.onnx.is_none() {
+        let model = denoize::models::find("gtcrn").expect("built-in GTCRN manifest entry");
+        backend_options.onnx = Some(OnnxModelConfig {
+            path: denoize::models::verify(model).map_err(|_| {
+                "GTCRN model is not installed; run `denoize models install gtcrn`".to_string()
+            })?,
+            sample_rate: model.sample_rate,
+        });
+    }
+    let elapsed = denoise_audio_with_backend_config(&mut audio, cfg, backend, &backend_options)?;
+    if output == "-" {
+        let bytes = write_wav_bytes(&audio)?;
+        std::io::Write::write_all(&mut std::io::stdout(), &bytes)
+            .map_err(|error| format!("failed to write stdout: {error}"))?;
+    } else {
+        let output_path = std::path::Path::new(output);
+        let filename = output_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or("invalid output filename")?;
+        let temporary = output_path.with_file_name(format!(".denoize-{filename}.part"));
+        // Preserve the real codec extension on the temporary file.
+        let temporary = temporary.with_extension(
+            output_path
+                .extension()
+                .and_then(|x| x.to_str())
+                .unwrap_or("wav"),
+        );
+        if let Err(error) = write_audio(&temporary, &audio, enc) {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error);
+        }
+        if output_path.exists() {
+            std::fs::remove_file(output_path).map_err(|e| format!("replace output: {e}"))?;
+        }
+        std::fs::rename(&temporary, output_path).map_err(|e| format!("commit output: {e}"))?;
+        if ov.json {
+            println!("{{\"input\":{:?},\"output\":{:?},\"backend\":{:?},\"channels\":{},\"frames\":{},\"sample_rate\":{},\"elapsed_ms\":{:.3}}}", input, output, format!("{backend:?}").to_ascii_lowercase(), audio.channels(), audio.frames(), audio.sample_rate, elapsed.as_secs_f64() * 1000.0);
+        }
+    }
+    Ok(())
+}
+
+fn run_batch(input: &str, output: &str, ov: &Overrides) -> Result<(), String> {
+    let input_dir = std::path::Path::new(input);
+    let output_dir = std::path::Path::new(output);
+    if !input_dir.is_dir() {
+        return Err(format!("batch input is not a directory: {input}"));
+    }
+    std::fs::create_dir_all(output_dir).map_err(|e| format!("create batch output: {e}"))?;
+    let mut files: Vec<_> = std::fs::read_dir(input_dir)
+        .map_err(|e| format!("read batch input: {e}"))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .and_then(|x| x.to_str())
+                .map(|x| {
+                    matches!(
+                        x.to_ascii_lowercase().as_str(),
+                        "wav" | "mp3" | "m4a" | "flac" | "opus" | "ogg"
+                    )
+                })
+                .unwrap_or(false)
+        })
+        .collect();
+    files.sort();
+    if files.is_empty() {
+        return Err("batch input contains no supported audio files".into());
+    }
+    for (index, path) in files.iter().enumerate() {
+        let destination = output_dir.join(path.file_name().ok_or("invalid batch filename")?);
+        eprintln!(
+            "denoize: batch {}/{} {}",
+            index + 1,
+            files.len(),
+            path.display()
+        );
+        let mut options = ov.clone();
+        options.batch = false;
+        run_one(
+            &path.to_string_lossy(),
+            &destination.to_string_lossy(),
+            options,
+        )?;
+    }
+    Ok(())
+}
+
+fn run_metrics(args: &[String]) -> Result<(), String> {
+    let reference = args.first().ok_or("metrics requires REFERENCE and TEST")?;
+    let test = args.get(1).ok_or("metrics requires REFERENCE and TEST")?;
+    let report =
+        denoize::benchmark::BenchmarkReport::compare(&read_audio(reference)?, &read_audio(test)?)?;
+    if args.iter().any(|argument| argument == "--json") {
+        println!("{}", report.json());
+    } else {
+        println!("{}", report.markdown());
+    }
+    Ok(())
+}
+
+fn run_models(args: &[String]) -> Result<(), String> {
+    let command = args.first().map(String::as_str).unwrap_or("list");
+    if command == "list" {
+        println!("NAME\tBACKEND\tRATE\tLICENSE\tSTATUS");
+        for model in denoize::models::MODELS {
+            let status = if denoize::models::verify(model).is_ok() {
+                "installed"
+            } else {
+                "not-installed"
+            };
+            println!(
+                "{}\t{}\t{}\t{}\t{}",
+                model.name, model.backend, model.sample_rate, model.license, status
+            );
+        }
+        return Ok(());
+    }
+    let name = args
+        .get(1)
+        .ok_or_else(|| format!("models {command} requires MODEL"))?;
+    let model = denoize::models::find(name)
+        .ok_or_else(|| format!("unknown model: {name} (run `denoize models list`)"))?;
+    match command {
+        "install" => println!("{}", denoize::models::install(model)?.display()),
+        "verify" => println!("verified {}", denoize::models::verify(model)?.display()),
+        "path" => println!("{}", denoize::models::path(model)?.display()),
+        _ => return Err(format!("unknown models command: {command}")),
+    }
     Ok(())
 }
 

@@ -1,7 +1,7 @@
 //! RNNoise backend via `nnnoiseless` (pure-Rust port of Xiph RNNoise).
 //!
-//! Operates at 48 kHz, 480-sample frames. Other sample rates are linearly
-//! resampled.
+//! Operates at 48 kHz, 480-sample frames. Other sample rates are converted with
+//! a band-limited FFT resampler.
 
 use nnnoiseless::DenoiseState;
 
@@ -26,7 +26,7 @@ fn process_channel(input: &[f64], sample_rate: u32) -> Result<Vec<f64>, String> 
     let at_48k: Vec<f32> = if sample_rate == RN_SR {
         input.iter().map(|&x| (x as f32) * 32768.0).collect()
     } else {
-        resample_linear(input, sample_rate, RN_SR)
+        crate::resample::resample(input, sample_rate, RN_SR)?
             .into_iter()
             .map(|x| (x as f32) * 32768.0)
             .collect()
@@ -54,7 +54,7 @@ fn process_channel(input: &[f64], sample_rate: u32) -> Result<Vec<f64>, String> 
     let result = if sample_rate == RN_SR {
         normalized
     } else {
-        resample_linear_f64(&normalized, RN_SR, sample_rate)
+        crate::resample::resample(&normalized, RN_SR, sample_rate)?
     };
 
     // Match input length.
@@ -64,28 +64,6 @@ fn process_channel(input: &[f64], sample_rate: u32) -> Result<Vec<f64>, String> 
         trimmed.resize(input.len(), 0.0);
     }
     Ok(trimmed)
-}
-
-fn resample_linear(input: &[f64], from_sr: u32, to_sr: u32) -> Vec<f64> {
-    if from_sr == to_sr {
-        return input.to_vec();
-    }
-    let ratio = to_sr as f64 / from_sr as f64;
-    let out_len = (input.len() as f64 * ratio).round() as usize;
-    let mut out = Vec::with_capacity(out_len.max(1));
-    for i in 0..out_len {
-        let src = i as f64 / ratio;
-        let idx = src.floor() as usize;
-        let frac = src - idx as f64;
-        let a = input.get(idx).copied().unwrap_or(0.0);
-        let b = input.get(idx + 1).copied().unwrap_or(a);
-        out.push(a + frac * (b - a));
-    }
-    out
-}
-
-fn resample_linear_f64(input: &[f64], from_sr: u32, to_sr: u32) -> Vec<f64> {
-    resample_linear(input, from_sr, to_sr)
 }
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 [package]
 name = "denoize"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 authors = ["denoize"]
 description = "Pure-Rust audio denoiser for the world's highest sound quality. Classical DSP + optional RNNoise / DeepFilterNet backends."
@@ -34,6 +34,14 @@ shine-rs = "0.1.3"
 oxideav-aac = "0.1.6"
 oxideav-aac-encoder = { git = "https://github.com/OxideAV/oxideav-aac", rev = "e8113d5", package = "oxideav-aac", optional = true }
 mp4 = "0.14.0"
+rubato = "0.16.2"
+sha2 = "0.10.9"
+ureq = { version = "2.12.1", features = ["tls"] }
+claxon = "0.4.3"
+flacenc = "0.5.1"
+opus = "0.3.1"
+ogg = "0.9.2"
+rayon = "1.11.0"
 
 [features]
 default = ["m4a-encode"]
@@ -44,8 +52,9 @@ mpsenet = ["onnx", "dep:rustfft"]
 bsrnn = ["onnx", "dep:rustfft"]
 mossformer2 = ["onnx", "dep:rustfft", "dep:kaldi-native-fbank"]
 sgmse = ["onnx", "dep:rustfft"]
+gtcrn = ["onnx", "dep:rustfft"]
 m4a-encode = ["dep:oxideav-aac-encoder"]
-full = ["rnnoise", "deepfilter", "onnx", "mpsenet", "bsrnn", "mossformer2", "sgmse", "m4a-encode"]
+full = ["rnnoise", "deepfilter", "onnx", "mpsenet", "bsrnn", "mossformer2", "sgmse", "gtcrn", "m4a-encode"]
 
 [dev-dependencies]
 prost = "0.11"
@@ -61,5 +70,5 @@ strip = true
 opt-level = 1
 
 [package.metadata.docs.rs]
-features = ["rnnoise", "mpsenet", "bsrnn", "mossformer2", "sgmse"]
+features = ["rnnoise", "mpsenet", "bsrnn", "mossformer2", "sgmse", "gtcrn"]
 rustdoc-args = ["--cfg", "docsrs"]

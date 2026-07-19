@@ -28,6 +28,7 @@ preserving timbre, transients, dynamics, stereo imaging, and natural "air".
 | `bsrnn` | `--features bsrnn` | ESPnet BSRNN spectral enhancement adapter (external converted model) |
 | `mossformer2` | `--features mossformer2` | ClearerVoice MossFormer2 48 kHz mask adapter (external converted model) |
 | `sgmse` | `--features sgmse` | SGMSE+ iterative diffusion adapter (external converted model) |
+| `gtcrn` | `--features gtcrn` | Official 48K-parameter causal GTCRN; offline and stateful streaming |
 
 Build everything: `cargo build --release --features full`
 
@@ -47,6 +48,8 @@ models; spectral models and diffusion samplers require dedicated adapters.
 | WAV | `hound` | 8–32 bit int / float |
 | MP3 | `nanomp3` (Pure Rust) | ID3 skip, no resampling |
 | M4A/AAC | `oxideav-aac` (Pure Rust) | MP4 demux + AAC-LC decode |
+| FLAC | `claxon` | Lossless FLAC |
+| Ogg Opus | `opus` + `ogg` | Mono/stereo; native 48 kHz decode |
 
 ### Output formats
 
@@ -55,6 +58,8 @@ models; spectral models and diffusion samplers require dedicated adapters.
 | WAV | `hound` | Lossless; preserves bit depth |
 | MP3 | `shine-rs` (Pure Rust) | `--mp3-bitrate` (default 192 kbps) |
 | M4A | `oxideav-aac` + MP4 mux | GitHub/source builds; `--m4a-bitrate` (default 192 kbps) |
+| FLAC | `flacenc` | Lossless, pure Rust |
+| Ogg Opus | `opus` + `ogg` | 128 kbps, mono/stereo |
 
 ```sh
 # MP3 / M4A input and output — no manual ffmpeg conversion
@@ -80,7 +85,17 @@ denoize noisy.wav clean.wav -b mossformer2 \
 
 # Official SGMSE+ VoiceBank model (30-step quality sampler)
 denoize noisy.wav clean.wav -b sgmse \
-  --onnx-model sgmse-vb.onnx --onnx-rate 16000
+  --onnx-model sgmse-vb.onnx --onnx-rate 16000 --sgmse-profile quality
+
+# Verified official GTCRN model (manual model path is unnecessary afterwards)
+denoize models install gtcrn
+denoize noisy.wav clean.wav -b gtcrn
+
+# Stereo coupling, pipes, metrics, and directory batches
+denoize stereo.wav clean.flac --channels linked
+cat noisy.wav | denoize - - > clean.wav
+denoize metrics reference.wav clean.wav --json
+denoize recordings/ cleaned/ --batch
 ```
 
 To prepare the pinned official MP-SENet VoiceBank model:
