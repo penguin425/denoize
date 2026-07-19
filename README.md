@@ -24,6 +24,7 @@ preserving timbre, transients, dynamics, stereo imaging, and natural "air".
 | `rnnoise` | `--features rnnoise` | RNNoise via nnnoiseless (pure-Rust) |
 | `deepfilter` | `--features deepfilter` | DeepFilterNet v3 (tract ONNX, embedded model) |
 | `onnx` | `--features onnx` | External waveform-to-waveform ONNX model (tract, Pure Rust) |
+| `mpsenet` | `--features mpsenet` | MP-SENet magnitude/phase enhancement adapter (external converted model) |
 
 Build everything: `cargo build --release --features full`
 
@@ -33,7 +34,7 @@ models; spectral models and diffusion samplers require dedicated adapters.
 
 > The prebuilt GitHub binaries include every backend. Because DeepFilterNet
 > 0.5.6 is not available from crates.io, the crates.io package's `full` feature
-> currently includes RNNoise but not DeepFilterNet.
+> currently includes RNNoise, generic ONNX, and MP-SENet, but not DeepFilterNet.
 
 ## Supported input formats
 
@@ -60,6 +61,22 @@ denoize noisy.wav clean.wav --mp3-bitrate 320
 # User-supplied waveform model: [1, samples] or [1, 1, samples]
 denoize noisy.wav clean.wav -b onnx \
   --onnx-model model.onnx --onnx-rate 16000
+
+# Official MP-SENet checkpoint converted with scripts/export-mpsenet.py
+denoize noisy.wav clean.wav -b mpsenet \
+  --onnx-model mp-senet-vb.onnx --onnx-rate 16000
+```
+
+To prepare the pinned official MP-SENet VoiceBank model:
+
+```sh
+git clone https://github.com/yxlu-0102/MP-SENet.git
+git -C MP-SENet checkout 89932cfe90d1dacb8e170e4a331d762462c21792
+python3 -m pip install torch onnx onnxscript pesq joblib matplotlib
+python3 scripts/export-mpsenet.py \
+  --repo MP-SENet \
+  --checkpoint MP-SENet/best_ckpt/g_best_vb \
+  --output mp-senet-vb.onnx
 ```
 
 ## Quick start

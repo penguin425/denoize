@@ -116,7 +116,7 @@ fn tract_error(error: impl std::fmt::Display) -> String {
     format!("ONNX inference failed: {error:#}")
 }
 
-fn resample_linear(input: &[f64], from_rate: u32, to_rate: u32) -> Vec<f64> {
+pub(super) fn resample_linear(input: &[f64], from_rate: u32, to_rate: u32) -> Vec<f64> {
     if input.is_empty() || from_rate == to_rate {
         return input.to_vec();
     }

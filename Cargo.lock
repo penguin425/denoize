@@ -185,6 +185,7 @@ dependencies = [
  "oxideav-aac 0.1.6 (registry+https://github.com/rust-lang/crates.io-index)",
  "oxideav-aac 0.1.6 (git+https://github.com/OxideAV/oxideav-aac?rev=e8113d5)",
  "prost",
+ "rustfft",
  "shine-rs",
  "tract-onnx",
 ]

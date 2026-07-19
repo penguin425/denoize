@@ -20,6 +20,9 @@ pub enum Backend {
     /// User-supplied waveform-to-waveform ONNX model (pure-Rust tract runtime).
     #[cfg(feature = "onnx")]
     Onnx,
+    /// MP-SENet magnitude/phase speech enhancement model.
+    #[cfg(feature = "mpsenet")]
+    MpSenet,
 }
 
 /// Configuration for a waveform-to-waveform ONNX enhancement model.
@@ -48,12 +51,16 @@ impl Backend {
             "deepfilter" | "deepfilternet" | "dfn" | "dfn3" => Backend::DeepFilter,
             #[cfg(feature = "onnx")]
             "onnx" | "model" => Backend::Onnx,
+            #[cfg(feature = "mpsenet")]
+            "mpsenet" | "mp-senet" | "mp_senet" => Backend::MpSenet,
             #[cfg(not(feature = "rnnoise"))]
             "rnnoise" | "rnn" => return None,
             #[cfg(not(feature = "deepfilter"))]
             "deepfilter" | "deepfilternet" | "dfn" | "dfn3" => return None,
             #[cfg(not(feature = "onnx"))]
             "onnx" | "model" => return None,
+            #[cfg(not(feature = "mpsenet"))]
+            "mpsenet" | "mp-senet" | "mp_senet" => return None,
             _ => return None,
         })
     }
@@ -67,6 +74,8 @@ impl Backend {
             "deepfilter",
             #[cfg(feature = "onnx")]
             "onnx",
+            #[cfg(feature = "mpsenet")]
+            "mpsenet",
         ]
     }
 }
@@ -94,6 +103,13 @@ pub fn process_channels(
             })?;
             onnx::process(channels, sample_rate, config)
         }
+        #[cfg(feature = "mpsenet")]
+        Backend::MpSenet => {
+            let config = backend_options.onnx.as_ref().ok_or_else(|| {
+                "MP-SENet backend requires a converted model (CLI: --onnx-model <PATH>)".to_string()
+            })?;
+            mpsenet::process(channels, sample_rate, config)
+        }
     }
 }
 
@@ -105,3 +121,18 @@ pub mod deepfilter;
 
 #[cfg(feature = "onnx")]
 pub mod onnx;
+
+#[cfg(feature = "mpsenet")]
+pub mod mpsenet;
+
+#[cfg(all(test, feature = "mpsenet"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_mp_senet_aliases() {
+        assert_eq!(Backend::parse("mpsenet"), Some(Backend::MpSenet));
+        assert_eq!(Backend::parse("mp-senet"), Some(Backend::MpSenet));
+        assert!(Backend::available_names().contains(&"mpsenet"));
+    }
+}
