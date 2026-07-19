@@ -19,3 +19,16 @@ as real-valued ONNX operations, and exports a dynamic-frame graph.
 Apache-2.0 license text: <https://www.apache.org/licenses/LICENSE-2.0>
 
 CC-BY-4.0 license text: <https://creativecommons.org/licenses/by/4.0/legalcode>
+
+## ClearerVoice MossFormer2
+
+`scripts/export-mossformer2.py` loads the MossFormer2 speech-enhancement
+architecture from [`modelscope/ClearerVoice-Studio`](https://github.com/modelscope/ClearerVoice-Studio)
+revision `6b3774dc79c46ae8bed2a4fa5f706f0ac8c75c61`. The upstream code and the
+`alibabasglab/MossFormer2_SE_48K` model revision
+`eff8c97925c8bec812af707814b3e5d777fd4503` are distributed under the Apache
+License 2.0. Model weights are not included in denoize.
+
+The converter fixes the deployment graph to the official four-second feature
+window and rewrites ONNX operations to numerically equivalent tract-supported
+primitives. No upstream source code is copied into the Rust adapter.
