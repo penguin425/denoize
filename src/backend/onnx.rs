@@ -8,6 +8,7 @@
 //! dedicated adapter and are deliberately rejected by this backend.
 
 use super::OnnxModelConfig;
+use rayon::prelude::*;
 use tract_onnx::prelude::*;
 use tract_onnx::tract_hir::infer::Factoid;
 
@@ -26,30 +27,33 @@ pub fn process(
         ));
     }
 
-    channels
-        .iter()
-        .map(|channel| process_channel(channel, input_sample_rate, config))
+    if channels.is_empty() {
+        return Ok(Vec::new());
+    }
+    let model_inputs =
+        crate::resample::resample_channels(channels, input_sample_rate, config.sample_rate)?;
+    if model_inputs[0].is_empty() {
+        return Ok(model_inputs);
+    }
+    let (model, shape) = load_model(model_inputs[0].len(), config)?;
+    model_inputs
+        .par_iter()
+        .zip(channels.par_iter())
+        .map(|(model_input, original)| {
+            let model_output = run_model(model_input, &shape, &model)?;
+            let mut output =
+                crate::resample::resample(&model_output, config.sample_rate, input_sample_rate)?;
+            output.truncate(original.len());
+            output.resize(original.len(), 0.0);
+            Ok(output)
+        })
         .collect()
 }
 
-fn process_channel(
-    input: &[f64],
-    input_sample_rate: u32,
+fn load_model(
+    input_len: usize,
     config: &OnnxModelConfig,
-) -> Result<Vec<f64>, String> {
-    if input.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let model_input = resample_linear(input, input_sample_rate, config.sample_rate);
-    let model_output = run_model(&model_input, config)?;
-    let mut output = resample_linear(&model_output, config.sample_rate, input_sample_rate);
-    output.truncate(input.len());
-    output.resize(input.len(), 0.0);
-    Ok(output)
-}
-
-fn run_model(input: &[f64], config: &OnnxModelConfig) -> Result<Vec<f64>, String> {
+) -> Result<(TypedRunnableModel<TypedModel>, TVec<usize>), String> {
     let mut model = tract_onnx::onnx()
         .model_for_path(&config.path)
         .map_err(|e| format!("failed to load ONNX model {}: {e}", config.path.display()))?;
@@ -68,8 +72,8 @@ fn run_model(input: &[f64], config: &OnnxModelConfig) -> Result<Vec<f64>, String
         .concretize()
         .ok_or_else(|| "ONNX model input rank must be known".to_string())?;
     let shape: TVec<usize> = match rank {
-        2 => tvec!(1, input.len()),
-        3 => tvec!(1, 1, input.len()),
+        2 => tvec!(1, input_len),
+        3 => tvec!(1, 1, input_len),
         other => {
             return Err(format!(
                 "unsupported ONNX input rank {other}; expected [batch, samples] or [batch, channels, samples]"
@@ -87,6 +91,14 @@ fn run_model(input: &[f64], config: &OnnxModelConfig) -> Result<Vec<f64>, String
         .into_optimized()
         .and_then(|model| model.into_runnable())
         .map_err(tract_error)?;
+    Ok((runnable, shape))
+}
+
+fn run_model(
+    input: &[f64],
+    shape: &[usize],
+    runnable: &TypedRunnableModel<TypedModel>,
+) -> Result<Vec<f64>, String> {
     let samples: Vec<f32> = input.iter().map(|&sample| sample as f32).collect();
     let tensor = Tensor::from_shape(&shape, &samples).map_err(tract_error)?;
     let outputs = runnable
@@ -116,24 +128,6 @@ fn tract_error(error: impl std::fmt::Display) -> String {
     format!("ONNX inference failed: {error:#}")
 }
 
-pub(super) fn resample_linear(input: &[f64], from_rate: u32, to_rate: u32) -> Vec<f64> {
-    if input.is_empty() || from_rate == to_rate {
-        return input.to_vec();
-    }
-    let ratio = to_rate as f64 / from_rate as f64;
-    let output_len = (input.len() as f64 * ratio).round() as usize;
-    (0..output_len)
-        .map(|index| {
-            let source = index as f64 / ratio;
-            let left = source.floor() as usize;
-            let fraction = source - left as f64;
-            let a = input.get(left).copied().unwrap_or(0.0);
-            let b = input.get(left + 1).copied().unwrap_or(a);
-            a + fraction * (b - a)
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,8 +150,8 @@ mod tests {
     #[test]
     fn round_trip_resampling_preserves_requested_length() {
         let input: Vec<f64> = (0..441).map(|index| index as f64 / 441.0).collect();
-        let at_16k = resample_linear(&input, 44_100, 16_000);
-        let restored = resample_linear(&at_16k, 16_000, 44_100);
+        let at_16k = crate::resample::resample(&input, 44_100, 16_000).unwrap();
+        let restored = crate::resample::resample(&at_16k, 16_000, 44_100).unwrap();
         assert_eq!(at_16k.len(), 160);
         assert_eq!(restored.len(), input.len());
     }

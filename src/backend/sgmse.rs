@@ -5,7 +5,7 @@
 //! official 16 kHz complex-STFT frontend and the quality-oriented 30-step
 //! OUVE predictor/corrector sampler without a Python runtime.
 
-use super::{onnx::resample_linear, OnnxModelConfig};
+use super::{OnnxModelConfig, SgmseProfile};
 use rustfft::{num_complex::Complex32, FftPlanner};
 use tract_onnx::prelude::*;
 
@@ -19,7 +19,6 @@ const THETA: f32 = 1.5;
 const SIGMA_MIN: f32 = 0.05;
 const SIGMA_MAX: f32 = 0.5;
 const EPSILON: f32 = 0.03;
-const STEPS: usize = 30;
 const CORRECTOR_SNR: f32 = 0.5;
 const DEFAULT_SEED: u64 = 0x5347_4d53_452b_0030;
 
@@ -27,6 +26,7 @@ pub fn process(
     channels: &[Vec<f64>],
     input_sample_rate: u32,
     config: &OnnxModelConfig,
+    profile: SgmseProfile,
 ) -> Result<Vec<Vec<f64>>, String> {
     if config.sample_rate != MODEL_RATE {
         return Err(format!(
@@ -44,7 +44,8 @@ pub fn process(
         return Ok(Vec::new());
     }
 
-    let model_samples = resample_linear(&channels[0], input_sample_rate, MODEL_RATE).len();
+    let model_samples =
+        crate::resample::resample(&channels[0], input_sample_rate, MODEL_RATE)?.len();
     if model_samples == 0 {
         return Ok(channels.iter().map(|_| Vec::new()).collect());
     }
@@ -59,6 +60,7 @@ pub fn process(
                 input_sample_rate,
                 frames,
                 DEFAULT_SEED.wrapping_add(index as u64),
+                profile.steps(),
                 &model,
             )
         })
@@ -70,12 +72,13 @@ fn process_channel(
     input_sample_rate: u32,
     expected_frames: usize,
     seed: u64,
+    steps: usize,
     model: &TypedRunnableModel<TypedModel>,
 ) -> Result<Vec<f64>, String> {
     if input.is_empty() {
         return Ok(Vec::new());
     }
-    let at_model_rate = resample_linear(input, input_sample_rate, MODEL_RATE);
+    let at_model_rate = crate::resample::resample(input, input_sample_rate, MODEL_RATE)?;
     let normalization = at_model_rate
         .iter()
         .map(|sample| sample.abs())
@@ -94,7 +97,7 @@ fn process_channel(
             noisy.frames
         ));
     }
-    let enhanced = sample(&noisy.values, noisy.frames, seed, |state, time| {
+    let enhanced = sample(&noisy.values, noisy.frames, seed, steps, |state, time| {
         run_score_model(state, &noisy.values, noisy.frames, time, model)
     })?;
     let reconstructed = istft(&enhanced, noisy.frames, normalized.len())?;
@@ -102,7 +105,7 @@ fn process_channel(
         .into_iter()
         .map(|sample| sample as f64 * normalization)
         .collect();
-    let mut output = resample_linear(&denormalized, MODEL_RATE, input_sample_rate);
+    let mut output = crate::resample::resample(&denormalized, MODEL_RATE, input_sample_rate)?;
     output.truncate(input.len());
     output.resize(input.len(), 0.0);
     Ok(output)
@@ -198,6 +201,7 @@ fn sample<F>(
     noisy: &[Complex32],
     frames: usize,
     seed: u64,
+    steps: usize,
     mut score: F,
 ) -> Result<Vec<Complex32>, String>
 where
@@ -210,10 +214,13 @@ where
         .map(|value| *value + rng.complex_normal() * prior_std)
         .collect();
     let mut final_mean = state.clone();
-    for index in 0..STEPS {
-        let time = 1.0 - (1.0 - EPSILON) * index as f32 / (STEPS - 1) as f32;
-        let next_time = if index + 1 < STEPS {
-            1.0 - (1.0 - EPSILON) * (index + 1) as f32 / (STEPS - 1) as f32
+    if steps < 2 {
+        return Err("SGMSE+ requires at least two diffusion steps".into());
+    }
+    for index in 0..steps {
+        let time = 1.0 - (1.0 - EPSILON) * index as f32 / (steps - 1) as f32;
+        let next_time = if index + 1 < steps {
+            1.0 - (1.0 - EPSILON) * (index + 1) as f32 / (steps - 1) as f32
         } else {
             0.0
         };
@@ -444,7 +451,7 @@ mod tests {
     fn sampler_is_deterministic_for_a_fixed_seed() {
         let noisy = vec![Complex32::new(0.1, -0.2); 17];
         let run = || {
-            sample(&noisy, 64, 42, |state, _| {
+            sample(&noisy, 64, 42, 30, |state, _| {
                 Ok(vec![Complex32::default(); state.len()])
             })
             .unwrap()
@@ -456,12 +463,12 @@ mod tests {
     fn sampler_uses_sixty_score_evaluations() {
         let noisy = vec![Complex32::default(); 3];
         let mut evaluations = 0;
-        sample(&noisy, 64, 7, |state, _| {
+        sample(&noisy, 64, 7, 30, |state, _| {
             evaluations += 1;
             Ok(vec![Complex32::default(); state.len()])
         })
         .unwrap();
-        assert_eq!(evaluations, 2 * STEPS);
+        assert_eq!(evaluations, 60);
     }
 
     #[test]

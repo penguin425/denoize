@@ -5,7 +5,7 @@
 //! centered periodic-Hann 960-point STFT, whole-utterance inference, inverse
 //! STFT, sample-rate conversion, and exact duration restoration.
 
-use super::{onnx::resample_linear, OnnxModelConfig};
+use super::OnnxModelConfig;
 use rustfft::{num_complex::Complex32, FftPlanner};
 use tract_onnx::prelude::*;
 
@@ -35,7 +35,8 @@ pub fn process(
         return Ok(Vec::new());
     }
 
-    let model_samples = resample_linear(&channels[0], input_sample_rate, MODEL_RATE).len();
+    let model_samples =
+        crate::resample::resample(&channels[0], input_sample_rate, MODEL_RATE)?.len();
     if model_samples == 0 {
         return Ok(channels.iter().map(|_| Vec::new()).collect());
     }
@@ -56,7 +57,7 @@ fn process_channel(
     if input.is_empty() {
         return Ok(Vec::new());
     }
-    let at_model_rate = resample_linear(input, input_sample_rate, MODEL_RATE);
+    let at_model_rate = crate::resample::resample(input, input_sample_rate, MODEL_RATE)?;
     let mean = at_model_rate.iter().sum::<f64>() / at_model_rate.len() as f64;
     let variance = if at_model_rate.len() > 1 {
         at_model_rate
@@ -88,7 +89,7 @@ fn process_channel(
         .iter()
         .map(|sample| *sample as f64 * standard_deviation)
         .collect();
-    let mut output = resample_linear(&denormalized, MODEL_RATE, input_sample_rate);
+    let mut output = crate::resample::resample(&denormalized, MODEL_RATE, input_sample_rate)?;
     output.truncate(input.len());
     output.resize(input.len(), 0.0);
     Ok(output)

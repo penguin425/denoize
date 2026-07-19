@@ -32,6 +32,9 @@ pub enum Backend {
     /// SGMSE+ diffusion speech enhancement model.
     #[cfg(feature = "sgmse")]
     Sgmse,
+    /// Official streaming GTCRN speech enhancement model.
+    #[cfg(feature = "gtcrn")]
+    Gtcrn,
 }
 
 /// Configuration for a waveform-to-waveform ONNX enhancement model.
@@ -43,11 +46,66 @@ pub struct OnnxModelConfig {
     pub sample_rate: u32,
 }
 
+/// How a stereo pair is presented to a denoising backend.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ChannelMode {
+    /// Process channels separately (legacy behavior).
+    #[default]
+    Independent,
+    /// Estimate one common correction from the stereo mid signal and apply it
+    /// equally to left and right. This preserves the side signal exactly.
+    StereoLinked,
+    /// Transform left/right to mid/side, denoise both, then reconstruct.
+    MidSide,
+}
+
+impl ChannelMode {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "independent" | "separate" => Some(Self::Independent),
+            "linked" | "stereo-linked" | "stereo_linked" => Some(Self::StereoLinked),
+            "mid-side" | "midside" | "ms" => Some(Self::MidSide),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SgmseProfile {
+    Fast,
+    #[default]
+    Balanced,
+    Quality,
+}
+
+impl SgmseProfile {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "fast" => Some(Self::Fast),
+            "balanced" | "default" => Some(Self::Balanced),
+            "quality" | "high" => Some(Self::Quality),
+            _ => None,
+        }
+    }
+    #[cfg(feature = "sgmse")]
+    pub(crate) fn steps(self) -> usize {
+        match self {
+            Self::Fast => 8,
+            Self::Balanced => 20,
+            Self::Quality => 30,
+        }
+    }
+}
+
 /// Options used by backends that require external model configuration.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BackendOptions {
     /// Model configuration used by the `onnx` backend when that feature is enabled.
     pub onnx: Option<OnnxModelConfig>,
+    /// Stereo channel coupling strategy.
+    pub channel_mode: ChannelMode,
+    /// SGMSE+ diffusion budget.
+    pub sgmse_profile: SgmseProfile,
 }
 
 impl Backend {
@@ -68,6 +126,8 @@ impl Backend {
             "mossformer2" | "moss-former2" | "mossformer" => Backend::Mossformer2,
             #[cfg(feature = "sgmse")]
             "sgmse" | "sgmse+" | "sgmse-plus" => Backend::Sgmse,
+            #[cfg(feature = "gtcrn")]
+            "gtcrn" => Backend::Gtcrn,
             #[cfg(not(feature = "rnnoise"))]
             "rnnoise" | "rnn" => return None,
             #[cfg(not(feature = "deepfilter"))]
@@ -82,6 +142,8 @@ impl Backend {
             "mossformer2" | "moss-former2" | "mossformer" => return None,
             #[cfg(not(feature = "sgmse"))]
             "sgmse" | "sgmse+" | "sgmse-plus" => return None,
+            #[cfg(not(feature = "gtcrn"))]
+            "gtcrn" => return None,
             _ => return None,
         })
     }
@@ -103,12 +165,108 @@ impl Backend {
             "mossformer2",
             #[cfg(feature = "sgmse")]
             "sgmse",
+            #[cfg(feature = "gtcrn")]
+            "gtcrn",
         ]
     }
 }
 
 /// Process all channels with the selected backend.
 pub fn process_channels(
+    backend: Backend,
+    channels: &[Vec<f64>],
+    sample_rate: u32,
+    classical_cfg: &crate::denoiser::DenoiserConfig,
+    backend_options: &BackendOptions,
+) -> Result<Vec<Vec<f64>>, String> {
+    if channels.len() == 2 && backend_options.channel_mode != ChannelMode::Independent {
+        return process_stereo(
+            backend,
+            channels,
+            sample_rate,
+            classical_cfg,
+            backend_options,
+        );
+    }
+    process_channels_independent(
+        backend,
+        channels,
+        sample_rate,
+        classical_cfg,
+        backend_options,
+    )
+}
+
+fn process_stereo(
+    backend: Backend,
+    channels: &[Vec<f64>],
+    sample_rate: u32,
+    classical_cfg: &crate::denoiser::DenoiserConfig,
+    backend_options: &BackendOptions,
+) -> Result<Vec<Vec<f64>>, String> {
+    if channels[0].len() != channels[1].len() {
+        return Err("stereo channels must contain the same number of frames".into());
+    }
+    let mid: Vec<f64> = channels[0]
+        .iter()
+        .zip(&channels[1])
+        .map(|(left, right)| (left + right) * 0.5)
+        .collect();
+    match backend_options.channel_mode {
+        ChannelMode::StereoLinked => {
+            let enhanced = process_channels_independent(
+                backend,
+                std::slice::from_ref(&mid),
+                sample_rate,
+                classical_cfg,
+                backend_options,
+            )?
+            .pop()
+            .unwrap_or_default();
+            let mut result = channels.to_vec();
+            let (left_channels, right_channels) = result.split_at_mut(1);
+            for ((left, right), (original, clean)) in left_channels[0]
+                .iter_mut()
+                .zip(&mut right_channels[0])
+                .zip(mid.iter().zip(enhanced.iter()))
+            {
+                let correction = clean - original;
+                *left += correction;
+                *right += correction;
+            }
+            Ok(result)
+        }
+        ChannelMode::MidSide => {
+            let side: Vec<f64> = channels[0]
+                .iter()
+                .zip(&channels[1])
+                .map(|(left, right)| (left - right) * 0.5)
+                .collect();
+            let processed = process_channels_independent(
+                backend,
+                &[mid, side],
+                sample_rate,
+                classical_cfg,
+                backend_options,
+            )?;
+            Ok(vec![
+                processed[0]
+                    .iter()
+                    .zip(&processed[1])
+                    .map(|(mid, side)| mid + side)
+                    .collect(),
+                processed[0]
+                    .iter()
+                    .zip(&processed[1])
+                    .map(|(mid, side)| mid - side)
+                    .collect(),
+            ])
+        }
+        ChannelMode::Independent => unreachable!(),
+    }
+}
+
+fn process_channels_independent(
     backend: Backend,
     channels: &[Vec<f64>],
     sample_rate: u32,
@@ -157,7 +315,15 @@ pub fn process_channels(
             let config = backend_options.onnx.as_ref().ok_or_else(|| {
                 "SGMSE+ backend requires a converted model (CLI: --onnx-model <PATH>)".to_string()
             })?;
-            sgmse::process(channels, sample_rate, config)
+            sgmse::process(channels, sample_rate, config, backend_options.sgmse_profile)
+        }
+        #[cfg(feature = "gtcrn")]
+        Backend::Gtcrn => {
+            let config = backend_options.onnx.as_ref().ok_or_else(|| {
+                "GTCRN backend requires the official streaming model (CLI: --onnx-model <PATH>)"
+                    .to_string()
+            })?;
+            gtcrn::process(channels, sample_rate, config)
         }
     }
 }
@@ -182,6 +348,56 @@ pub mod mossformer2;
 
 #[cfg(feature = "sgmse")]
 pub mod sgmse;
+
+#[cfg(feature = "gtcrn")]
+pub mod gtcrn;
+
+#[cfg(test)]
+mod channel_tests {
+    use super::*;
+
+    #[test]
+    fn parses_channel_modes() {
+        assert_eq!(
+            ChannelMode::parse("linked"),
+            Some(ChannelMode::StereoLinked)
+        );
+        assert_eq!(ChannelMode::parse("mid-side"), Some(ChannelMode::MidSide));
+        assert_eq!(
+            ChannelMode::parse("independent"),
+            Some(ChannelMode::Independent)
+        );
+    }
+
+    #[test]
+    fn stereo_linked_preserves_the_side_signal() {
+        let frames = 4_096;
+        let left: Vec<f64> = (0..frames)
+            .map(|i| (i as f64 * 0.013).sin() * 0.4)
+            .collect();
+        let right: Vec<f64> = (0..frames)
+            .map(|i| (i as f64 * 0.017).sin() * 0.3)
+            .collect();
+        let input = vec![left, right];
+        let options = BackendOptions {
+            channel_mode: ChannelMode::StereoLinked,
+            ..BackendOptions::default()
+        };
+        let output = process_channels(
+            Backend::Classical,
+            &input,
+            48_000,
+            &crate::denoiser::DenoiserConfig::default(48_000),
+            &options,
+        )
+        .unwrap();
+        for index in 0..frames {
+            let before = input[0][index] - input[1][index];
+            let after = output[0][index] - output[1][index];
+            assert!((before - after).abs() < 1e-12);
+        }
+    }
+}
 
 #[cfg(all(
     test,

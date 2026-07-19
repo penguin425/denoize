@@ -14,6 +14,7 @@
 
 mod m4a;
 mod mp3;
+mod opus;
 mod pcm;
 
 pub use pcm::DecodedPcm;
@@ -24,6 +25,8 @@ use std::path::Path;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AudioFormat {
     Wav,
+    Flac,
+    OggOpus,
     Mp3,
     M4a,
     /// AAC in ADTS (.aac) — not yet supported.
@@ -37,6 +40,12 @@ impl AudioFormat {
         if header.len() >= 12 {
             if &header[0..4] == b"RIFF" && header.len() >= 12 && &header[8..12] == b"WAVE" {
                 return AudioFormat::Wav;
+            }
+            if &header[0..4] == b"fLaC" {
+                return AudioFormat::Flac;
+            }
+            if &header[0..4] == b"OggS" {
+                return AudioFormat::OggOpus;
             }
             if &header[4..8] == b"ftyp" {
                 return AudioFormat::M4a;
@@ -61,6 +70,8 @@ impl AudioFormat {
             .as_deref()
         {
             Some("wav") => AudioFormat::Wav,
+            Some("flac") => AudioFormat::Flac,
+            Some("opus" | "ogg") => AudioFormat::OggOpus,
             Some("mp3") => AudioFormat::Mp3,
             Some("m4a" | "m4b" | "m4p" | "mp4") => AudioFormat::M4a,
             Some("aac") => AudioFormat::AacAdts,
@@ -71,6 +82,8 @@ impl AudioFormat {
     pub fn extensions(self) -> &'static [&'static str] {
         match self {
             AudioFormat::Wav => &["wav"],
+            AudioFormat::Flac => &["flac"],
+            AudioFormat::OggOpus => &["opus", "ogg"],
             AudioFormat::Mp3 => &["mp3"],
             AudioFormat::M4a => &["m4a", "m4b", "mp4", "aac"],
             AudioFormat::AacAdts => &["aac"],
@@ -86,6 +99,8 @@ pub fn decode_file(path: &Path) -> Result<DecodedPcm, String> {
 
     match fmt {
         AudioFormat::Wav => decode_wav(path),
+        AudioFormat::Flac => decode_flac(path),
+        AudioFormat::OggOpus => opus::decode_ogg_opus(path),
         AudioFormat::Mp3 => mp3::decode_mp3_file(path),
         AudioFormat::M4a => m4a::decode_m4a(path),
         AudioFormat::AacAdts => Err("ADTS .aac not yet supported; convert to M4A or WAV".into()),
@@ -94,6 +109,22 @@ pub fn decode_file(path: &Path) -> Result<DecodedPcm, String> {
             path.display()
         )),
     }
+}
+
+fn decode_flac(path: &Path) -> Result<DecodedPcm, String> {
+    let mut reader = claxon::FlacReader::open(path).map_err(|e| format!("FLAC open: {e}"))?;
+    let info = reader.streaminfo();
+    let channels = info.channels as usize;
+    let scale = 1.0 / (1_u64 << (info.bits_per_sample - 1)) as f64;
+    let mut output = vec![Vec::new(); channels];
+    for (index, sample) in reader.samples().enumerate() {
+        output[index % channels]
+            .push(sample.map_err(|e| format!("FLAC decode: {e}"))? as f64 * scale);
+    }
+    Ok(DecodedPcm {
+        sample_rate: info.sample_rate,
+        channels: output,
+    })
 }
 
 fn read_header(path: &Path, n: usize) -> Result<Vec<u8>, String> {

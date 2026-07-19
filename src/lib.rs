@@ -33,20 +33,26 @@
 
 pub mod audio;
 pub mod backend;
+pub mod benchmark;
 pub mod bessel;
 pub mod decode;
 pub mod denoiser;
 pub mod encode;
 pub mod fft;
 pub mod gain;
+pub mod models;
 pub mod noise;
 pub mod perceptual;
 pub mod postfilter;
+pub mod resample;
 pub mod stft;
+pub mod stream;
 pub mod window;
 
-pub use audio::{read_audio, read_wav, write_audio, write_wav, Audio};
-pub use backend::{Backend, BackendOptions, OnnxModelConfig};
+pub use audio::{
+    read_audio, read_wav, read_wav_bytes, write_audio, write_wav, write_wav_bytes, Audio,
+};
+pub use backend::{Backend, BackendOptions, ChannelMode, OnnxModelConfig, SgmseProfile};
 pub use decode::{decode_file, AudioFormat, DecodedPcm};
 pub use denoiser::{Denoiser, DenoiserConfig, Preset};
 pub use encode::{EncodeOptions, OutputFormat};
@@ -102,7 +108,7 @@ where
 pub fn denoise_file_with_backend_config<P1, P2>(
     input: P1,
     output: P2,
-    mut config: DenoiserConfig,
+    config: DenoiserConfig,
     backend: Backend,
     encode_opts: EncodeOptions,
     backend_options: BackendOptions,
@@ -112,6 +118,19 @@ where
     P2: AsRef<std::path::Path>,
 {
     let mut audio = read_audio(input)?;
+    denoise_audio_with_backend_config(&mut audio, config, backend, &backend_options)?;
+    write_audio(output, &audio, encode_opts)?;
+    Ok(audio)
+}
+
+/// Process already-decoded audio in place. This is the path used by stdin and
+/// embedders that do not have filesystem-backed input.
+pub fn denoise_audio_with_backend_config(
+    audio: &mut Audio,
+    mut config: DenoiserConfig,
+    backend: Backend,
+    backend_options: &BackendOptions,
+) -> Result<std::time::Duration, String> {
     config.sample_rate = audio.sample_rate;
     let t0 = std::time::Instant::now();
     audio.channels = backend::process_channels(
@@ -119,10 +138,9 @@ where
         &audio.channels,
         audio.sample_rate,
         &config,
-        &backend_options,
+        backend_options,
     )?;
     let elapsed = t0.elapsed();
-    write_audio(output, &audio, encode_opts)?;
     eprintln!(
         "denoize: {:?} | {}ch x {} frames ({:.2}s) in {:.2?} ({:.1}x realtime)",
         backend,
@@ -132,5 +150,5 @@ where
         elapsed,
         (audio.frames() as f64 / audio.sample_rate as f64) / elapsed.as_secs_f64().max(1e-9),
     );
-    Ok(audio)
+    Ok(elapsed)
 }

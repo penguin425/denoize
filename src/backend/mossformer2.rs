@@ -5,7 +5,7 @@
 //! official four-second segmentation, 40 ms/8 ms frontend, non-centred
 //! symmetric-Hamming STFT, mask application, and edge-discard stitching.
 
-use super::{onnx::resample_linear, OnnxModelConfig};
+use super::OnnxModelConfig;
 use kaldi_native_fbank::{
     mel::MelOptions, FbankComputer, FbankOptions, FrameOptions, OnlineFeature,
 };
@@ -58,7 +58,7 @@ fn process_channel(
     if input.is_empty() {
         return Ok(Vec::new());
     }
-    let at_model_rate = resample_linear(input, input_sample_rate, MODEL_RATE);
+    let at_model_rate = crate::resample::resample(input, input_sample_rate, MODEL_RATE)?;
     let original_model_length = at_model_rate.len();
     let padded_length = segmentation_length(original_model_length);
     let mut padded = at_model_rate;
@@ -90,7 +90,7 @@ fn process_channel(
         .iter()
         .map(|sample| *sample as f64 / 32_768.0)
         .collect();
-    let mut output = resample_linear(&enhanced, MODEL_RATE, input_sample_rate);
+    let mut output = crate::resample::resample(&enhanced, MODEL_RATE, input_sample_rate)?;
     output.truncate(input.len());
     output.resize(input.len(), 0.0);
     Ok(output)

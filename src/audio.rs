@@ -58,7 +58,17 @@ pub fn read_audio<P: AsRef<std::path::Path>>(path: P) -> Result<Audio, String> {
 
 /// Read a WAV file into de-interleaved `f64` channels.
 pub fn read_wav<P: AsRef<std::path::Path>>(path: P) -> Result<Audio, String> {
-    let mut reader = WavReader::open(&path).map_err(|e| format!("open: {e}"))?;
+    let reader = WavReader::open(&path).map_err(|e| format!("open: {e}"))?;
+    read_wav_reader(reader)
+}
+
+/// Read WAV data supplied by a pipe or another in-memory source.
+pub fn read_wav_bytes(bytes: Vec<u8>) -> Result<Audio, String> {
+    let reader = WavReader::new(std::io::Cursor::new(bytes)).map_err(|e| format!("open: {e}"))?;
+    read_wav_reader(reader)
+}
+
+fn read_wav_reader<R: std::io::Read>(mut reader: WavReader<R>) -> Result<Audio, String> {
     let spec = reader.spec();
     let nchan = spec.channels as usize;
     if nchan == 0 {
@@ -121,7 +131,26 @@ pub fn write_audio<P: AsRef<std::path::Path>>(
 /// Write an [`Audio`] to a WAV file, preserving its bit depth / format.
 pub fn write_wav<P: AsRef<std::path::Path>>(path: P, audio: &Audio) -> Result<(), String> {
     let spec = audio.wav_spec();
-    let mut writer = WavWriter::create(path, spec).map_err(|e| format!("create: {e}"))?;
+    let writer = WavWriter::create(path, spec).map_err(|e| format!("create: {e}"))?;
+    write_wav_writer(writer, audio)
+}
+
+/// Encode a complete WAV into memory for stdout and network transports.
+pub fn write_wav_bytes(audio: &Audio) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    {
+        let cursor = std::io::Cursor::new(&mut bytes);
+        let writer =
+            WavWriter::new(cursor, audio.wav_spec()).map_err(|e| format!("create: {e}"))?;
+        write_wav_writer(writer, audio)?;
+    }
+    Ok(bytes)
+}
+
+fn write_wav_writer<W: std::io::Write + std::io::Seek>(
+    mut writer: WavWriter<W>,
+    audio: &Audio,
+) -> Result<(), String> {
     let nchan = audio.channels();
     let frames = audio.frames();
 
