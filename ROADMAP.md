@@ -12,7 +12,7 @@ an end-to-end audio fixture test.
 | BSRNN | [ESPnet VCTK+DEMAND xtiny checkpoint](https://huggingface.co/wyz/vctk_bsrnn_xtiny_causal) (CC-BY-4.0) | External conversion is required because upstream publishes PyTorch only | Implemented |
 | MP-SENet | [Official MIT repository](https://github.com/yxlu-0102/MP-SENet) with PyTorch checkpoints | External conversion is required because upstream publishes PyTorch only | Implemented |
 | MossFormer2 | [Apache-2.0 ClearerVoice-Studio](https://github.com/modelscope/ClearerVoice-Studio) and the official 48 kHz checkpoint | External conversion is required because upstream publishes PyTorch only | Implemented |
-| SGMSE+ | [Official MIT repository](https://github.com/sp-uhh/sgmse) with PyTorch Lightning checkpoints | Complex STFT transforms plus an iterative predictor/corrector or ODE sampler; it is not a one-pass waveform graph | Researching |
+| SGMSE+ | [Official MIT repository](https://github.com/sp-uhh/sgmse) with PyTorch Lightning checkpoints | External conversion plus a native iterative predictor/corrector sampler | Implemented |
 
 None of these upstream projects currently publishes a model artifact with a
 documented ONNX contract that can be embedded directly in this Rust CLI. Their
@@ -129,3 +129,32 @@ For each named backend:
 SGMSE+ additionally requires deterministic sampler tests and an explicit
 quality/speed choice because its iterative inference cost differs substantially
 from one-pass enhancement networks.
+
+## SGMSE+ adapter
+
+The `sgmse` feature implements the official 16 kHz VoiceBank+DEMAND inference
+path: noisy-peak normalization, centered 510-point periodic-Hann STFT with a
+128-sample hop, magnitude-square-root complex transform scaled by 0.15,
+multiple-of-64 spectral padding, inverse transform, and exact duration/channel
+restoration. `scripts/export-sgmse.py` loads the official EMA parameters and
+exports the dynamic-frame NCSN++ score network with explicit real/imaginary
+channels for tract.
+
+The architecture revision is `1961cf4483e37df1bb92ccf0eb8b28bf6f44cb0e`,
+the model revision is `b6485214b3662a7f90309f397cacf1384046783c`, and the
+checkpoint SHA-256 is
+`e3875747b5646092d5c556bae68e5af639e2c1f45f009c669f379cd4d415cbd8`.
+Both code and model are MIT licensed; weights are external. The explicit
+quality/speed choice is the upstream quality configuration: 30 OUVE reverse
+steps, one ALD corrector step per reverse step, `snr=0.5`, and therefore 60
+score-network evaluations. Sampling uses a documented fixed SplitMix64 and
+Box-Muller normal stream so repeated runs are deterministic.
+
+On a fixed 64-frame score fixture, PyTorch and ONNX Runtime correlated above
+`0.999999999999` (MSE `4.66e-12`, maximum absolute error `1.53e-5`). On the
+pinned two-second Apache-2.0 ESPnet speech fixture, the Rust end-to-end output
+correlated with the same deterministic Python/ONNX sampler at
+`0.9999999972` (MSE `2.35e-11`, maximum PCM difference `3.05e-5`). The quality
+gate improved SI-SNR from `2.719 dB` to `11.471 dB` (`+8.752 dB`). The graph is
+about 252 MiB. A release build on the reference x86-64 Linux host took 737.92
+seconds for the two-second fixture and used 1,204,648 KiB maximum RSS.

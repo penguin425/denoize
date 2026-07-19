@@ -27,6 +27,7 @@ preserving timbre, transients, dynamics, stereo imaging, and natural "air".
 | `mpsenet` | `--features mpsenet` | MP-SENet magnitude/phase enhancement adapter (external converted model) |
 | `bsrnn` | `--features bsrnn` | ESPnet BSRNN spectral enhancement adapter (external converted model) |
 | `mossformer2` | `--features mossformer2` | ClearerVoice MossFormer2 48 kHz mask adapter (external converted model) |
+| `sgmse` | `--features sgmse` | SGMSE+ iterative diffusion adapter (external converted model) |
 
 Build everything: `cargo build --release --features full`
 
@@ -36,8 +37,8 @@ models; spectral models and diffusion samplers require dedicated adapters.
 
 > The prebuilt GitHub binaries include every backend. Because DeepFilterNet
 > 0.5.6 is not available from crates.io, the crates.io package's `full` feature
-> currently includes RNNoise, generic ONNX, MP-SENet, BSRNN, and MossFormer2, but not
-> DeepFilterNet.
+> currently includes RNNoise, generic ONNX, MP-SENet, BSRNN, MossFormer2, and
+> SGMSE+, but not DeepFilterNet.
 
 ## Supported input formats
 
@@ -76,6 +77,10 @@ denoize noisy.wav clean.wav -b bsrnn \
 # ClearerVoice MossFormer2 48 kHz model
 denoize noisy.wav clean.wav -b mossformer2 \
   --onnx-model mossformer2-se-48k.onnx --onnx-rate 48000
+
+# Official SGMSE+ VoiceBank model (30-step quality sampler)
+denoize noisy.wav clean.wav -b sgmse \
+  --onnx-model sgmse-vb.onnx --onnx-rate 16000
 ```
 
 To prepare the pinned official MP-SENet VoiceBank model:
@@ -162,6 +167,42 @@ Run the pinned real-speech quality gate after conversion:
 python3 scripts/validate-mossformer2.py \
   --denoize target/release/denoize \
   --model mossformer2-se-48k.onnx
+```
+
+To prepare the pinned MIT-licensed SGMSE+ VoiceBank+DEMAND model:
+
+```sh
+git clone https://github.com/sp-uhh/sgmse.git
+git -C sgmse checkout 1961cf4483e37df1bb92ccf0eb8b28bf6f44cb0e
+curl -L \
+  'https://huggingface.co/sp-uhh/speech-enhancement-sgmse/resolve/b6485214b3662a7f90309f397cacf1384046783c/train_vb_29nqe0uh_epoch%3D115.ckpt?download=true' \
+  -o 'train_vb_29nqe0uh_epoch=115.ckpt'
+echo 'e3875747b5646092d5c556bae68e5af639e2c1f45f009c669f379cd4d415cbd8  train_vb_29nqe0uh_epoch=115.ckpt' \
+  | sha256sum -c -
+python3 -m pip install torch onnx onnxruntime numpy
+python3 scripts/export-sgmse.py \
+  --source sgmse \
+  --checkpoint 'train_vb_29nqe0uh_epoch=115.ckpt' \
+  --output sgmse-vb.onnx \
+  --verify
+```
+
+The adapter reproduces the official noisy-peak normalization, centered
+510-point periodic-Hann STFT with a 128-sample hop, complex square-root
+spectrum transform, and OUVE predictor/corrector sampler. The explicit
+quality/speed choice is the upstream 30 reverse steps with one ALD corrector
+step (`snr=0.5`), or 60 score-network evaluations. The graph is about 252 MiB
+and weights are not bundled. On the reference x86-64 Linux host, the pinned
+two-second mono fixture took 737.92 seconds and used 1,204,648 KiB maximum RSS
+in a release build. This backend prioritizes generative quality rather than
+interactive speed.
+
+Run the pinned quality gate after conversion (expect a long CPU run):
+
+```sh
+python3 scripts/validate-sgmse.py \
+  --denoize target/release/denoize \
+  --model sgmse-vb.onnx
 ```
 
 ## Quick start
@@ -264,11 +305,11 @@ denoise_file_with_backend("noisy.wav", "clean.wav", cfg, Backend::DeepFilter)?;
 | 4 | Multiband / nonlinear SpecSub | ✅ |
 | 5 | Perceptual weighting + musical-noise PF | ✅ |
 | 6 | Pure-Rust external ONNX inference foundation | 🟨 waveform contract implemented |
-| 7 | BSRNN / MP-SENet / MossFormer2 adapters | 🟨 BSRNN implemented; MP-SENet partial; MossFormer2 researching |
-| 8 | SGMSE+ | 🔲 Diffusion sampler + score-model port |
+| 7 | BSRNN / MP-SENet / MossFormer2 adapters | ✅ implemented and quality-gated |
+| 8 | SGMSE+ | ✅ 30-step PC sampler + score-model adapter |
 
 See [ROADMAP.md](ROADMAP.md) for the implementation audit and the acceptance
-criteria for marking each named model complete.
+criteria and numerical evidence for each named model.
 
 ## License
 

@@ -29,6 +29,9 @@ pub enum Backend {
     /// ClearerVoice MossFormer2 48 kHz speech enhancement model.
     #[cfg(feature = "mossformer2")]
     Mossformer2,
+    /// SGMSE+ diffusion speech enhancement model.
+    #[cfg(feature = "sgmse")]
+    Sgmse,
 }
 
 /// Configuration for a waveform-to-waveform ONNX enhancement model.
@@ -63,6 +66,8 @@ impl Backend {
             "bsrnn" | "bs-rnn" | "bs_rnn" => Backend::Bsrnn,
             #[cfg(feature = "mossformer2")]
             "mossformer2" | "moss-former2" | "mossformer" => Backend::Mossformer2,
+            #[cfg(feature = "sgmse")]
+            "sgmse" | "sgmse+" | "sgmse-plus" => Backend::Sgmse,
             #[cfg(not(feature = "rnnoise"))]
             "rnnoise" | "rnn" => return None,
             #[cfg(not(feature = "deepfilter"))]
@@ -75,6 +80,8 @@ impl Backend {
             "bsrnn" | "bs-rnn" | "bs_rnn" => return None,
             #[cfg(not(feature = "mossformer2"))]
             "mossformer2" | "moss-former2" | "mossformer" => return None,
+            #[cfg(not(feature = "sgmse"))]
+            "sgmse" | "sgmse+" | "sgmse-plus" => return None,
             _ => return None,
         })
     }
@@ -94,6 +101,8 @@ impl Backend {
             "bsrnn",
             #[cfg(feature = "mossformer2")]
             "mossformer2",
+            #[cfg(feature = "sgmse")]
+            "sgmse",
         ]
     }
 }
@@ -143,6 +152,13 @@ pub fn process_channels(
             })?;
             mossformer2::process(channels, sample_rate, config)
         }
+        #[cfg(feature = "sgmse")]
+        Backend::Sgmse => {
+            let config = backend_options.onnx.as_ref().ok_or_else(|| {
+                "SGMSE+ backend requires a converted model (CLI: --onnx-model <PATH>)".to_string()
+            })?;
+            sgmse::process(channels, sample_rate, config)
+        }
     }
 }
 
@@ -164,9 +180,17 @@ pub mod bsrnn;
 #[cfg(feature = "mossformer2")]
 pub mod mossformer2;
 
+#[cfg(feature = "sgmse")]
+pub mod sgmse;
+
 #[cfg(all(
     test,
-    any(feature = "mpsenet", feature = "bsrnn", feature = "mossformer2")
+    any(
+        feature = "mpsenet",
+        feature = "bsrnn",
+        feature = "mossformer2",
+        feature = "sgmse"
+    )
 ))]
 mod tests {
     use super::*;
@@ -193,5 +217,13 @@ mod tests {
         assert_eq!(Backend::parse("mossformer2"), Some(Backend::Mossformer2));
         assert_eq!(Backend::parse("moss-former2"), Some(Backend::Mossformer2));
         assert!(Backend::available_names().contains(&"mossformer2"));
+    }
+
+    #[cfg(feature = "sgmse")]
+    #[test]
+    fn parses_sgmse_aliases() {
+        assert_eq!(Backend::parse("sgmse"), Some(Backend::Sgmse));
+        assert_eq!(Backend::parse("sgmse+"), Some(Backend::Sgmse));
+        assert!(Backend::available_names().contains(&"sgmse"));
     }
 }

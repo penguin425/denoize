@@ -34,6 +34,8 @@ include = [
     "scripts/export-mossformer2.py",
     "scripts/validate-mossformer2.py",
     "scripts/validate-bsrnn.py",
+    "scripts/export-sgmse.py",
+    "scripts/validate-sgmse.py",
 ]
 
 [lib]
@@ -62,18 +64,19 @@ onnx = ["dep:tract-onnx"]
 mpsenet = ["onnx", "dep:rustfft"]
 bsrnn = ["onnx", "dep:rustfft"]
 mossformer2 = ["onnx", "dep:rustfft", "dep:kaldi-native-fbank"]
-full = ["rnnoise", "onnx", "mpsenet", "bsrnn", "mossformer2"]
+sgmse = ["onnx", "dep:rustfft"]
+full = ["rnnoise", "onnx", "mpsenet", "bsrnn", "mossformer2", "sgmse"]
 
 [dev-dependencies]
 prost = "0.11"
 
 [package.metadata.docs.rs]
-features = ["rnnoise", "mpsenet", "bsrnn", "mossformer2"]
+features = ["rnnoise", "mpsenet", "bsrnn", "mossformer2", "sgmse"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [
-    'cfg(feature, values("deepfilter", "m4a-encode", "onnx", "mpsenet", "bsrnn", "mossformer2"))',
+    'cfg(feature, values("deepfilter", "m4a-encode", "onnx", "mpsenet", "bsrnn", "mossformer2", "sgmse"))',
 ] }
 
 [profile.release]
