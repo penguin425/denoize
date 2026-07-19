@@ -70,6 +70,33 @@ cargo build --release --features full
   -a specsub-nl -s 0.5
 ```
 
+## Prebuilt binaries
+
+Each [GitHub Release](https://github.com/penguin425/denoize/releases) contains
+prebuilt `full`-feature binaries for:
+
+- Linux x86-64
+- macOS Intel and Apple Silicon
+- Windows x86-64
+
+Every archive has a matching `.sha256` checksum file.
+
+### Publishing a release
+
+1. Set the version in `Cargo.toml` and update `Cargo.lock`.
+2. Commit and push the version change.
+3. Create and push a matching tag:
+
+```sh
+git tag -a v0.3.2 -m "denoize v0.3.2"
+git push origin v0.3.2
+```
+
+The `GitHub Release` workflow validates that the tag matches `Cargo.toml`, runs
+the full test suite, builds all supported platforms, attaches archives and
+checksums, and publishes generated release notes. A failed build leaves the
+release as a draft so it cannot expose an incomplete asset set.
+
 ## CLI highlights
 
 ```

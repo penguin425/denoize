@@ -1,0 +1,129 @@
+name: GitHub Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+
+env:
+  GH_REPO: ${{ github.repository }}
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Validate tag and create draft
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v6
+
+      - name: Validate Cargo version
+        shell: bash
+        run: |
+          package_version=$(sed -n '/^\[package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)
+          tag_version=${GITHUB_REF_NAME#v}
+          if [[ "$tag_version" != "$package_version" ]]; then
+            echo "Tag $GITHUB_REF_NAME does not match Cargo.toml version $package_version" >&2
+            exit 1
+          fi
+
+      - name: Run release tests
+        run: cargo test --locked --all-targets --features full
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME already exists; reusing it."
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --draft \
+              --verify-tag \
+              --generate-notes \
+              --title "denoize $GITHUB_REF_NAME"
+          fi
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            archive: tar.gz
+          - os: macos-14
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v6
+
+      - name: Select stable Rust
+        shell: bash
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+
+      - name: Build release binary
+        run: cargo build --locked --release --features full
+
+      - name: Package Unix binary
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          package="denoize-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir "$package"
+          cp target/release/denoize README.md LICENSE "$package/"
+          tar -czf "$package.tar.gz" "$package"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$package.tar.gz" > "$package.tar.gz.sha256"
+          else
+            shasum -a 256 "$package.tar.gz" > "$package.tar.gz.sha256"
+          fi
+
+      - name: Package Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $package = "denoize-$env:GITHUB_REF_NAME-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path $package | Out-Null
+          Copy-Item target/release/denoize.exe, README.md, LICENSE -Destination $package
+          Compress-Archive -Path $package -DestinationPath "$package.zip"
+          $hash = (Get-FileHash "$package.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $package.zip" | Set-Content -Encoding ascii "$package.zip.sha256"
+
+      - name: Upload release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" \
+            denoize-${GITHUB_REF_NAME}-${{ matrix.target }}.${{ matrix.archive }} \
+            denoize-${GITHUB_REF_NAME}-${{ matrix.target }}.${{ matrix.archive }}.sha256 \
+            --clobber
+
+  publish:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false
