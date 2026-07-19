@@ -25,3 +25,6 @@ jobs:
 
       - name: Test all features
         run: cargo test --locked --all-targets --features full
+
+      - name: Test crates.io feature set
+        run: bash scripts/publish-crates-io.sh --test

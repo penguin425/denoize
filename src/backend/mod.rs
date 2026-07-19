@@ -2,6 +2,8 @@
 
 mod classical;
 
+use std::path::PathBuf;
+
 pub use classical::process_classical;
 
 /// Denoising backend selection.
@@ -15,6 +17,25 @@ pub enum Backend {
     /// DeepFilterNet v3 (tract ONNX, embedded default model).
     #[cfg(feature = "deepfilter")]
     DeepFilter,
+    /// User-supplied waveform-to-waveform ONNX model (pure-Rust tract runtime).
+    #[cfg(feature = "onnx")]
+    Onnx,
+}
+
+/// Configuration for a waveform-to-waveform ONNX enhancement model.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OnnxModelConfig {
+    /// Path to the ONNX model file.
+    pub path: PathBuf,
+    /// Sample rate expected and produced by the model.
+    pub sample_rate: u32,
+}
+
+/// Options used by backends that require external model configuration.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BackendOptions {
+    /// Model configuration used by the `onnx` backend when that feature is enabled.
+    pub onnx: Option<OnnxModelConfig>,
 }
 
 impl Backend {
@@ -25,23 +46,28 @@ impl Backend {
             "rnnoise" | "rnn" => Backend::Rnnoise,
             #[cfg(feature = "deepfilter")]
             "deepfilter" | "deepfilternet" | "dfn" | "dfn3" => Backend::DeepFilter,
+            #[cfg(feature = "onnx")]
+            "onnx" | "model" => Backend::Onnx,
             #[cfg(not(feature = "rnnoise"))]
             "rnnoise" | "rnn" => return None,
             #[cfg(not(feature = "deepfilter"))]
             "deepfilter" | "deepfilternet" | "dfn" | "dfn3" => return None,
+            #[cfg(not(feature = "onnx"))]
+            "onnx" | "model" => return None,
             _ => return None,
         })
     }
 
     pub fn available_names() -> &'static [&'static str] {
-        #[cfg(all(feature = "rnnoise", feature = "deepfilter"))]
-        return &["classical", "rnnoise", "deepfilter"];
-        #[cfg(all(feature = "rnnoise", not(feature = "deepfilter")))]
-        return &["classical", "rnnoise"];
-        #[cfg(all(not(feature = "rnnoise"), feature = "deepfilter"))]
-        return &["classical", "deepfilter"];
-        #[cfg(not(any(feature = "rnnoise", feature = "deepfilter")))]
-        return &["classical"];
+        &[
+            "classical",
+            #[cfg(feature = "rnnoise")]
+            "rnnoise",
+            #[cfg(feature = "deepfilter")]
+            "deepfilter",
+            #[cfg(feature = "onnx")]
+            "onnx",
+        ]
     }
 }
 
@@ -51,14 +77,23 @@ pub fn process_channels(
     channels: &[Vec<f64>],
     sample_rate: u32,
     classical_cfg: &crate::denoiser::DenoiserConfig,
+    backend_options: &BackendOptions,
 ) -> Result<Vec<Vec<f64>>, String> {
     let _ = sample_rate; // used by AI backends; classical reads from cfg
+    let _ = backend_options; // used by configured model backends when enabled
     match backend {
         Backend::Classical => Ok(process_classical(channels, classical_cfg)),
         #[cfg(feature = "rnnoise")]
         Backend::Rnnoise => rnnoise::process(channels, sample_rate),
         #[cfg(feature = "deepfilter")]
         Backend::DeepFilter => deepfilter::process(channels, sample_rate),
+        #[cfg(feature = "onnx")]
+        Backend::Onnx => {
+            let config = backend_options.onnx.as_ref().ok_or_else(|| {
+                "ONNX backend requires a model path (CLI: --onnx-model <PATH>)".to_string()
+            })?;
+            onnx::process(channels, sample_rate, config)
+        }
     }
 }
 
@@ -67,3 +102,6 @@ pub mod rnnoise;
 
 #[cfg(feature = "deepfilter")]
 pub mod deepfilter;
+
+#[cfg(feature = "onnx")]
+pub mod onnx;
