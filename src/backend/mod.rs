@@ -23,6 +23,9 @@ pub enum Backend {
     /// MP-SENet magnitude/phase speech enhancement model.
     #[cfg(feature = "mpsenet")]
     MpSenet,
+    /// ESPnet band-split recurrent speech enhancement model.
+    #[cfg(feature = "bsrnn")]
+    Bsrnn,
 }
 
 /// Configuration for a waveform-to-waveform ONNX enhancement model.
@@ -53,6 +56,8 @@ impl Backend {
             "onnx" | "model" => Backend::Onnx,
             #[cfg(feature = "mpsenet")]
             "mpsenet" | "mp-senet" | "mp_senet" => Backend::MpSenet,
+            #[cfg(feature = "bsrnn")]
+            "bsrnn" | "bs-rnn" | "bs_rnn" => Backend::Bsrnn,
             #[cfg(not(feature = "rnnoise"))]
             "rnnoise" | "rnn" => return None,
             #[cfg(not(feature = "deepfilter"))]
@@ -61,6 +66,8 @@ impl Backend {
             "onnx" | "model" => return None,
             #[cfg(not(feature = "mpsenet"))]
             "mpsenet" | "mp-senet" | "mp_senet" => return None,
+            #[cfg(not(feature = "bsrnn"))]
+            "bsrnn" | "bs-rnn" | "bs_rnn" => return None,
             _ => return None,
         })
     }
@@ -76,6 +83,8 @@ impl Backend {
             "onnx",
             #[cfg(feature = "mpsenet")]
             "mpsenet",
+            #[cfg(feature = "bsrnn")]
+            "bsrnn",
         ]
     }
 }
@@ -110,6 +119,13 @@ pub fn process_channels(
             })?;
             mpsenet::process(channels, sample_rate, config)
         }
+        #[cfg(feature = "bsrnn")]
+        Backend::Bsrnn => {
+            let config = backend_options.onnx.as_ref().ok_or_else(|| {
+                "BSRNN backend requires a converted model (CLI: --onnx-model <PATH>)".to_string()
+            })?;
+            bsrnn::process(channels, sample_rate, config)
+        }
     }
 }
 
@@ -125,14 +141,26 @@ pub mod onnx;
 #[cfg(feature = "mpsenet")]
 pub mod mpsenet;
 
-#[cfg(all(test, feature = "mpsenet"))]
+#[cfg(feature = "bsrnn")]
+pub mod bsrnn;
+
+#[cfg(all(test, any(feature = "mpsenet", feature = "bsrnn")))]
 mod tests {
     use super::*;
 
+    #[cfg(feature = "mpsenet")]
     #[test]
     fn parses_mp_senet_aliases() {
         assert_eq!(Backend::parse("mpsenet"), Some(Backend::MpSenet));
         assert_eq!(Backend::parse("mp-senet"), Some(Backend::MpSenet));
         assert!(Backend::available_names().contains(&"mpsenet"));
+    }
+
+    #[cfg(feature = "bsrnn")]
+    #[test]
+    fn parses_bsrnn_aliases() {
+        assert_eq!(Backend::parse("bsrnn"), Some(Backend::Bsrnn));
+        assert_eq!(Backend::parse("bs-rnn"), Some(Backend::Bsrnn));
+        assert!(Backend::available_names().contains(&"bsrnn"));
     }
 }

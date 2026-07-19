@@ -40,8 +40,9 @@ rnnoise = ["dep:nnnoiseless"]
 deepfilter = ["dep:df", "dep:ndarray"]
 onnx = ["dep:tract-onnx"]
 mpsenet = ["onnx", "dep:rustfft"]
+bsrnn = ["onnx", "dep:rustfft"]
 m4a-encode = ["dep:oxideav-aac-encoder"]
-full = ["rnnoise", "deepfilter", "onnx", "mpsenet", "m4a-encode"]
+full = ["rnnoise", "deepfilter", "onnx", "mpsenet", "bsrnn", "m4a-encode"]
 
 [dev-dependencies]
 prost = "0.11"
