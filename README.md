@@ -26,6 +26,7 @@ preserving timbre, transients, dynamics, stereo imaging, and natural "air".
 | `onnx` | `--features onnx` | External waveform-to-waveform ONNX model (tract, Pure Rust) |
 | `mpsenet` | `--features mpsenet` | MP-SENet magnitude/phase enhancement adapter (external converted model) |
 | `bsrnn` | `--features bsrnn` | ESPnet BSRNN spectral enhancement adapter (external converted model) |
+| `mossformer2` | `--features mossformer2` | ClearerVoice MossFormer2 48 kHz mask adapter (external converted model) |
 
 Build everything: `cargo build --release --features full`
 
@@ -35,7 +36,7 @@ models; spectral models and diffusion samplers require dedicated adapters.
 
 > The prebuilt GitHub binaries include every backend. Because DeepFilterNet
 > 0.5.6 is not available from crates.io, the crates.io package's `full` feature
-> currently includes RNNoise, generic ONNX, MP-SENet, and BSRNN, but not
+> currently includes RNNoise, generic ONNX, MP-SENet, BSRNN, and MossFormer2, but not
 > DeepFilterNet.
 
 ## Supported input formats
@@ -71,6 +72,10 @@ denoize noisy.wav clean.wav -b mpsenet \
 # ESPnet BSRNN xtiny checkpoint converted with scripts/export-bsrnn.py
 denoize noisy.wav clean.wav -b bsrnn \
   --onnx-model bsrnn-xtiny.onnx --onnx-rate 48000
+
+# ClearerVoice MossFormer2 48 kHz model
+denoize noisy.wav clean.wav -b mossformer2 \
+  --onnx-model mossformer2-se-48k.onnx --onnx-rate 48000
 ```
 
 To prepare the pinned official MP-SENet VoiceBank model:
@@ -113,6 +118,39 @@ Run the reproducible real-speech quality gate after conversion:
 python3 scripts/validate-bsrnn.py \
   --denoize target/release/denoize \
   --model bsrnn-xtiny.onnx
+```
+
+To prepare the pinned Apache-2.0 MossFormer2 SE 48 kHz model:
+
+```sh
+git clone https://github.com/modelscope/ClearerVoice-Studio.git
+git -C ClearerVoice-Studio checkout 6b3774dc79c46ae8bed2a4fa5f706f0ac8c75c61
+curl -L \
+  'https://huggingface.co/alibabasglab/MossFormer2_SE_48K/resolve/eff8c97925c8bec812af707814b3e5d777fd4503/last_best_checkpoint.pt' \
+  -o last_best_checkpoint.pt
+echo '03692b9f773bbd6bb43b9c5a41f96b1e28affd66e13796b7bec66ad3d8b227c6  last_best_checkpoint.pt' \
+  | sha256sum -c -
+python3 -m pip install torch onnx onnxruntime numpy einops rotary-embedding-torch
+python3 scripts/export-mossformer2.py \
+  --repo ClearerVoice-Studio \
+  --checkpoint last_best_checkpoint.pt \
+  --output mossformer2-se-48k.onnx \
+  --verify
+```
+
+The adapter uses 48 kHz audio, 40 ms Kaldi fbank frames at an 8 ms shift,
+first- and second-order deltas, a non-centred 1,920-point symmetric-Hamming
+STFT, and the official four-second/three-second-stride edge-discard
+reconstruction. The converted graph is about 217 MiB. On the reference
+x86-64 Linux host, a four-second mono fixture took 7.74 seconds and used
+483,400 KiB maximum RSS in a release build. Model weights are not bundled.
+
+Run the pinned real-speech quality gate after conversion:
+
+```sh
+python3 scripts/validate-mossformer2.py \
+  --denoize target/release/denoize \
+  --model mossformer2-se-48k.onnx
 ```
 
 ## Quick start

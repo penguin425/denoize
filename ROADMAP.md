@@ -11,7 +11,7 @@ an end-to-end audio fixture test.
 |---|---|---|---|
 | BSRNN | [ESPnet VCTK+DEMAND xtiny checkpoint](https://huggingface.co/wyz/vctk_bsrnn_xtiny_causal) (CC-BY-4.0) | External conversion is required because upstream publishes PyTorch only | Implemented |
 | MP-SENet | [Official MIT repository](https://github.com/yxlu-0102/MP-SENet) with PyTorch checkpoints | Numerical parity and quality fixture for the converted graph | Adapter implemented |
-| MossFormer2 | [Official MIT repository](https://github.com/alibabasglab/MossFormer2), now directing users to ClearerVoice-Studio | Speech-enhancement checkpoint export, segmentation, and overlap reconstruction | Researching |
+| MossFormer2 | [Apache-2.0 ClearerVoice-Studio](https://github.com/modelscope/ClearerVoice-Studio) and the official 48 kHz checkpoint | External conversion is required because upstream publishes PyTorch only | Implemented |
 | SGMSE+ | [Official MIT repository](https://github.com/sp-uhh/sgmse) with PyTorch Lightning checkpoints | Complex STFT transforms plus an iterative predictor/corrector or ODE sampler; it is not a one-pass waveform graph | Researching |
 
 None of these upstream projects currently publishes a model artifact with a
@@ -86,6 +86,30 @@ speech fixture, the Rust end-to-end quality gate improved SI-SNR from
 Linux host processed it in 1.58 seconds (1.3x realtime) with 44,628 KiB maximum
 RSS. The model is about 2.4 MiB; memory and latency grow with utterance length
 because upstream inference is recurrent and whole-utterance.
+
+## MossFormer2 adapter
+
+The `mossformer2` feature implements the ClearerVoice 48 kHz frontend and its
+four-second deployment contract: 60-bin Kaldi fbank features with first- and
+second-order deltas, a non-centred 1,920-point symmetric-Hamming STFT with a
+384-sample hop, real spectral-mask application, three-second-stride segmented
+inference, 0.5-second edge discard, resampling, and exact input-duration and
+channel restoration. `scripts/export-mossformer2.py` pins and verifies the
+official checkpoint and rewrites the fixed 496-frame graph to tract-supported
+primitive ONNX operations.
+
+The architecture revision is `6b3774dc79c46ae8bed2a4fa5f706f0ac8c75c61`,
+the model revision is `eff8c97925c8bec812af707814b3e5d777fd4503`, and the
+checkpoint SHA-256 is
+`03692b9f773bbd6bb43b9c5a41f96b1e28affd66e13796b7bec66ad3d8b227c6`.
+Both architecture and model are Apache-2.0; weights are external. On a fixed
+496-frame numerical fixture, the compatibility rewrite matched its source
+graph exactly, while tract and ONNX Runtime correlated at
+`0.999999999997` (MSE `4.93e-12`, maximum absolute error `4.49e-5`). The graph
+is about 217 MiB. A four-second release-build CLI run on the reference x86-64
+Linux host took 7.74 seconds and used 483,400 KiB maximum RSS. On the pinned
+four-second Apache-2.0 ESPnet speech fixture, the Rust end-to-end quality gate
+improved SI-SNR from `2.683 dB` to `13.928 dB` (`+11.246 dB`).
 
 ## Completion gates
 

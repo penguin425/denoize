@@ -26,8 +26,9 @@ hound = "3.5"
 nnnoiseless = { version = "0.5.2", optional = true, default-features = false }
 df = { git = "https://github.com/Rikorose/DeepFilterNet", tag = "v0.5.6", package = "deep_filter", optional = true, default-features = false, features = ["tract", "default-model", "wav-utils", "transforms"] }
 ndarray = { version = "0.15", optional = true }
-tract-onnx = { version = "0.19.16", optional = true }
+tract-onnx = { version = "0.22.3", optional = true }
 rustfft = { version = "6.4", optional = true }
+kaldi-native-fbank = { version = "0.1.0", optional = true }
 nanomp3 = "0.1.1"
 shine-rs = "0.1.3"
 oxideav-aac = "0.1.6"
@@ -41,8 +42,9 @@ deepfilter = ["dep:df", "dep:ndarray"]
 onnx = ["dep:tract-onnx"]
 mpsenet = ["onnx", "dep:rustfft"]
 bsrnn = ["onnx", "dep:rustfft"]
+mossformer2 = ["onnx", "dep:rustfft", "dep:kaldi-native-fbank"]
 m4a-encode = ["dep:oxideav-aac-encoder"]
-full = ["rnnoise", "deepfilter", "onnx", "mpsenet", "bsrnn", "m4a-encode"]
+full = ["rnnoise", "deepfilter", "onnx", "mpsenet", "bsrnn", "mossformer2", "m4a-encode"]
 
 [dev-dependencies]
 prost = "0.11"

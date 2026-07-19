@@ -62,6 +62,7 @@ BACKENDS (build with --features full for all):
     onnx        External waveform ONNX model (requires --features onnx)
     mpsenet     MP-SENet magnitude/phase model (requires --features mpsenet)
     bsrnn       ESPnet BSRNN spectral model (requires --features bsrnn)
+    mossformer2 ClearerVoice MossFormer2 model (requires --features mossformer2)
 
 PRESETS:
     hifi        Flagship transparency: OMLSA + protections + advanced DSP

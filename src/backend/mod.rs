@@ -26,6 +26,9 @@ pub enum Backend {
     /// ESPnet band-split recurrent speech enhancement model.
     #[cfg(feature = "bsrnn")]
     Bsrnn,
+    /// ClearerVoice MossFormer2 48 kHz speech enhancement model.
+    #[cfg(feature = "mossformer2")]
+    Mossformer2,
 }
 
 /// Configuration for a waveform-to-waveform ONNX enhancement model.
@@ -58,6 +61,8 @@ impl Backend {
             "mpsenet" | "mp-senet" | "mp_senet" => Backend::MpSenet,
             #[cfg(feature = "bsrnn")]
             "bsrnn" | "bs-rnn" | "bs_rnn" => Backend::Bsrnn,
+            #[cfg(feature = "mossformer2")]
+            "mossformer2" | "moss-former2" | "mossformer" => Backend::Mossformer2,
             #[cfg(not(feature = "rnnoise"))]
             "rnnoise" | "rnn" => return None,
             #[cfg(not(feature = "deepfilter"))]
@@ -68,6 +73,8 @@ impl Backend {
             "mpsenet" | "mp-senet" | "mp_senet" => return None,
             #[cfg(not(feature = "bsrnn"))]
             "bsrnn" | "bs-rnn" | "bs_rnn" => return None,
+            #[cfg(not(feature = "mossformer2"))]
+            "mossformer2" | "moss-former2" | "mossformer" => return None,
             _ => return None,
         })
     }
@@ -85,6 +92,8 @@ impl Backend {
             "mpsenet",
             #[cfg(feature = "bsrnn")]
             "bsrnn",
+            #[cfg(feature = "mossformer2")]
+            "mossformer2",
         ]
     }
 }
@@ -126,6 +135,14 @@ pub fn process_channels(
             })?;
             bsrnn::process(channels, sample_rate, config)
         }
+        #[cfg(feature = "mossformer2")]
+        Backend::Mossformer2 => {
+            let config = backend_options.onnx.as_ref().ok_or_else(|| {
+                "MossFormer2 backend requires a converted model (CLI: --onnx-model <PATH>)"
+                    .to_string()
+            })?;
+            mossformer2::process(channels, sample_rate, config)
+        }
     }
 }
 
@@ -144,7 +161,13 @@ pub mod mpsenet;
 #[cfg(feature = "bsrnn")]
 pub mod bsrnn;
 
-#[cfg(all(test, any(feature = "mpsenet", feature = "bsrnn")))]
+#[cfg(feature = "mossformer2")]
+pub mod mossformer2;
+
+#[cfg(all(
+    test,
+    any(feature = "mpsenet", feature = "bsrnn", feature = "mossformer2")
+))]
 mod tests {
     use super::*;
 
@@ -162,5 +185,13 @@ mod tests {
         assert_eq!(Backend::parse("bsrnn"), Some(Backend::Bsrnn));
         assert_eq!(Backend::parse("bs-rnn"), Some(Backend::Bsrnn));
         assert!(Backend::available_names().contains(&"bsrnn"));
+    }
+
+    #[cfg(feature = "mossformer2")]
+    #[test]
+    fn parses_mossformer2_aliases() {
+        assert_eq!(Backend::parse("mossformer2"), Some(Backend::Mossformer2));
+        assert_eq!(Backend::parse("moss-former2"), Some(Backend::Mossformer2));
+        assert!(Backend::available_names().contains(&"mossformer2"));
     }
 }
