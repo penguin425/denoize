@@ -24,6 +24,7 @@
 //! - `rnnoise` feature: RNNoise via nnnoiseless (pure-Rust)
 //! - `deepfilter` feature: DeepFilterNet v3 via tract ONNX
 //! - `onnx` feature: user-supplied waveform ONNX models via tract
+//! - `mpsenet` feature: MP-SENet compressed-magnitude/phase ONNX adapter
 //!
 //! Build with all backends: `cargo build --release --features full`
 
