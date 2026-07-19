@@ -96,7 +96,17 @@ jobs:
         run: |
           real_cmake=$(command -v cmake)
           wrapper="$RUNNER_TEMP/denoize-cmake"
-          printf '#!/usr/bin/env bash\nexec "%s" "$@" -DCMAKE_POLICY_VERSION_MINIMUM=3.5\n' "$real_cmake" > "$wrapper"
+          cat > "$wrapper" <<EOF
+          #!/usr/bin/env bash
+          case "\${1:-}" in
+            --build|--install|--open|--help|--version|-E)
+              exec "$real_cmake" "\$@"
+              ;;
+            *)
+              exec "$real_cmake" "\$@" -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+              ;;
+          esac
+          EOF
           chmod +x "$wrapper"
           echo "CMAKE=$wrapper" >> "$GITHUB_ENV"
 
@@ -105,8 +115,15 @@ jobs:
         shell: pwsh
         run: |
           $wrapper = Join-Path $env:RUNNER_TEMP "denoize-cmake.cmd"
-          "@echo off`r`ncmake.exe %* -DCMAKE_POLICY_VERSION_MINIMUM=3.5" |
-            Set-Content -Encoding ascii $wrapper
+          @'
+          @echo off
+          if /I "%~1"=="--build" goto passthrough
+          if /I "%~1"=="--install" goto passthrough
+          cmake.exe %* -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+          exit /b %errorlevel%
+          :passthrough
+          cmake.exe %*
+          '@ | Set-Content -Encoding ascii $wrapper
           "CMAKE=$wrapper" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Build release binary
