@@ -35,8 +35,8 @@ the repository's built-in `GITHUB_TOKEN`.
 5. Tag that exact commit and push the tag:
 
    ```sh
-   git tag -a v0.3.2 -m "denoize v0.3.2"
-   git push origin v0.3.2
+   git tag -a v0.1.0 -m "denoize v0.1.0"
+   git push origin v0.1.0
    ```
 
 The workflow first validates and tests the tag, builds and uploads every OS

@@ -105,8 +105,8 @@ this repository with its primary `Cargo.toml`.
 3. Create and push a matching tag:
 
 ```sh
-git tag -a v0.3.2 -m "denoize v0.3.2"
-git push origin v0.3.2
+git tag -a v0.1.0 -m "denoize v0.1.0"
+git push origin v0.1.0
 ```
 
 The `GitHub Release` workflow validates that the tag matches `Cargo.toml`, runs
