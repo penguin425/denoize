@@ -18,4 +18,11 @@ trap restore_files EXIT
 cp Cargo.crates-io.toml Cargo.toml
 rm Cargo.lock
 cargo generate-lockfile
+
+if [[ "${1:-}" == "--test" ]]; then
+  shift
+  cargo test --locked --all-targets --features full "$@"
+  exit 0
+fi
+
 cargo publish --locked --allow-dirty "$@"

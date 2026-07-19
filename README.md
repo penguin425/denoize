@@ -23,8 +23,13 @@ preserving timbre, transients, dynamics, stereo imaging, and natural "air".
 |---------|---------|-------------|
 | `rnnoise` | `--features rnnoise` | RNNoise via nnnoiseless (pure-Rust) |
 | `deepfilter` | `--features deepfilter` | DeepFilterNet v3 (tract ONNX, embedded model) |
+| `onnx` | `--features onnx` | External waveform-to-waveform ONNX model (tract, Pure Rust) |
 
 Build everything: `cargo build --release --features full`
+
+The generic ONNX backend is the deployment foundation for future neural
+models. It intentionally accepts only single-input/single-output waveform
+models; spectral models and diffusion samplers require dedicated adapters.
 
 > The prebuilt GitHub binaries include every backend. Because DeepFilterNet
 > 0.5.6 is not available from crates.io, the crates.io package's `full` feature
@@ -51,6 +56,10 @@ Build everything: `cargo build --release --features full`
 denoize noisy.mp3 clean.mp3 -p hifi
 denoize noisy.m4a clean.m4a -b deepfilter
 denoize noisy.wav clean.wav --mp3-bitrate 320
+
+# User-supplied waveform model: [1, samples] or [1, 1, samples]
+denoize noisy.wav clean.wav -b onnx \
+  --onnx-model model.onnx --onnx-rate 16000
 ```
 
 ## Quick start
@@ -127,6 +136,8 @@ release as a draft so it cannot expose an incomplete asset set.
 --postfilter             Musical-noise suppression post-filter
 -p hifi                   Flagship preset (Kaiser + perceptual + postfilter)
 --quality ultra           Maximum fidelity settings
+--onnx-model <PATH>       Waveform ONNX model used by the onnx backend
+--onnx-rate <HZ>          Model sample rate (default: 16000)
 ```
 
 ## Library API
@@ -150,7 +161,12 @@ denoise_file_with_backend("noisy.wav", "clean.wav", cfg, Backend::DeepFilter)?;
 | 3 | Kaiser/Flat-top/DPSS windows | ✅ |
 | 4 | Multiband / nonlinear SpecSub | ✅ |
 | 5 | Perceptual weighting + musical-noise PF | ✅ |
-| 6–8 | BSRNN / MP-SENet / MossFormer2 / SGMSE+ | 🔲 Future |
+| 6 | Pure-Rust external ONNX inference foundation | 🟨 waveform contract implemented |
+| 7 | BSRNN / MP-SENet / MossFormer2 adapters | 🔲 Model-specific preprocessing/export |
+| 8 | SGMSE+ | 🔲 Diffusion sampler + score-model port |
+
+See [ROADMAP.md](ROADMAP.md) for the implementation audit and the acceptance
+criteria for marking each named model complete.
 
 ## License
 

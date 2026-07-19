@@ -42,7 +42,9 @@ jobs:
         run: cargo test --locked --all-targets --features full
 
       - name: Verify crates.io package
-        run: bash scripts/publish-crates-io.sh --dry-run
+        run: |
+          bash scripts/publish-crates-io.sh --test
+          bash scripts/publish-crates-io.sh --dry-run
 
       - name: Create draft release
         env:

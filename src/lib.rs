@@ -23,6 +23,7 @@
 //! ### Optional AI backends (feature-gated)
 //! - `rnnoise` feature: RNNoise via nnnoiseless (pure-Rust)
 //! - `deepfilter` feature: DeepFilterNet v3 via tract ONNX
+//! - `onnx` feature: user-supplied waveform ONNX models via tract
 //!
 //! Build with all backends: `cargo build --release --features full`
 
@@ -41,7 +42,7 @@ pub mod stft;
 pub mod window;
 
 pub use audio::{read_audio, read_wav, write_audio, write_wav, Audio};
-pub use backend::Backend;
+pub use backend::{Backend, BackendOptions, OnnxModelConfig};
 pub use decode::{decode_file, AudioFormat, DecodedPcm};
 pub use denoiser::{Denoiser, DenoiserConfig, Preset};
 pub use encode::{EncodeOptions, OutputFormat};
@@ -75,9 +76,32 @@ where
 pub fn denoise_file_with_backend_opts<P1, P2>(
     input: P1,
     output: P2,
+    config: DenoiserConfig,
+    backend: Backend,
+    encode_opts: EncodeOptions,
+) -> Result<Audio, String>
+where
+    P1: AsRef<std::path::Path>,
+    P2: AsRef<std::path::Path>,
+{
+    denoise_file_with_backend_config(
+        input,
+        output,
+        config,
+        backend,
+        encode_opts,
+        BackendOptions::default(),
+    )
+}
+
+/// Denoise with explicit backend, encoder, and backend-specific model options.
+pub fn denoise_file_with_backend_config<P1, P2>(
+    input: P1,
+    output: P2,
     mut config: DenoiserConfig,
     backend: Backend,
     encode_opts: EncodeOptions,
+    backend_options: BackendOptions,
 ) -> Result<Audio, String>
 where
     P1: AsRef<std::path::Path>,
@@ -86,8 +110,13 @@ where
     let mut audio = read_audio(input)?;
     config.sample_rate = audio.sample_rate;
     let t0 = std::time::Instant::now();
-    audio.channels =
-        backend::process_channels(backend, &audio.channels, audio.sample_rate, &config)?;
+    audio.channels = backend::process_channels(
+        backend,
+        &audio.channels,
+        audio.sample_rate,
+        &config,
+        &backend_options,
+    )?;
     let elapsed = t0.elapsed();
     write_audio(output, &audio, encode_opts)?;
     eprintln!(

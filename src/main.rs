@@ -2,7 +2,10 @@
 
 use denoize::audio::read_audio;
 use denoize::denoiser::{DenoiserConfig, Preset};
-use denoize::{denoise_file_with_backend_opts, Algorithm, Backend, EncodeOptions, WindowType};
+use denoize::{
+    denoise_file_with_backend_config, Algorithm, Backend, BackendOptions, EncodeOptions,
+    OnnxModelConfig, WindowType,
+};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -47,6 +50,8 @@ OPTIONS:
         --report             print settings report and exit
         --mp3-bitrate <KBPS> MP3 CBR bitrate (default: 192)
         --m4a-bitrate <KBPS> M4A/AAC CBR bitrate (default: 192)
+        --onnx-model <PATH>   waveform ONNX model (required for -b onnx)
+        --onnx-rate <HZ>      ONNX model sample rate (default: 16000)
     -h, --help               show this help
     -V, --version            show version
 
@@ -54,6 +59,7 @@ BACKENDS (build with --features full for all):
     classical   Enhanced STFT/IMCRA/OMLSA pipeline (default)
     rnnoise     RNNoise via nnnoiseless (requires --features rnnoise)
     deepfilter  DeepFilterNet v3 (requires --features deepfilter)
+    onnx        External waveform ONNX model (requires --features onnx)
 
 PRESETS:
     hifi        Flagship transparency: OMLSA + protections + advanced DSP
@@ -92,6 +98,8 @@ struct Overrides {
     no_pre_emphasis: bool,
     mp3_bitrate_kbps: Option<u32>,
     m4a_bitrate_kbps: Option<u32>,
+    onnx_model: Option<String>,
+    onnx_sample_rate: Option<u32>,
 }
 
 fn parse_value<T>(args: &[String], i: &mut usize, flag: &str) -> Result<T, String>
@@ -177,6 +185,8 @@ fn parse_args(args: &[String]) -> Result<(String, String, Overrides), String> {
             "--no-pre-emphasis" => ov.no_pre_emphasis = true,
             "--mp3-bitrate" => ov.mp3_bitrate_kbps = Some(parse_value(args, &mut i, a)?),
             "--m4a-bitrate" => ov.m4a_bitrate_kbps = Some(parse_value(args, &mut i, a)?),
+            "--onnx-model" => ov.onnx_model = Some(parse_value(args, &mut i, a)?),
+            "--onnx-rate" => ov.onnx_sample_rate = Some(parse_value(args, &mut i, a)?),
             other if other.starts_with('-') => {
                 return Err(format!("unknown option: {other}"));
             }
@@ -375,7 +385,13 @@ fn run(args: &[String]) -> Result<(), String> {
         enc.m4a_bitrate_bps = kbps.saturating_mul(1000);
     }
 
-    denoise_file_with_backend_opts(&input, &output, cfg, backend, enc)?;
+    let backend_options = BackendOptions {
+        onnx: ov.onnx_model.map(|path| OnnxModelConfig {
+            path: path.into(),
+            sample_rate: ov.onnx_sample_rate.unwrap_or(16_000),
+        }),
+    };
+    denoise_file_with_backend_config(&input, &output, cfg, backend, enc, backend_options)?;
     Ok(())
 }
 
@@ -385,5 +401,29 @@ fn main() {
         eprintln!("denoize: error: {e}");
         eprintln!("run 'denoize --help' for usage.");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(feature = "onnx")]
+    #[test]
+    fn parses_onnx_model_options() {
+        let args = vec![
+            "input.wav".into(),
+            "output.wav".into(),
+            "--backend".into(),
+            "onnx".into(),
+            "--onnx-model".into(),
+            "model.onnx".into(),
+            "--onnx-rate".into(),
+            "48000".into(),
+        ];
+        let (_, _, options) = parse_args(&args).unwrap();
+        assert_eq!(options.backend, Some(Backend::Onnx));
+        assert_eq!(options.onnx_model.as_deref(), Some("model.onnx"));
+        assert_eq!(options.onnx_sample_rate, Some(48_000));
     }
 }
