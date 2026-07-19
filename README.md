@@ -90,6 +90,17 @@ python3 scripts/export-mpsenet.py \
   --output mp-senet-vb.onnx
 ```
 
+The VoiceBank graph is about 9 MiB and expects 16 kHz audio. On the reference
+x86-64 Linux host, a two-second mono speech fixture took 43.67 seconds after
+model loading and the complete process used 410,048 KiB maximum RSS. Run the
+pinned real-speech quality gate after conversion:
+
+```sh
+python3 scripts/validate-mpsenet.py \
+  --denoize target/release/denoize \
+  --model mp-senet-vb.onnx
+```
+
 To prepare the pinned ESPnet BSRNN xtiny model (CC-BY-4.0):
 
 ```sh

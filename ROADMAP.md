@@ -10,7 +10,7 @@ an end-to-end audio fixture test.
 | Model | Upstream artifact | Native integration gap | Status |
 |---|---|---|---|
 | BSRNN | [ESPnet VCTK+DEMAND xtiny checkpoint](https://huggingface.co/wyz/vctk_bsrnn_xtiny_causal) (CC-BY-4.0) | External conversion is required because upstream publishes PyTorch only | Implemented |
-| MP-SENet | [Official MIT repository](https://github.com/yxlu-0102/MP-SENet) with PyTorch checkpoints | Numerical parity and quality fixture for the converted graph | Adapter implemented |
+| MP-SENet | [Official MIT repository](https://github.com/yxlu-0102/MP-SENet) with PyTorch checkpoints | External conversion is required because upstream publishes PyTorch only | Implemented |
 | MossFormer2 | [Apache-2.0 ClearerVoice-Studio](https://github.com/modelscope/ClearerVoice-Studio) and the official 48 kHz checkpoint | External conversion is required because upstream publishes PyTorch only | Implemented |
 | SGMSE+ | [Official MIT repository](https://github.com/sp-uhh/sgmse) with PyTorch Lightning checkpoints | Complex STFT transforms plus an iterative predictor/corrector or ODE sampler; it is not a one-pass waveform graph | Researching |
 
@@ -42,8 +42,8 @@ normalization, centered 400-point periodic-Hann STFT with 100-sample hop,
 STFT, 50%-overlapped reconstruction of the official 32,000-sample training
 segments, and exact input-duration restoration. `scripts/export-mpsenet.py`
 converts an official `g_best_vb` or `g_best_dns` checkpoint into the adapter's
-two-input/two-output ONNX contract. The adapter remains partial until a pinned
-converted model is covered by an automated denoising-quality fixture.
+two-input/two-output ONNX contract. The converted model is covered by a pinned
+automated real-speech quality fixture.
 
 The converter pins upstream revision
 `89932cfe90d1dacb8e170e4a331d762462c21792` and verifies the official checkpoint
@@ -53,9 +53,11 @@ matched upstream PyTorch through ONNX Runtime with magnitude correlation above
 Runtime at the same correlation threshold. End-to-end Rust/PyTorch waveform
 correlation was `0.9900` (MSE `8.56e-6`), with the remaining difference dominated
 by phase wrapping in low-energy FFT bins across the two FFT implementations.
-On the repository's synthetic tone-plus-noise fixture, the converted VoiceBank
-model improved global SNR from `-0.01 dB` to `0.24 dB`; this manual result is not
-yet the automated speech-quality gate required for completion.
+On the pinned two-second Apache-2.0 ESPnet speech fixture, the Rust end-to-end
+quality gate improved SI-SNR from `2.719 dB` to `10.282 dB` (`+7.563 dB`). The
+converted graph is about 9 MiB. On the reference x86-64 Linux host, inference
+for the fixture took 43.67 seconds and the complete process used 410,048 KiB
+maximum RSS.
 
 ## BSRNN adapter
 
