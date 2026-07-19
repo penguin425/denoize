@@ -27,14 +27,22 @@ jobs:
         shell: bash
         run: |
           package_version=$(sed -n '/^\[package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)
+          crate_version=$(sed -n '/^\[package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.crates-io.toml)
           tag_version=${GITHUB_REF_NAME#v}
           if [[ "$tag_version" != "$package_version" ]]; then
             echo "Tag $GITHUB_REF_NAME does not match Cargo.toml version $package_version" >&2
             exit 1
           fi
+          if [[ "$tag_version" != "$crate_version" ]]; then
+            echo "Tag $GITHUB_REF_NAME does not match Cargo.crates-io.toml version $crate_version" >&2
+            exit 1
+          fi
 
       - name: Run release tests
         run: cargo test --locked --all-targets --features full
+
+      - name: Verify crates.io package
+        run: bash scripts/publish-crates-io.sh --dry-run
 
       - name: Create draft release
         env:
@@ -120,10 +128,39 @@ jobs:
 
   publish:
     name: Publish release
-    needs: build
+    needs: [build, publish-crate]
     runs-on: ubuntu-latest
     steps:
       - name: Publish draft release
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release edit "$GITHUB_REF_NAME" --draft=false
+
+  publish-crate:
+    name: Publish crates.io package
+    needs: build
+    runs-on: ubuntu-latest
+    environment: crates-io
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v6
+
+      - name: Publish denoize to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        shell: bash
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          response=$(curl --fail --silent --show-error \
+            --user-agent "denoize-release-workflow ($GITHUB_SERVER_URL/$GITHUB_REPOSITORY)" \
+            "https://crates.io/api/v1/crates/denoize" || true)
+          if jq -e --arg version "$version" \
+            '.versions[]? | select(.num == $version)' <<<"$response" >/dev/null; then
+            echo "denoize $version is already published; skipping."
+          else
+            if [[ -z "$CARGO_REGISTRY_TOKEN" ]]; then
+              echo "CRATES_IO_TOKEN is not configured in the crates-io environment." >&2
+              exit 1
+            fi
+            bash scripts/publish-crates-io.sh
+          fi

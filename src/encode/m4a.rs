@@ -7,15 +7,12 @@ use mp4::{
     AacConfig, AudioObjectType as Mp4Aot, ChannelConfig, FourCC, MediaConfig, Mp4Config, Mp4Sample,
     Mp4Writer, SampleFreqIndex, TrackConfig, TrackType,
 };
-use oxideav_aac::adts::ADTS_HEADER_BYTES_NO_CRC;
-use oxideav_aac::encoder::{EncoderConfig, StreamEncoder, FRAME_LEN};
+use oxideav_aac_encoder::adts::ADTS_HEADER_BYTES_NO_CRC;
+use oxideav_aac_encoder::encoder::{EncoderConfig, StreamEncoder, FRAME_LEN};
 
 use crate::audio::Audio;
 
 use super::pcm::{lossy_channel_layout, planar_f64_to_interleaved_i16};
-
-/// Default AAC bitrate (bps, not kbps).
-pub const DEFAULT_M4A_BITRATE: u32 = 192_000;
 
 /// Write planar `f64` audio to an M4A file.
 pub fn write_m4a<P: AsRef<Path>>(path: P, audio: &Audio, bitrate_bps: u32) -> Result<(), String> {

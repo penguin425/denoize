@@ -182,7 +182,8 @@ dependencies = [
  "nanomp3",
  "ndarray",
  "nnnoiseless",
- "oxideav-aac",
+ "oxideav-aac 0.1.6 (registry+https://github.com/rust-lang/crates.io-index)",
+ "oxideav-aac 0.1.6 (git+https://github.com/OxideAV/oxideav-aac?rev=e8113d5)",
  "shine-rs",
 ]
 
@@ -668,6 +669,15 @@ checksum = "4ed8acf08e98e744e5384c8bc63ceb0364e68a6854187221c18df61c4797690e"
 dependencies = [
  "dlv-list",
  "hashbrown 0.13.2",
+]
+
+[[package]]
+name = "oxideav-aac"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9246dc98ce532f45d3f8d0193996f7947cf06691ea533804641b27e9ee5b2f73"
+dependencies = [
+ "oxideav-core",
 ]
 
 [[package]]

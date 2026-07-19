@@ -6,12 +6,17 @@
 //! | MP3 | `shine-rs` (Pure Rust) |
 //! | M4A | `oxideav-aac` + `mp4` mux (Pure-Rust AAC-LC) |
 
+#[cfg(feature = "m4a-encode")]
 mod m4a;
 mod mp3;
 mod pcm;
 
-pub use m4a::{write_m4a, DEFAULT_M4A_BITRATE};
+#[cfg(feature = "m4a-encode")]
+pub use m4a::write_m4a;
 pub use mp3::{write_mp3, DEFAULT_MP3_BITRATE};
+
+/// Default AAC bitrate (bps, not kbps).
+pub const DEFAULT_M4A_BITRATE: u32 = 192_000;
 
 use std::path::Path;
 
@@ -72,7 +77,17 @@ pub fn write_audio<P: AsRef<Path>>(
     match OutputFormat::from_path(path)? {
         OutputFormat::Wav => write_wav(path, audio),
         OutputFormat::Mp3 => write_mp3(path, audio, options.mp3_bitrate_kbps),
-        OutputFormat::M4a => write_m4a(path, audio, options.m4a_bitrate_bps),
+        OutputFormat::M4a => {
+            #[cfg(feature = "m4a-encode")]
+            {
+                write_m4a(path, audio, options.m4a_bitrate_bps)
+            }
+            #[cfg(not(feature = "m4a-encode"))]
+            {
+                let _ = options;
+                Err("M4A output is unavailable in the crates.io build; use WAV/MP3 or a GitHub release binary".into())
+            }
+        }
     }
 }
 

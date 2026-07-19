@@ -26,6 +26,10 @@ preserving timbre, transients, dynamics, stereo imaging, and natural "air".
 
 Build everything: `cargo build --release --features full`
 
+> The prebuilt GitHub binaries include every backend. Because DeepFilterNet
+> 0.5.6 is not available from crates.io, the crates.io package's `full` feature
+> currently includes RNNoise but not DeepFilterNet.
+
 ## Supported input formats
 
 | Format | Decoder | Notes |
@@ -40,7 +44,7 @@ Build everything: `cargo build --release --features full`
 |--------|---------|-------|
 | WAV | `hound` | Lossless; preserves bit depth |
 | MP3 | `shine-rs` (Pure Rust) | `--mp3-bitrate` (default 192 kbps) |
-| M4A | `oxideav-aac` + MP4 mux | `--m4a-bitrate` (default 192 kbps); Pure-Rust AAC-LC |
+| M4A | `oxideav-aac` + MP4 mux | GitHub/source builds; `--m4a-bitrate` (default 192 kbps) |
 
 ```sh
 # MP3 / M4A input and output — no manual ffmpeg conversion
@@ -81,9 +85,22 @@ prebuilt `full`-feature binaries for:
 
 Every archive has a matching `.sha256` checksum file.
 
+## Install with Cargo
+
+The crates.io package provides the CLI and library with the classical DSP and
+optional RNNoise backends:
+
+```sh
+cargo install denoize --features full
+```
+
+For the embedded DeepFilterNet backend, use a prebuilt GitHub binary or build
+this repository with its primary `Cargo.toml`.
+
 ### Publishing a release
 
-1. Set the version in `Cargo.toml` and update `Cargo.lock`.
+1. Set the same version in `Cargo.toml` and `Cargo.crates-io.toml`, then update
+   `Cargo.lock`.
 2. Commit and push the version change.
 3. Create and push a matching tag:
 
@@ -120,7 +137,7 @@ use denoize::{denoise_file_with_backend, Backend, DenoiserConfig, Preset};
 let cfg = Preset::HiFi.config(48000);
 denoise_file_with_backend("noisy.wav", "clean.wav", cfg, Backend::Classical)?;
 
-// With AI (requires --features full at build time)
+// With DeepFilterNet (GitHub/source build with --features full)
 denoise_file_with_backend("noisy.wav", "clean.wav", cfg, Backend::DeepFilter)?;
 ```
 
@@ -137,4 +154,4 @@ denoise_file_with_backend("noisy.wav", "clean.wav", cfg, Backend::DeepFilter)?;
 
 ## License
 
-MIT OR Apache-2.0.
+MIT.

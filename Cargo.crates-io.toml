@@ -1,0 +1,70 @@
+# crates.io distribution manifest.
+#
+# DeepFilterNet 0.5.6 is not published on crates.io, so registry releases
+# contain the classical DSP and RNNoise backends. The unreleased AAC encoder is
+# also excluded; AAC/M4A decoding remains available. GitHub release binaries
+# are built from Cargo.toml with all backends and encoders enabled.
+
+[package]
+name = "denoize"
+version = "0.3.2"
+edition = "2021"
+rust-version = "1.85"
+authors = ["KAORU <133386210+penguin425@users.noreply.github.com>"]
+description = "Pure-Rust audio denoiser with classical DSP and optional RNNoise"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/penguin425/denoize"
+homepage = "https://github.com/penguin425/denoize"
+documentation = "https://docs.rs/denoize"
+keywords = ["audio", "denoise", "dsp", "stft", "noise-reduction"]
+categories = ["multimedia::audio", "science"]
+include = [
+    "Cargo.toml",
+    "Cargo.crates-io.toml",
+    "Cargo.lock",
+    "LICENSE",
+    "README.md",
+    "src/**/*.rs",
+    "examples/**/*.rs",
+]
+
+[lib]
+name = "denoize"
+path = "src/lib.rs"
+
+[[bin]]
+name = "denoize"
+path = "src/main.rs"
+
+[dependencies]
+hound = "3.5"
+nnnoiseless = { version = "0.5.2", optional = true, default-features = false }
+nanomp3 = "0.1.1"
+shine-rs = "0.1.3"
+oxideav-aac = "0.1.6"
+mp4 = "0.14.0"
+
+[features]
+default = []
+rnnoise = ["dep:nnnoiseless"]
+full = ["rnnoise"]
+
+[package.metadata.docs.rs]
+features = ["rnnoise"]
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(feature, values("deepfilter", "m4a-encode"))',
+] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+opt-level = 1

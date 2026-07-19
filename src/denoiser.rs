@@ -46,7 +46,7 @@
 //!   3. STFT analysis（任意の窓 + 高オーバーラップ対応）
 //!   4. IMCRA ノイズPSD + SPP 更新
 //!   5. Decision-directed a-priori SNR 推定
-//!   6. 選択したゲイン推定器で g[k] を計算
+//!   6. 選択したゲイン推定器で `g[k]` を計算
 //!   7. Transient Protection（フラックスベース）
 //!   8. Attack/Release 平滑化
 //!   9. Cepstral Smoothing（本格的低ケフレンシ除去）
