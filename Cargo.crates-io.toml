@@ -29,6 +29,7 @@ include = [
     "src/**/*.rs",
     "examples/**/*.rs",
     "scripts/export-mpsenet.py",
+    "scripts/validate-mpsenet.py",
     "scripts/export-bsrnn.py",
     "scripts/export-mossformer2.py",
     "scripts/validate-mossformer2.py",
