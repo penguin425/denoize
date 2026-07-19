@@ -43,8 +43,9 @@ onnx = ["dep:tract-onnx"]
 mpsenet = ["onnx", "dep:rustfft"]
 bsrnn = ["onnx", "dep:rustfft"]
 mossformer2 = ["onnx", "dep:rustfft", "dep:kaldi-native-fbank"]
+sgmse = ["onnx", "dep:rustfft"]
 m4a-encode = ["dep:oxideav-aac-encoder"]
-full = ["rnnoise", "deepfilter", "onnx", "mpsenet", "bsrnn", "mossformer2", "m4a-encode"]
+full = ["rnnoise", "deepfilter", "onnx", "mpsenet", "bsrnn", "mossformer2", "sgmse", "m4a-encode"]
 
 [dev-dependencies]
 prost = "0.11"
@@ -60,5 +61,5 @@ strip = true
 opt-level = 1
 
 [package.metadata.docs.rs]
-features = ["rnnoise", "mpsenet"]
+features = ["rnnoise", "mpsenet", "bsrnn", "mossformer2", "sgmse"]
 rustdoc-args = ["--cfg", "docsrs"]

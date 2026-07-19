@@ -63,6 +63,7 @@ BACKENDS (build with --features full for all):
     mpsenet     MP-SENet magnitude/phase model (requires --features mpsenet)
     bsrnn       ESPnet BSRNN spectral model (requires --features bsrnn)
     mossformer2 ClearerVoice MossFormer2 model (requires --features mossformer2)
+    sgmse       SGMSE+ diffusion model (requires --features sgmse)
 
 PRESETS:
     hifi        Flagship transparency: OMLSA + protections + advanced DSP

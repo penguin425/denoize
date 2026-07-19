@@ -32,3 +32,17 @@ License 2.0. Model weights are not included in denoize.
 The converter fixes the deployment graph to the official four-second feature
 window and rewrites ONNX operations to numerically equivalent tract-supported
 primitives. No upstream source code is copied into the Rust adapter.
+
+## SGMSE+
+
+`scripts/export-sgmse.py` loads the NCSN++ speech-enhancement architecture
+from [`sp-uhh/sgmse`](https://github.com/sp-uhh/sgmse) revision
+`1961cf4483e37df1bb92ccf0eb8b28bf6f44cb0e` and the official VoiceBank model
+revision `b6485214b3662a7f90309f397cacf1384046783c`. The upstream code and model
+are distributed under the MIT License. Model weights are not included in
+denoize.
+
+The converter loads the published EMA parameters and replaces only the
+PyTorch complex tensor boundary with explicit real and imaginary ONNX
+channels. The Rust adapter independently implements the documented OUVE
+predictor/corrector sampler and signal-processing frontend.
