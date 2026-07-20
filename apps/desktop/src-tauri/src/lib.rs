@@ -8,6 +8,7 @@ use denoize::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -130,6 +131,16 @@ struct ModelRow {
     revision: &'static str,
     installed: bool,
     path: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PreviewData {
+    source: String,
+    playable_path: String,
+    duration_seconds: f64,
+    rms_db: f64,
+    waveform: Vec<f64>,
 }
 
 #[tauri::command]
@@ -488,6 +499,51 @@ async fn model_action(name: String, action: String) -> Result<String, String> {
 }
 
 #[tauri::command]
+async fn prepare_preview(path: String, points: Option<usize>) -> Result<PreviewData, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let source = Path::new(&path);
+        if !source.is_file() {
+            return Err("プレビューする音声ファイルが存在しません".into());
+        }
+        let audio = read_audio(source)?;
+        let frames = audio.frames();
+        let point_count = points.unwrap_or(180).clamp(32, 512);
+        let mut waveform = vec![0.0f64; point_count];
+        let mut sum_squares = 0.0;
+        let mut sample_count = 0usize;
+        for channel in &audio.channels {
+            for (index, sample) in channel.iter().enumerate() {
+                let bucket = index.saturating_mul(point_count) / frames.max(1);
+                if let Some(peak) = waveform.get_mut(bucket.min(point_count - 1)) {
+                    *peak = peak.max(sample.abs());
+                }
+                sum_squares += sample * sample;
+                sample_count += 1;
+            }
+        }
+        let peak = waveform.iter().copied().fold(0.0f64, f64::max).max(1e-9);
+        for value in &mut waveform { *value /= peak; }
+        let rms = (sum_squares / sample_count.max(1) as f64).sqrt();
+        let mut hasher = DefaultHasher::new();
+        path.hash(&mut hasher);
+        source.metadata().and_then(|metadata| metadata.modified()).ok().hash(&mut hasher);
+        let preview_dir = std::env::temp_dir().join("denoize-previews");
+        std::fs::create_dir_all(&preview_dir).map_err(|error| format!("プレビューフォルダを作成できません: {error}"))?;
+        let playable = preview_dir.join(format!("{:016x}.wav", hasher.finish()));
+        if !playable.is_file() {
+            write_audio(&playable, &audio, EncodeOptions::default())?;
+        }
+        Ok(PreviewData {
+            source: path,
+            playable_path: playable.to_string_lossy().into_owned(),
+            duration_seconds: frames as f64 / audio.sample_rate.max(1) as f64,
+            rms_db: 20.0 * rms.max(1e-10).log10(),
+            waveform,
+        })
+    }).await.map_err(|error| format!("プレビュー処理に失敗しました: {error}"))?
+}
+
+#[tauri::command]
 fn save_text_file(path: String, contents: String) -> Result<(), String> {
     std::fs::write(&path, contents).map_err(|error| format!("{path} を保存できません: {error}"))
 }
@@ -745,9 +801,12 @@ pub fn run() {
             compare_audio,
             list_models,
             model_action,
+            prepare_preview,
             save_text_file
         ])
         .setup(|app| {
+            let preview_dir = std::env::temp_dir().join("denoize-previews");
+            let _ = std::fs::remove_dir_all(&preview_dir);
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.set_title(&format!("denoize {}", env!("CARGO_PKG_VERSION")));
             }

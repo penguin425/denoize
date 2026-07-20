@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import "./styles.css";
@@ -17,11 +17,14 @@ type ModelRow = {
   name: string; backend: string; license: string; sampleRate: number; revision: string;
   installed: boolean; path: string;
 };
+type PreviewData = { source: string; playablePath: string; durationSeconds: number; rmsDb: number; waveform: number[] };
 
 const audioFilters = [{ name: "Audio", extensions: ["wav", "flac", "opus", "ogg", "mp3", "m4a", "aac"] }];
 let appInfo: AppInfo;
 let activeJob: number | null = null;
 let comparison: Comparison | null = null;
+const previews: { input?: PreviewData; output?: PreviewData } = {};
+let activePreview: "input" | "output" = "input";
 
 document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
   <div class="shell">
@@ -46,6 +49,14 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
               <div class="file-row"><div><label>入力</label><div id="input-display" class="path empty">音声ファイルを選択</div></div><button class="secondary" id="choose-input">選択</button></div>
               <div class="file-row"><div><label>出力</label><div id="output-display" class="path empty">保存先を選択</div></div><button class="secondary" id="choose-output">選択</button></div>
               <input type="hidden" id="input-path"><input type="hidden" id="output-path">
+            </article>
+
+            <article class="card preview-card">
+              <div class="card-heading"><div><span class="step">A/B</span><h2>プレビュー</h2></div><div class="ab-buttons"><button id="preview-input" class="active">処理前</button><button id="preview-output" disabled>処理後</button></div></div>
+              <div id="waveform" class="waveform empty"><span>入力ファイルを選ぶと波形を表示します</span></div>
+              <audio id="preview-audio" controls preload="metadata"></audio>
+              <div class="preview-loop"><label class="toggle inline"><input id="loop-enabled" type="checkbox"><span></span><div><b>区間ループ</b></div></label><label>開始 秒<input id="loop-start" type="number" value="0" min="0" step="0.1"></label><label>終了 秒<input id="loop-end" type="number" value="0" min="0" step="0.1"></label></div>
+              <p id="preview-info" class="field-hint">同一位置のまま処理前／処理後を切り替え、RMS音量を揃えて試聴できます。</p>
             </article>
 
             <article class="card">
@@ -179,10 +190,58 @@ document.querySelectorAll<HTMLButtonElement>(".nav-item").forEach((button) => bu
   $("#page-title").textContent = button.textContent?.trim() ?? "denoize";
 }));
 
+async function preparePreview(kind: "input" | "output", path: string) {
+  try {
+    const preview = await invoke<PreviewData>("prepare_preview", { path, points: 180 });
+    previews[kind] = preview;
+    if (kind === "output") $<HTMLButtonElement>("#preview-output").disabled = false;
+    await selectPreview(kind);
+  } catch (error) { showToast(`プレビュー: ${errorText(error)}`, true); }
+}
+
+async function selectPreview(kind: "input" | "output") {
+  const preview = previews[kind]; if (!preview) return;
+  const audio = $<HTMLAudioElement>("#preview-audio");
+  const position = audio.currentTime || 0; const playing = !audio.paused;
+  activePreview = kind;
+  document.querySelectorAll(".ab-buttons button").forEach((button) => button.classList.toggle("active", button.id === `preview-${kind}`));
+  audio.src = convertFileSrc(preview.playablePath);
+  const levels = [previews.input?.rmsDb, previews.output?.rmsDb].filter((value): value is number => value != null);
+  const target = levels.length ? Math.min(...levels) : preview.rmsDb;
+  audio.volume = Math.min(1, 10 ** ((target - preview.rmsDb) / 20));
+  audio.currentTime = Math.min(position, preview.durationSeconds);
+  renderWaveform(preview);
+  $<HTMLInputElement>("#loop-end").max = String(preview.durationSeconds);
+  if (Number($<HTMLInputElement>("#loop-end").value) <= 0) $<HTMLInputElement>("#loop-end").value = preview.durationSeconds.toFixed(1);
+  $("#preview-info").textContent = `${kind === "input" ? "処理前" : "処理後"} · ${preview.durationSeconds.toFixed(1)}秒 · RMS ${preview.rmsDb.toFixed(1)} dB`;
+  if (playing) await audio.play();
+}
+
+function renderWaveform(preview: PreviewData) {
+  const waveform = $("#waveform"); waveform.classList.remove("empty");
+  waveform.innerHTML = preview.waveform.map((peak) => `<i style="height:${Math.max(2, peak * 100).toFixed(1)}%"></i>`).join("");
+}
+
+$("#preview-input").addEventListener("click", () => void selectPreview("input"));
+$("#preview-output").addEventListener("click", () => void selectPreview("output"));
+$("#waveform").addEventListener("click", (event) => {
+  const preview = previews[activePreview]; if (!preview) return;
+  const rect = $("#waveform").getBoundingClientRect();
+  $<HTMLAudioElement>("#preview-audio").currentTime = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width)) * preview.durationSeconds;
+});
+$<HTMLAudioElement>("#preview-audio").addEventListener("timeupdate", (event) => {
+  if (!$<HTMLInputElement>("#loop-enabled").checked) return;
+  const audio = event.currentTarget as HTMLAudioElement;
+  const start = Number($<HTMLInputElement>("#loop-start").value), end = Number($<HTMLInputElement>("#loop-end").value);
+  if (end > start && audio.currentTime >= end) audio.currentTime = start;
+});
+
 $("#choose-input").addEventListener("click", async () => {
   const path = await open({ multiple: false, filters: audioFilters }); if (typeof path !== "string") return;
   setPath("#input-path", "#input-display", path);
   const output = await defaultOutput(path); setPath("#output-path", "#output-display", output);
+  previews.output = undefined; $<HTMLButtonElement>("#preview-output").disabled = true;
+  await preparePreview("input", path);
 });
 $("#choose-output").addEventListener("click", async () => {
   const path = await save({ filters: audioFilters, defaultPath: $<HTMLInputElement>("#output-path").value || undefined });
@@ -281,6 +340,7 @@ listen<JobProgress>("job-progress", ({ payload }) => {
   if (payload.kind === "batch" && payload.item && payload.itemStatus) renderBatchResult(payload);
   updateProgress(payload);
   if (["completed", "failed", "cancelled"].includes(payload.status)) {
+    if (payload.kind === "file" && payload.status === "completed" && payload.output) void preparePreview("output", payload.output);
     activeJob = null; setJobUi(false, payload.kind); showToast(payload.error ?? payload.message, payload.status === "failed");
   }
 });

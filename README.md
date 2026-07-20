@@ -255,6 +255,8 @@ when selected; managed GTCRN weights are resolved automatically after install.
 Desktop batches accept files or folders, preserve relative paths, run with a
 configurable worker count, continue after individual failures, and can resume
 from the `.denoize-gui-state` journal in the output directory.
+Single-file processing also provides local waveform previews, RMS-matched
+before/after switching, click-to-seek, and configurable section looping.
 
 ```sh
 cd apps/desktop
