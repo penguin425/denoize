@@ -20,6 +20,8 @@ Input/output: WAV, FLAC, Ogg Opus, MP3, M4A (built in; no ffmpeg).
 
 USAGE:
     denoize <INPUT> <OUTPUT.wav|flac|opus|ogg|mp3|m4a> [OPTIONS]
+    denoize live [--input-device NAME] [--output-device NAME] [OPTIONS]
+    denoize live --list-devices
     denoize models <list|install|verify|path> [MODEL]
     denoize metrics <REFERENCE> <TEST> [--json|--markdown]
 
@@ -58,6 +60,9 @@ OPTIONS:
         --batch               process files in INPUT directory into OUTPUT directory
         --force               allow replacing existing output files
         --json                emit a machine-readable result
+        --input-device <NAME> live capture device (default: system default)
+        --output-device <NAME> live playback device (default: system default)
+        --chunk-ms <MS>       live processing chunk duration (default: 100)
     -h, --help               show this help
     -V, --version            show version
 
@@ -116,6 +121,10 @@ struct Overrides {
     batch: bool,
     force: bool,
     json: bool,
+    input_device: Option<String>,
+    output_device: Option<String>,
+    chunk_ms: Option<u32>,
+    list_devices: bool,
 }
 
 fn parse_value<T>(args: &[String], i: &mut usize, flag: &str) -> Result<T, String>
@@ -222,6 +231,10 @@ fn parse_args(args: &[String]) -> Result<(String, String, Overrides), String> {
             "--batch" => ov.batch = true,
             "--force" => ov.force = true,
             "--json" => ov.json = true,
+            "--input-device" => ov.input_device = Some(parse_value(args, &mut i, a)?),
+            "--output-device" => ov.output_device = Some(parse_value(args, &mut i, a)?),
+            "--chunk-ms" => ov.chunk_ms = Some(parse_value(args, &mut i, a)?),
+            "--list-devices" => ov.list_devices = true,
             "-" => {
                 if input.is_none() {
                     input = Some(a.clone());
@@ -411,6 +424,9 @@ fn print_report(input: &str, audio: &denoize::Audio, cfg: &DenoiserConfig, backe
 }
 
 fn run(args: &[String]) -> Result<(), String> {
+    if args.first().map(String::as_str) == Some("live") {
+        return run_live(&args[1..]);
+    }
     if args.first().map(String::as_str) == Some("models") {
         return run_models(&args[1..]);
     }
@@ -422,6 +438,49 @@ fn run(args: &[String]) -> Result<(), String> {
         return run_batch(&input, &output, &ov);
     }
     run_one(&input, &output, ov)
+}
+
+#[cfg(feature = "live")]
+fn run_live(args: &[String]) -> Result<(), String> {
+    let mut parseable = vec!["-".to_string(), "-".to_string()];
+    parseable.extend_from_slice(args);
+    let (_, _, ov) = parse_args(&parseable)?;
+    if ov.list_devices {
+        let (inputs, outputs) = denoize::live::device_names()?;
+        println!("Input devices:");
+        for device in inputs {
+            println!("  {device}");
+        }
+        println!("Output devices:");
+        for device in outputs {
+            println!("  {device}");
+        }
+        return Ok(());
+    }
+    let backend = ov.backend.unwrap_or(Backend::Classical);
+    let sample_rate = 48_000;
+    let denoiser = build_config(&ov, sample_rate);
+    let backend_options = BackendOptions {
+        onnx: ov.onnx_model.map(|path| OnnxModelConfig {
+            path: path.into(),
+            sample_rate: ov.onnx_sample_rate.unwrap_or(16_000),
+        }),
+        channel_mode: ov.channel_mode.unwrap_or_default(),
+        sgmse_profile: ov.sgmse_profile.unwrap_or_default(),
+    };
+    denoize::live::run(denoize::live::LiveConfig {
+        input_device: ov.input_device,
+        output_device: ov.output_device,
+        chunk_ms: ov.chunk_ms.unwrap_or(100),
+        backend,
+        backend_options,
+        denoiser,
+    })
+}
+
+#[cfg(not(feature = "live"))]
+fn run_live(_args: &[String]) -> Result<(), String> {
+    Err("live audio is unavailable in this build; rebuild with --features live".into())
 }
 
 fn run_one(input: &str, output: &str, ov: Overrides) -> Result<(), String> {
@@ -626,5 +685,23 @@ mod tests {
         assert_eq!(options.backend, Some(Backend::Onnx));
         assert_eq!(options.onnx_model.as_deref(), Some("model.onnx"));
         assert_eq!(options.onnx_sample_rate, Some(48_000));
+    }
+
+    #[test]
+    fn parses_live_device_options() {
+        let args = vec![
+            "-".into(),
+            "-".into(),
+            "--input-device".into(),
+            "Mic".into(),
+            "--output-device".into(),
+            "Cable".into(),
+            "--chunk-ms".into(),
+            "40".into(),
+        ];
+        let (_, _, options) = parse_args(&args).unwrap();
+        assert_eq!(options.input_device.as_deref(), Some("Mic"));
+        assert_eq!(options.output_device.as_deref(), Some("Cable"));
+        assert_eq!(options.chunk_ms, Some(40));
     }
 }

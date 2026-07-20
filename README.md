@@ -283,6 +283,22 @@ release as a draft so it cannot expose an incomplete asset set.
 
 ## CLI highlights
 
+### Realtime audio
+
+Build with the optional system-audio integration, list devices, then route a
+microphone through a denoising backend to an output or virtual-audio device:
+
+```sh
+cargo build --release --features live,rnnoise
+denoize live --list-devices
+denoize live --backend rnnoise --input-device "Microphone" --output-device "Virtual Cable"
+```
+
+Realtime processing runs outside the device callbacks and uses bounded queues,
+so an overloaded backend drops stale capture chunks instead of blocking the
+audio thread. `--chunk-ms` controls the latency/throughput trade-off and defaults
+to 100 ms. Input and output devices must currently share a default sample rate.
+
 ```
 -b, --backend <NAME>     classical|rnnoise|deepfilter
 -a, --algorithm <NAME>    omlsa|logmmse|mmse|wiener|specsub|specsub-nl|specsub-geo
