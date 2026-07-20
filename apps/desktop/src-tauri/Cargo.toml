@@ -1,0 +1,26 @@
+[package]
+name = "denoize-desktop"
+version = "0.4.0"
+description = "Desktop interface for denoize"
+authors = ["denoize"]
+edition = "2021"
+rust-version = "1.87"
+
+[lib]
+name = "denoize_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.5.3", features = [] }
+
+[dependencies]
+denoize = { path = "../../.." }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2.11.5", features = [] }
+tauri-plugin-dialog = "2.7.2"
+
+[features]
+default = ["full"]
+full = ["denoize/full"]
+fdk-aac-encoder = ["denoize/fdk-aac-encoder"]

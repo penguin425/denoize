@@ -244,6 +244,32 @@ cargo build --release --features full
   -a specsub-nl -s 0.5
 ```
 
+## Desktop app
+
+The Tauri desktop app exposes single-file denoising, batch conversion, quality
+comparison, and model management without sending audio off the computer. Its
+default build includes every backend in the repository's `full` feature set;
+FDK-AAC remains an explicit opt-in because of its separate licensing terms.
+
+```sh
+cd apps/desktop
+npm ci
+npm run tauri -- dev
+
+# Build a platform-native installer/package
+npm run tauri -- build
+
+# Optional FDK-AAC selector
+npm run tauri -- build --features fdk-aac-encoder
+```
+
+Linux development requires the WebKitGTK 4.1 and GTK 3 development packages.
+For Ubuntu 24.04 or later:
+
+```sh
+sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev patchelf
+```
+
 ## Prebuilt binaries
 
 Each [GitHub Release](https://github.com/penguin425/denoize/releases) contains
