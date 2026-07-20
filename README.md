@@ -323,8 +323,11 @@ git push origin v0.1.0
 
 The `GitHub Release` workflow validates that the tag matches `Cargo.toml`, runs
 the full test suite, builds all supported platforms, attaches archives and
-checksums, and publishes generated release notes. A failed build leaves the
-release as a draft so it cannot expose an incomplete asset set.
+checksums, signs desktop updater artifacts, and publishes generated release
+notes. Installed desktop apps check the signed `latest.json` feed on startup;
+updates are only installed after user confirmation. The updater private key is
+kept in the `TAURI_SIGNING_PRIVATE_KEY` repository secret. A failed build leaves
+the release as a draft so it cannot expose an incomplete asset set.
 
 ## CLI highlights
 
