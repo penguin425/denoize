@@ -3,7 +3,7 @@
 use denoize::audio::{read_audio, read_wav_bytes, write_audio, write_wav_bytes};
 use denoize::denoiser::{DenoiserConfig, Preset, ProcessingMode};
 use denoize::{
-    denoise_audio_with_backend_config, Algorithm, Backend, BackendOptions, ChannelMode,
+    denoise_audio_with_backend_config, AacEncoder, Algorithm, Backend, BackendOptions, ChannelMode,
     EncodeOptions, OnnxModelConfig, SgmseProfile, WindowType,
 };
 
@@ -56,6 +56,7 @@ OPTIONS:
         --report             print settings report and exit
         --mp3-bitrate <KBPS> MP3 CBR bitrate (default: 192)
         --m4a-bitrate <KBPS> M4A/AAC CBR bitrate (default: 192)
+        --aac-encoder <NAME> oxide|fdk (default: oxide)
         --loudness <LUFS>     normalize integrated loudness after denoising
         --true-peak <DBTP>    true-peak ceiling with --loudness (default: -1)
         --onnx-model <PATH>   waveform ONNX model (required for -b onnx)
@@ -126,6 +127,7 @@ struct Overrides {
     no_pre_emphasis: bool,
     mp3_bitrate_kbps: Option<u32>,
     m4a_bitrate_kbps: Option<u32>,
+    aac_encoder: Option<AacEncoder>,
     loudness_lufs: Option<f64>,
     true_peak_dbtp: Option<f64>,
     onnx_model: Option<String>,
@@ -240,6 +242,12 @@ fn parse_args(args: &[String]) -> Result<(String, String, Overrides), String> {
             "--no-pre-emphasis" => ov.no_pre_emphasis = true,
             "--mp3-bitrate" => ov.mp3_bitrate_kbps = Some(parse_value(args, &mut i, a)?),
             "--m4a-bitrate" => ov.m4a_bitrate_kbps = Some(parse_value(args, &mut i, a)?),
+            "--aac-encoder" => {
+                let name: String = parse_value(args, &mut i, a)?;
+                ov.aac_encoder = Some(AacEncoder::parse(&name).ok_or_else(|| {
+                    format!("unknown AAC encoder: {name} (expected oxide or fdk)")
+                })?);
+            }
             "--loudness" => ov.loudness_lufs = Some(parse_value(args, &mut i, a)?),
             "--true-peak" => ov.true_peak_dbtp = Some(parse_value(args, &mut i, a)?),
             "--onnx-model" => ov.onnx_model = Some(parse_value(args, &mut i, a)?),
@@ -570,6 +578,9 @@ fn run_one(input: &str, output: &str, ov: Overrides) -> Result<(), String> {
     }
     if let Some(kbps) = ov.m4a_bitrate_kbps {
         enc.m4a_bitrate_bps = kbps.saturating_mul(1000);
+    }
+    if let Some(encoder) = ov.aac_encoder {
+        enc.aac_encoder = encoder;
     }
 
     #[allow(unused_mut)]

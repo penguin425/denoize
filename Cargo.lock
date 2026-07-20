@@ -488,6 +488,7 @@ dependencies = [
  "ctrlc",
  "deep_filter",
  "ebur128",
+ "fdk-aac-rust",
  "flacenc",
  "hound",
  "kaldi-native-fbank",
@@ -666,6 +667,12 @@ dependencies = [
  "libc",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "fdk-aac-rust"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "73301e1a09f04642bd39ad85c6e54493ff887d4e7f02052d6d201b694f536957"
 
 [[package]]
 name = "filetime"

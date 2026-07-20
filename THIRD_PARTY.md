@@ -46,3 +46,9 @@ The converter loads the published EMA parameters and replaces only the
 PyTorch complex tensor boundary with explicit real and imaginary ONNX
 channels. The Rust adapter independently implements the documented OUVE
 predictor/corrector sampler and signal-processing frontend.
+# Optional FDK-AAC
+
+The `fdk-aac-encoder` feature uses the third-party `fdk-aac-rust` port of the
+Fraunhofer FDK AAC Codec Library for Android. It is not enabled by default, by
+`full`, or in official binaries. The upstream Fraunhofer license and patent
+notice apply when this feature is built or distributed.
