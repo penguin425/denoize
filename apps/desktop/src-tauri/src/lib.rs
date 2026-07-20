@@ -143,6 +143,14 @@ struct PreviewData {
     waveform: Vec<f64>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DropSelection {
+    audio_files: Vec<String>,
+    directories: Vec<String>,
+    ignored: Vec<String>,
+}
+
 #[tauri::command]
 fn app_info() -> AppInfo {
     AppInfo {
@@ -560,6 +568,18 @@ fn save_gui_config(path: String, mut config: serde_json::Value) -> Result<(), St
     std::fs::write(&path, source).map_err(|error| format!("{path} を保存できません: {error}"))
 }
 
+#[tauri::command]
+fn classify_dropped_paths(paths: Vec<String>) -> DropSelection {
+    let mut selection = DropSelection { audio_files: Vec::new(), directories: Vec::new(), ignored: Vec::new() };
+    for value in paths {
+        let path = Path::new(&value);
+        if path.is_dir() { selection.directories.push(value); }
+        else if path.is_file() && is_audio_path(path) { selection.audio_files.push(value); }
+        else { selection.ignored.push(value); }
+    }
+    selection
+}
+
 fn remove_json_nulls(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(map) => {
@@ -835,6 +855,7 @@ pub fn run() {
             prepare_preview,
             load_gui_config,
             save_gui_config,
+            classify_dropped_paths,
             save_text_file
         ])
         .setup(|app| {
@@ -950,5 +971,21 @@ mod tests {
         assert_eq!(loaded["strength"], 0.42);
         assert!(loaded.get("onnx_model").is_none());
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn dropped_paths_are_classified_without_reading_contents() {
+        let root = std::env::temp_dir().join(format!(
+            "denoize-gui-drop-{}-{}",
+            std::process::id(),
+            NEXT_JOB_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let audio = root.join("voice.wav");
+        let ignored = root.join("notes.txt");
+        std::fs::write(&audio, []).unwrap(); std::fs::write(&ignored, []).unwrap();
+        let result = classify_dropped_paths(vec![root.to_string_lossy().into_owned(), audio.to_string_lossy().into_owned(), ignored.to_string_lossy().into_owned()]);
+        assert_eq!(result.directories.len(), 1); assert_eq!(result.audio_files.len(), 1); assert_eq!(result.ignored.len(), 1);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
