@@ -252,6 +252,9 @@ default build includes every backend in the repository's `full` feature set;
 FDK-AAC remains an explicit opt-in because of its separate licensing terms.
 ONNX-based backends expose model-file, model-rate, and SGMSE quality controls
 when selected; managed GTCRN weights are resolved automatically after install.
+Desktop batches accept files or folders, preserve relative paths, run with a
+configurable worker count, continue after individual failures, and can resume
+from the `.denoize-gui-state` journal in the output directory.
 
 ```sh
 cd apps/desktop
