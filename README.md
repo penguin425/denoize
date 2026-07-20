@@ -398,6 +398,26 @@ The report shows noisy and enhanced SI-SDR, SI-SNR, SNR, segmental SNR, and
 improvement deltas. Metrics requiring external models or licensed reference
 implementations are explicitly marked as unmeasured.
 
+### Configuration file
+
+Reusable defaults can be stored in TOML and loaded with `--config`. Explicit
+command-line options override the file.
+
+```toml
+backend = "auto"
+preset = "hifi"
+mode = "speech"
+strength = 0.45
+adaptive_noise = true
+vad = true
+loudness_lufs = -16.0
+true_peak_dbtp = -1.0
+```
+
+```sh
+denoize input.wav output.flac --config denoize.toml --strength 0.55
+```
+
 ```
 -b, --backend <NAME>     classical|rnnoise|deepfilter
 -a, --algorithm <NAME>    omlsa|logmmse|mmse|wiener|specsub|specsub-nl|specsub-geo

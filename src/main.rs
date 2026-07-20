@@ -6,6 +6,7 @@ use denoize::{
     denoise_audio_with_backend_config, AacEncoder, Algorithm, Backend, BackendOptions, ChannelMode,
     EncodeOptions, OnnxModelConfig, SgmseProfile, WindowType,
 };
+use serde::Deserialize;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -27,6 +28,7 @@ USAGE:
     denoize compare <CLEAN> <NOISY> <ENHANCED> [--json|--html]
 
 OPTIONS:
+        --config <PATH>      load TOML defaults (CLI options take precedence)
     -b, --backend <NAME>     auto|{backends}  (default: classical)
     -a, --algorithm <NAME>   omlsa|logmmse|mmse|wiener|specsub|specsub-nl|specsub-geo
     -p, --preset <NAME>      speech|music|aggressive|gentle|restore|hifi
@@ -96,7 +98,7 @@ PRESETS:
     )
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 struct Overrides {
     backend: Option<Backend>,
     auto_backend: bool,
@@ -149,6 +151,101 @@ struct Overrides {
     list_devices: bool,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct FileConfig {
+    backend: Option<String>,
+    algorithm: Option<String>,
+    preset: Option<String>,
+    mode: Option<String>,
+    strength: Option<f64>,
+    profile_ms: Option<f64>,
+    adaptive_noise: bool,
+    vad: bool,
+    frame_size: Option<usize>,
+    overlap: Option<f64>,
+    window: Option<String>,
+    smoothing: Option<f64>,
+    makeup_db: Option<f64>,
+    quality: Option<String>,
+    loudness_lufs: Option<f64>,
+    true_peak_dbtp: Option<f64>,
+    channels: Option<String>,
+    batch: bool,
+    recursive: bool,
+    jobs: Option<usize>,
+    output_format: Option<String>,
+    force: bool,
+    preserve_metadata: Option<bool>,
+}
+
+fn load_config(path: &str) -> Result<Overrides, String> {
+    let source = std::fs::read_to_string(path)
+        .map_err(|error| format!("failed to read config {path}: {error}"))?;
+    parse_config(&source, path)
+}
+
+fn parse_config(source: &str, path: &str) -> Result<Overrides, String> {
+    let config: FileConfig =
+        toml::from_str(source).map_err(|error| format!("invalid config {path}: {error}"))?;
+    let mut ov = Overrides::default();
+    if let Some(name) = config.backend {
+        if name.eq_ignore_ascii_case("auto") {
+            ov.auto_backend = true;
+        } else {
+            ov.backend = Some(
+                Backend::parse(&name)
+                    .ok_or_else(|| format!("unknown backend in config: {name}"))?,
+            );
+        }
+    }
+    if let Some(name) = config.algorithm {
+        ov.algorithm = Some(
+            Algorithm::parse(&name)
+                .ok_or_else(|| format!("unknown algorithm in config: {name}"))?,
+        );
+    }
+    if let Some(name) = config.preset {
+        ov.preset =
+            Some(Preset::parse(&name).ok_or_else(|| format!("unknown preset in config: {name}"))?);
+    }
+    if let Some(name) = config.mode {
+        ov.mode = Some(
+            ProcessingMode::parse(&name)
+                .ok_or_else(|| format!("unknown mode in config: {name}"))?,
+        );
+    }
+    if let Some(name) = config.window {
+        ov.window = Some(
+            WindowType::parse(&name).ok_or_else(|| format!("unknown window in config: {name}"))?,
+        );
+    }
+    if let Some(name) = config.channels {
+        ov.channel_mode = Some(
+            ChannelMode::parse(&name)
+                .ok_or_else(|| format!("unknown channel mode in config: {name}"))?,
+        );
+    }
+    ov.strength = config.strength;
+    ov.profile_ms = config.profile_ms;
+    ov.adaptive_noise = config.adaptive_noise;
+    ov.vad = config.vad;
+    ov.frame_size = config.frame_size;
+    ov.overlap = config.overlap;
+    ov.smoothing = config.smoothing;
+    ov.makeup = config.makeup_db;
+    ov.quality = config.quality.map(|value| value.to_ascii_lowercase());
+    ov.loudness_lufs = config.loudness_lufs;
+    ov.true_peak_dbtp = config.true_peak_dbtp;
+    ov.batch = config.batch;
+    ov.recursive = config.recursive;
+    ov.jobs = config.jobs;
+    ov.output_format = config.output_format;
+    ov.force = config.force;
+    ov.no_metadata = config.preserve_metadata == Some(false);
+    Ok(ov)
+}
+
 fn parse_value<T>(args: &[String], i: &mut usize, flag: &str) -> Result<T, String>
 where
     T: std::str::FromStr,
@@ -166,12 +263,25 @@ where
 fn parse_args(args: &[String]) -> Result<(String, String, Overrides), String> {
     let mut input: Option<String> = None;
     let mut output: Option<String> = None;
-    let mut ov = Overrides::default();
+    let config_path = args
+        .windows(2)
+        .find(|pair| pair[0] == "--config")
+        .map(|pair| pair[1].as_str());
+    if args.last().map(String::as_str) == Some("--config") {
+        return Err("missing value for --config".into());
+    }
+    let mut ov = match config_path {
+        Some(path) => load_config(path)?,
+        None => Overrides::default(),
+    };
 
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
         match a.as_str() {
+            "--config" => {
+                let _: String = parse_value(args, &mut i, a)?;
+            }
             "-h" | "--help" => {
                 print!("{}", usage());
                 std::process::exit(0);
@@ -184,9 +294,11 @@ fn parse_args(args: &[String]) -> Result<(String, String, Overrides), String> {
                 let name: String = parse_value(args, &mut i, a)?;
                 if name.eq_ignore_ascii_case("auto") {
                     ov.auto_backend = true;
+                    ov.backend = None;
                     i += 1;
                     continue;
                 }
+                ov.auto_backend = false;
                 ov.backend = Some(Backend::parse(&name).ok_or_else(|| {
                     format!(
                         "unknown backend: {name} (available: {:?})",
@@ -958,6 +1070,64 @@ mod auto_backend_tests {
     fn automatic_selection_uses_an_available_backend() {
         let selected = select_auto_backend(30.0, None);
         assert!(Backend::available_names().contains(&backend_name(selected)));
+    }
+}
+
+#[cfg(test)]
+mod config_file_tests {
+    use super::*;
+
+    #[test]
+    fn parses_toml_defaults() {
+        let options = parse_config(
+            r#"
+backend = "auto"
+preset = "hifi"
+mode = "speech"
+strength = 0.42
+adaptive_noise = true
+vad = true
+preserve_metadata = false
+"#,
+            "test.toml",
+        )
+        .unwrap();
+        assert!(options.auto_backend);
+        assert_eq!(options.preset, Some(Preset::HiFi));
+        assert_eq!(options.mode, Some(ProcessingMode::Speech));
+        assert_eq!(options.strength, Some(0.42));
+        assert!(options.adaptive_noise && options.vad && options.no_metadata);
+    }
+
+    #[test]
+    fn rejects_unknown_config_keys() {
+        let error = parse_config("strenth = 0.5", "test.toml").unwrap_err();
+        assert!(error.contains("unknown field"));
+    }
+
+    #[test]
+    fn command_line_overrides_config_defaults() {
+        let path = std::env::temp_dir().join(format!(
+            "denoize-config-{}-{}.toml",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::write(&path, "backend = \"auto\"\nstrength = 0.25\n").unwrap();
+        let args = vec![
+            "input.wav".into(),
+            "output.wav".into(),
+            "--config".into(),
+            path.to_string_lossy().into_owned(),
+            "--backend".into(),
+            "classical".into(),
+            "--strength".into(),
+            "0.75".into(),
+        ];
+        let (_, _, options) = parse_args(&args).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(options.backend, Some(Backend::Classical));
+        assert!(!options.auto_backend);
+        assert_eq!(options.strength, Some(0.75));
     }
 }
 
