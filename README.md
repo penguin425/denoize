@@ -322,6 +322,14 @@ RNNoise to bound processing cost. Realtime sessions prefer RNNoise. The
 classical backend is the dependency-free fallback, and the selected backend is
 reported before processing.
 
+### Adaptive noise profiling
+
+`--adaptive-noise` detects spectrally noise-like, low-speech-probability regions
+throughout a recording and slowly refreshes the classical estimator's anchored
+noise profile. This handles changing fans, air conditioning, and room tone
+without assuming that the recording begins with silence. Tonal frames are
+rejected to reduce the risk of learning sustained notes as noise.
+
 ```
 -b, --backend <NAME>     classical|rnnoise|deepfilter
 -a, --algorithm <NAME>    omlsa|logmmse|mmse|wiener|specsub|specsub-nl|specsub-geo

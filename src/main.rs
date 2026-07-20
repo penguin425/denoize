@@ -33,6 +33,7 @@ OPTIONS:
         --profile <MS>       learn noise from first MS ms (default: auto-detect)
         --no-profile         no profiling; rely on blind IMCRA bootstrap
         --no-adapt           freeze the noise estimate
+        --adaptive-noise     learn noise from noise-only regions throughout the file
         --frame <N>          FFT size: 512|1024|2048|4096|8192 (default: 2048)
         --overlap <F>        overlap ratio 0.5..0.95 (default: 0.75)
         --window <NAME>      hann|hamming|sine|blackman|kaiser|flattop|dpss
@@ -98,6 +99,7 @@ struct Overrides {
     profile_ms: Option<f64>,
     no_profile: bool,
     no_adapt: bool,
+    adaptive_noise: bool,
     frame_size: Option<usize>,
     overlap: Option<f64>,
     window: Option<WindowType>,
@@ -194,6 +196,7 @@ fn parse_args(args: &[String]) -> Result<(String, String, Overrides), String> {
             "--profile" => ov.profile_ms = Some(parse_value(args, &mut i, a)?),
             "--no-profile" => ov.no_profile = true,
             "--no-adapt" => ov.no_adapt = true,
+            "--adaptive-noise" => ov.adaptive_noise = true,
             "--frame" => ov.frame_size = Some(parse_value(args, &mut i, a)?),
             "--overlap" => ov.overlap = Some(parse_value(args, &mut i, a)?),
             "--window" => {
@@ -298,6 +301,9 @@ fn build_config(ov: &Overrides, sample_rate: u32) -> DenoiserConfig {
     }
     if ov.no_adapt {
         cfg.adapt = false;
+    }
+    if ov.adaptive_noise {
+        cfg.adaptive_noise = true;
     }
     if let Some(f) = ov.frame_size {
         cfg.frame_size = f;
@@ -430,6 +436,7 @@ fn print_report(input: &str, audio: &denoize::Audio, cfg: &DenoiserConfig, backe
         }
     );
     println!("adapt      : {}", cfg.adapt);
+    println!("adaptive-profile: {}", cfg.adaptive_noise);
     println!("dc-block   : {}", cfg.dc_block);
     println!("makeup     : {:.1} dB", cfg.makeup_gain_db);
     println!(

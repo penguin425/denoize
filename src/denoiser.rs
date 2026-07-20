@@ -87,6 +87,8 @@ pub struct DenoiserConfig {
     pub profile_ms: f64,
     /// Allow the noise PSD to adapt over time.
     pub adapt: bool,
+    /// Continuously learn a profile from confidently noise-only regions.
+    pub adaptive_noise: bool,
     /// Gain release-smoothing coefficient in `[0, 1]` (higher = slower).
     /// Higher values help kill musical noise for transparent results.
     pub smoothing: f64,
@@ -227,6 +229,7 @@ impl DenoiserConfig {
             window: WindowType::Hann,
             profile_ms: 0.0,
             adapt: true,
+            adaptive_noise: false,
             smoothing: 0.6,
             dc_block: true,
             makeup_gain_db: 0.0,
@@ -325,7 +328,10 @@ impl Denoiser {
             beta_floor,
         };
 
-        let noise_cfg = NoiseConfig::default();
+        let noise_cfg = NoiseConfig {
+            adaptive_profile: config.adaptive_noise,
+            ..NoiseConfig::default()
+        };
         let noise = NoiseEstimator::new(noise_cfg, m, sample_rate, hop);
         let makeup = 10f64.powf(config.makeup_gain_db / 20.0);
 
