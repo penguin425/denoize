@@ -330,6 +330,13 @@ noise profile. This handles changing fans, air conditioning, and room tone
 without assuming that the recording begins with silence. Tonal frames are
 rejected to reduce the risk of learning sustained notes as noise.
 
+### Voice activity detection
+
+`--vad` detects speech with 20 ms energy frames, hangover, context padding, and
+region merging. Long silent spans bypass expensive backend inference and are
+strongly attenuated; enhanced speech retains a small dry-signal blend to protect
+consonants and attacks. Output channel count and duration remain unchanged.
+
 ```
 -b, --backend <NAME>     classical|rnnoise|deepfilter
 -a, --algorithm <NAME>    omlsa|logmmse|mmse|wiener|specsub|specsub-nl|specsub-geo

@@ -89,6 +89,8 @@ pub struct DenoiserConfig {
     pub adapt: bool,
     /// Continuously learn a profile from confidently noise-only regions.
     pub adaptive_noise: bool,
+    /// Segment processing around detected speech and strongly attenuate silence.
+    pub vad: bool,
     /// Gain release-smoothing coefficient in `[0, 1]` (higher = slower).
     /// Higher values help kill musical noise for transparent results.
     pub smoothing: f64,
@@ -230,6 +232,7 @@ impl DenoiserConfig {
             profile_ms: 0.0,
             adapt: true,
             adaptive_noise: false,
+            vad: false,
             smoothing: 0.6,
             dc_block: true,
             makeup_gain_db: 0.0,
