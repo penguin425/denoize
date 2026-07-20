@@ -299,6 +299,18 @@ so an overloaded backend drops stale capture chunks instead of blocking the
 audio thread. `--chunk-ms` controls the latency/throughput trade-off and defaults
 to 100 ms. Input and output devices must currently share a default sample rate.
 
+### Batch processing
+
+Process a directory tree concurrently while preserving its relative layout:
+
+```sh
+denoize recordings cleaned --batch --recursive --jobs 4 --output-format flac
+```
+
+Batch mode continues after per-file failures and reports a final success/failure
+summary. Existing outputs remain protected unless `--force` is supplied. Omit
+`--output-format` to retain each input file's format.
+
 ```
 -b, --backend <NAME>     classical|rnnoise|deepfilter
 -a, --algorithm <NAME>    omlsa|logmmse|mmse|wiener|specsub|specsub-nl|specsub-geo
