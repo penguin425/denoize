@@ -135,7 +135,7 @@ fn write_raw_aac_frame<W: std::io::Write + std::io::Seek>(
     Ok(())
 }
 
-fn sample_rate_to_index(sr: u32) -> Result<SampleFreqIndex, String> {
+pub(super) fn sample_rate_to_index(sr: u32) -> Result<SampleFreqIndex, String> {
     match sr {
         96000 => Ok(SampleFreqIndex::Freq96000),
         88200 => Ok(SampleFreqIndex::Freq88200),

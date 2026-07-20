@@ -8,16 +8,37 @@
 
 #[cfg(feature = "m4a-encode")]
 mod m4a;
+#[cfg(feature = "fdk-aac-encoder")]
+mod m4a_fdk;
 mod mp3;
 mod opus;
 mod pcm;
 
 #[cfg(feature = "m4a-encode")]
 pub use m4a::write_m4a;
+#[cfg(feature = "fdk-aac-encoder")]
+pub use m4a_fdk::write_m4a_fdk;
 pub use mp3::{write_mp3, DEFAULT_MP3_BITRATE};
 
 /// Default AAC bitrate (bps, not kbps).
 pub const DEFAULT_M4A_BITRATE: u32 = 192_000;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AacEncoder {
+    #[default]
+    Oxide,
+    Fdk,
+}
+
+impl AacEncoder {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "oxide" | "oxideav" | "rust" => Some(Self::Oxide),
+            "fdk" | "fdk-aac" => Some(Self::Fdk),
+            _ => None,
+        }
+    }
+}
 
 use std::path::Path;
 
@@ -61,6 +82,7 @@ pub struct EncodeOptions {
     pub mp3_bitrate_kbps: u32,
     /// AAC constant bitrate in bps.
     pub m4a_bitrate_bps: u32,
+    pub aac_encoder: AacEncoder,
 }
 
 impl Default for EncodeOptions {
@@ -68,6 +90,7 @@ impl Default for EncodeOptions {
         Self {
             mp3_bitrate_kbps: DEFAULT_MP3_BITRATE,
             m4a_bitrate_bps: DEFAULT_M4A_BITRATE,
+            aac_encoder: AacEncoder::Oxide,
         }
     }
 }
@@ -87,7 +110,19 @@ pub fn write_audio<P: AsRef<Path>>(
         OutputFormat::M4a => {
             #[cfg(feature = "m4a-encode")]
             {
-                write_m4a(path, audio, options.m4a_bitrate_bps)
+                match options.aac_encoder {
+                    AacEncoder::Oxide => write_m4a(path, audio, options.m4a_bitrate_bps),
+                    AacEncoder::Fdk => {
+                        #[cfg(feature = "fdk-aac-encoder")]
+                        {
+                            write_m4a_fdk(path, audio, options.m4a_bitrate_bps)
+                        }
+                        #[cfg(not(feature = "fdk-aac-encoder"))]
+                        {
+                            Err("FDK-AAC is unavailable in this build; rebuild with --features fdk-aac-encoder".into())
+                        }
+                    }
+                }
             }
             #[cfg(not(feature = "m4a-encode"))]
             {

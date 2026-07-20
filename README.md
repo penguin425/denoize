@@ -358,6 +358,21 @@ low suppression; ambient mode preserves environmental texture while tracking
 slowly changing noise. Explicit options such as `--strength` still override the
 mode defaults.
 
+### Optional FDK-AAC encoder
+
+Pure-Rust `oxideav-aac` remains the default. Source builders can opt into the
+Fraunhofer encoder and select it per invocation:
+
+```sh
+cargo build --release --features fdk-aac-encoder
+denoize input.wav output.m4a --aac-encoder fdk --m4a-bitrate 192
+```
+
+The FDK feature uses the third-party Rust port and is intentionally excluded
+from `full` and official release binaries. Fraunhofer's codec source has its own
+license and MPEG-AAC patent language; downstream distributors are responsible
+for reviewing both. Enabling it raises the minimum Rust version to 1.87.
+
 ```
 -b, --backend <NAME>     classical|rnnoise|deepfilter
 -a, --algorithm <NAME>    omlsa|logmmse|mmse|wiener|specsub|specsub-nl|specsub-geo
