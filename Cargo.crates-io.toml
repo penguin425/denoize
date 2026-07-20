@@ -61,6 +61,7 @@ oxideav-aac = "0.1.6"
 mp4 = "0.14.0"
 rubato = "0.16.2"
 rayon = "1.11.0"
+ebur128 = "0.1.10"
 sha2 = "0.10.9"
 ureq = { version = "2.12.1", features = ["tls"] }
 tract-onnx = { version = "0.22.3", optional = true }

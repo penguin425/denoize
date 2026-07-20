@@ -42,6 +42,7 @@ pub mod fft;
 pub mod gain;
 #[cfg(feature = "live")]
 pub mod live;
+pub mod loudness;
 pub mod models;
 pub mod noise;
 pub mod perceptual;

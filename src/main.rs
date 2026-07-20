@@ -55,6 +55,8 @@ OPTIONS:
         --report             print settings report and exit
         --mp3-bitrate <KBPS> MP3 CBR bitrate (default: 192)
         --m4a-bitrate <KBPS> M4A/AAC CBR bitrate (default: 192)
+        --loudness <LUFS>     normalize integrated loudness after denoising
+        --true-peak <DBTP>    true-peak ceiling with --loudness (default: -1)
         --onnx-model <PATH>   waveform ONNX model (required for -b onnx)
         --onnx-rate <HZ>      ONNX model sample rate (default: 16000)
         --channels <MODE>     independent|linked|mid-side (default: independent)
@@ -122,6 +124,8 @@ struct Overrides {
     no_pre_emphasis: bool,
     mp3_bitrate_kbps: Option<u32>,
     m4a_bitrate_kbps: Option<u32>,
+    loudness_lufs: Option<f64>,
+    true_peak_dbtp: Option<f64>,
     onnx_model: Option<String>,
     onnx_sample_rate: Option<u32>,
     channel_mode: Option<ChannelMode>,
@@ -228,6 +232,8 @@ fn parse_args(args: &[String]) -> Result<(String, String, Overrides), String> {
             "--no-pre-emphasis" => ov.no_pre_emphasis = true,
             "--mp3-bitrate" => ov.mp3_bitrate_kbps = Some(parse_value(args, &mut i, a)?),
             "--m4a-bitrate" => ov.m4a_bitrate_kbps = Some(parse_value(args, &mut i, a)?),
+            "--loudness" => ov.loudness_lufs = Some(parse_value(args, &mut i, a)?),
+            "--true-peak" => ov.true_peak_dbtp = Some(parse_value(args, &mut i, a)?),
             "--onnx-model" => ov.onnx_model = Some(parse_value(args, &mut i, a)?),
             "--onnx-rate" => ov.onnx_sample_rate = Some(parse_value(args, &mut i, a)?),
             "--channels" => {
@@ -575,6 +581,18 @@ fn run_one(input: &str, output: &str, ov: Overrides) -> Result<(), String> {
         });
     }
     let elapsed = denoise_audio_with_backend_config(&mut audio, cfg, backend, &backend_options)?;
+    if let Some(target) = ov.loudness_lufs {
+        let report =
+            denoize::loudness::normalize(&mut audio, target, ov.true_peak_dbtp.unwrap_or(-1.0))?;
+        if !ov.json {
+            eprintln!(
+                "denoize: loudness {:.2} -> {:.2} LUFS, true peak {:.2} dBTP, gain {:+.2} dB",
+                report.input_lufs, report.output_lufs, report.true_peak_dbtp, report.gain_db
+            );
+        }
+    } else if ov.true_peak_dbtp.is_some() {
+        return Err("--true-peak requires --loudness".into());
+    }
     if output == "-" {
         let bytes = write_wav_bytes(&audio)?;
         std::io::Write::write_all(&mut std::io::stdout(), &bytes)

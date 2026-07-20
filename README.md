@@ -337,6 +337,18 @@ region merging. Long silent spans bypass expensive backend inference and are
 strongly attenuated; enhanced speech retains a small dry-signal blend to protect
 consonants and attacks. Output channel count and duration remain unchanged.
 
+### Loudness delivery
+
+Normalize denoised output to an EBU R128 integrated-loudness target while
+respecting an oversampled true-peak ceiling:
+
+```sh
+denoize input.wav output.flac --loudness -16 --true-peak -1
+```
+
+The applied gain is reduced when necessary to satisfy the peak ceiling, so
+peak safety takes precedence over reaching the requested LUFS exactly.
+
 ```
 -b, --backend <NAME>     classical|rnnoise|deepfilter
 -a, --algorithm <NAME>    omlsa|logmmse|mmse|wiener|specsub|specsub-nl|specsub-geo
