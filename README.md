@@ -89,6 +89,9 @@ denoize noisy.wav clean.wav -b sgmse \
 
 # Verified official GTCRN model (manual model path is unnecessary afterwards)
 denoize models install gtcrn
+denoize models verify all
+denoize models update gtcrn
+denoize models remove gtcrn
 denoize noisy.wav clean.wav -b gtcrn
 
 # Stereo coupling, pipes, metrics, and directory batches

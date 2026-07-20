@@ -123,6 +123,60 @@ pub fn install(model: &ModelInfo) -> Result<PathBuf, String> {
     Ok(destination)
 }
 
+/// Remove an installed model and any interrupted download for it.
+pub fn remove(model: &ModelInfo) -> Result<bool, String> {
+    let destination = path(model)?;
+    let partial = destination.with_extension("onnx.part");
+    let removed = remove_file_if_present(&destination)? | remove_file_if_present(&partial)?;
+    if let Some(directory) = destination.parent() {
+        match std::fs::remove_dir(directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
+            Err(error) => return Err(format!("failed to remove {}: {error}", directory.display())),
+        }
+    }
+    Ok(removed)
+}
+
+/// Re-download a model while retaining the verified old file if the update fails.
+pub fn update(model: &ModelInfo) -> Result<PathBuf, String> {
+    let destination = path(model)?;
+    let backup = destination.with_extension("onnx.backup");
+    let had_existing = destination.is_file();
+    if had_existing {
+        std::fs::rename(&destination, &backup).map_err(|error| {
+            format!(
+                "failed to stage existing model {}: {error}",
+                destination.display()
+            )
+        })?;
+    }
+    match install(model) {
+        Ok(path) => {
+            let _ = std::fs::remove_file(backup);
+            Ok(path)
+        }
+        Err(error) => {
+            if had_existing {
+                let _ = std::fs::remove_file(&destination);
+                std::fs::rename(&backup, &destination).map_err(|restore_error| {
+                    format!("{error}; additionally failed to restore old model: {restore_error}")
+                })?;
+            }
+            Err(error)
+        }
+    }
+}
+
+fn remove_file_if_present(path: &Path) -> Result<bool, String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!("failed to remove {}: {error}", path.display())),
+    }
+}
+
 fn sha256(path: &Path) -> Result<String, String> {
     let mut input =
         File::open(path).map_err(|error| format!("failed to open {}: {error}", path.display()))?;
@@ -153,5 +207,17 @@ mod tests {
             assert!(model.sample_rate > 0);
             assert!(!model.license.is_empty());
         }
+    }
+
+    #[test]
+    fn removal_is_idempotent() {
+        let directory =
+            std::env::temp_dir().join(format!("denoize-model-remove-test-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("model.onnx");
+        std::fs::write(&path, b"model").unwrap();
+        assert!(remove_file_if_present(&path).unwrap());
+        assert!(!remove_file_if_present(&path).unwrap());
+        std::fs::remove_dir(directory).unwrap();
     }
 }
