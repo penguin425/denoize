@@ -69,6 +69,7 @@ OPTIONS:
         --output-format <EXT> convert every batch output to this format
         --force               allow replacing existing output files
         --json                emit a machine-readable result
+        --no-metadata         do not copy input tags/artwork to the output
         --input-device <NAME> live capture device (default: system default)
         --output-device <NAME> live playback device (default: system default)
         --chunk-ms <MS>       live processing chunk duration (default: 100)
@@ -140,6 +141,7 @@ struct Overrides {
     output_format: Option<String>,
     force: bool,
     json: bool,
+    no_metadata: bool,
     input_device: Option<String>,
     output_device: Option<String>,
     chunk_ms: Option<u32>,
@@ -274,6 +276,7 @@ fn parse_args(args: &[String]) -> Result<(String, String, Overrides), String> {
             "--output-format" => ov.output_format = Some(parse_value(args, &mut i, a)?),
             "--force" => ov.force = true,
             "--json" => ov.json = true,
+            "--no-metadata" => ov.no_metadata = true,
             "--input-device" => ov.input_device = Some(parse_value(args, &mut i, a)?),
             "--output-device" => ov.output_device = Some(parse_value(args, &mut i, a)?),
             "--chunk-ms" => ov.chunk_ms = Some(parse_value(args, &mut i, a)?),
@@ -541,6 +544,11 @@ fn run_live(_args: &[String]) -> Result<(), String> {
 }
 
 fn run_one(input: &str, output: &str, ov: Overrides) -> Result<(), String> {
+    let metadata = if input != "-" && !ov.no_metadata {
+        denoize::metadata::read(std::path::Path::new(input))?
+    } else {
+        None
+    };
     let mut audio = if input == "-" {
         let mut bytes = Vec::new();
         std::io::Read::read_to_end(&mut std::io::stdin(), &mut bytes)
@@ -641,6 +649,9 @@ fn run_one(input: &str, output: &str, ov: Overrides) -> Result<(), String> {
             std::fs::remove_file(output_path).map_err(|e| format!("replace output: {e}"))?;
         }
         std::fs::rename(&temporary, output_path).map_err(|e| format!("commit output: {e}"))?;
+        if let Some(metadata) = metadata {
+            denoize::metadata::write(metadata, output_path)?;
+        }
         if ov.json {
             println!("{{\"input\":{:?},\"output\":{:?},\"backend\":{:?},\"channels\":{},\"frames\":{},\"sample_rate\":{},\"elapsed_ms\":{:.3}}}", input, output, format!("{backend:?}").to_ascii_lowercase(), audio.channels(), audio.frames(), audio.sample_rate, elapsed.as_secs_f64() * 1000.0);
         }

@@ -379,6 +379,13 @@ for reviewing both. Enabling it raises the minimum Rust version to 1.87.
 container or an ffmpeg conversion step. M4A and raw AAC share
 `--m4a-bitrate`; raw ADTS output currently uses the default oxideav encoder.
 
+### Metadata preservation
+
+File processing preserves the input's primary metadata tag after encoding.
+Native tags are retained for same-format output; conversions remap common
+fields such as title, artist, album, date, ReplayGain, comments, and artwork to
+the destination container's tag type. Use `--no-metadata` for a clean output.
+
 ```
 -b, --backend <NAME>     classical|rnnoise|deepfilter
 -a, --algorithm <NAME>    omlsa|logmmse|mmse|wiener|specsub|specsub-nl|specsub-geo
