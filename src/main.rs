@@ -26,7 +26,7 @@ USAGE:
     denoize metrics <REFERENCE> <TEST> [--json|--markdown]
 
 OPTIONS:
-    -b, --backend <NAME>     {backends}  (default: classical)
+    -b, --backend <NAME>     auto|{backends}  (default: classical)
     -a, --algorithm <NAME>   omlsa|logmmse|mmse|wiener|specsub|specsub-nl|specsub-geo
     -p, --preset <NAME>      speech|music|aggressive|gentle|restore|hifi
     -s, --strength <0..1>    denoising strength (default: 0.6)
@@ -91,6 +91,7 @@ PRESETS:
 #[derive(Clone, Default)]
 struct Overrides {
     backend: Option<Backend>,
+    auto_backend: bool,
     algorithm: Option<Algorithm>,
     preset: Option<Preset>,
     strength: Option<f64>,
@@ -166,6 +167,11 @@ fn parse_args(args: &[String]) -> Result<(String, String, Overrides), String> {
             }
             "-b" | "--backend" => {
                 let name: String = parse_value(args, &mut i, a)?;
+                if name.eq_ignore_ascii_case("auto") {
+                    ov.auto_backend = true;
+                    i += 1;
+                    continue;
+                }
                 ov.backend = Some(Backend::parse(&name).ok_or_else(|| {
                     format!(
                         "unknown backend: {name} (available: {:?})",
@@ -466,7 +472,11 @@ fn run_live(args: &[String]) -> Result<(), String> {
         }
         return Ok(());
     }
-    let backend = ov.backend.unwrap_or(Backend::Classical);
+    let backend = if ov.auto_backend {
+        select_live_backend()
+    } else {
+        ov.backend.unwrap_or(Backend::Classical)
+    };
     let sample_rate = 48_000;
     let denoiser = build_config(&ov, sample_rate);
     let backend_options = BackendOptions {
@@ -502,7 +512,17 @@ fn run_one(input: &str, output: &str, ov: Overrides) -> Result<(), String> {
         read_audio(input)?
     };
     let cfg = build_config(&ov, audio.sample_rate);
-    let backend = ov.backend.unwrap_or(Backend::Classical);
+    let backend = if ov.auto_backend {
+        select_auto_backend(
+            audio.frames() as f64 / audio.sample_rate as f64,
+            ov.quality.as_deref(),
+        )
+    } else {
+        ov.backend.unwrap_or(Backend::Classical)
+    };
+    if ov.auto_backend && !ov.json {
+        eprintln!("denoize: auto-selected backend {}", backend_name(backend));
+    }
 
     if ov.report {
         print_report(input, &audio, &cfg, backend);
@@ -573,6 +593,55 @@ fn run_one(input: &str, output: &str, ov: Overrides) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn backend_name(backend: Backend) -> &'static str {
+    match backend {
+        Backend::Classical => "classical",
+        #[cfg(feature = "rnnoise")]
+        Backend::Rnnoise => "rnnoise",
+        #[cfg(feature = "deepfilter")]
+        Backend::DeepFilter => "deepfilter",
+        #[cfg(feature = "onnx")]
+        Backend::Onnx => "onnx",
+        #[cfg(feature = "mpsenet")]
+        Backend::MpSenet => "mpsenet",
+        #[cfg(feature = "bsrnn")]
+        Backend::Bsrnn => "bsrnn",
+        #[cfg(feature = "mossformer2")]
+        Backend::Mossformer2 => "mossformer2",
+        #[cfg(feature = "sgmse")]
+        Backend::Sgmse => "sgmse",
+        #[cfg(feature = "gtcrn")]
+        Backend::Gtcrn => "gtcrn",
+    }
+}
+
+/// Choose the strongest built-in backend whose expected cost fits the request.
+fn select_auto_backend(_duration_seconds: f64, _quality: Option<&str>) -> Backend {
+    #[cfg(feature = "deepfilter")]
+    {
+        let high_quality = matches!(_quality, Some("high" | "ultra" | "max" | "highest"));
+        if high_quality || _duration_seconds <= 10.0 * 60.0 {
+            return Backend::DeepFilter;
+        }
+    }
+    #[cfg(feature = "rnnoise")]
+    {
+        return Backend::Rnnoise;
+    }
+    #[allow(unreachable_code)]
+    Backend::Classical
+}
+
+#[cfg(feature = "live")]
+fn select_live_backend() -> Backend {
+    #[cfg(feature = "rnnoise")]
+    {
+        return Backend::Rnnoise;
+    }
+    #[allow(unreachable_code)]
+    Backend::Classical
 }
 
 fn run_batch(input: &str, output: &str, ov: &Overrides) -> Result<(), String> {
@@ -796,6 +865,30 @@ mod batch_tests {
         run_batch(input.to_str().unwrap(), output.to_str().unwrap(), &options).unwrap();
         assert!(output.join("nested/sample.flac").is_file());
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod auto_backend_tests {
+    use super::*;
+
+    #[test]
+    fn parses_auto_backend() {
+        let (_, _, options) = parse_args(&[
+            "input.wav".into(),
+            "output.wav".into(),
+            "--backend".into(),
+            "auto".into(),
+        ])
+        .unwrap();
+        assert!(options.auto_backend);
+        assert!(options.backend.is_none());
+    }
+
+    #[test]
+    fn automatic_selection_uses_an_available_backend() {
+        let selected = select_auto_backend(30.0, None);
+        assert!(Backend::available_names().contains(&backend_name(selected)));
     }
 }
 
