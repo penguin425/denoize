@@ -21,6 +21,10 @@ type ModelRow = {
   name: string; backend: string; license: string; sampleRate: number; revision: string;
   installed: boolean; path: string;
 };
+type ModelProgress = {
+  jobId: number; name: string; status: "running" | "completed" | "failed" | "cancelled";
+  message: string; downloaded: number; total: number | null; fraction: number | null;
+};
 type PreviewData = { source: string; playablePath: string; durationSeconds: number; rmsDb: number; waveform: number[] };
 type DropSelection = { audioFiles: string[]; directories: string[]; ignored: string[] };
 type LiveDevices = { inputs: string[]; outputs: string[] };
@@ -34,6 +38,7 @@ const audioFilters = [{ name: "Audio", extensions: ["wav", "flac", "opus", "ogg"
 let appInfo: AppInfo;
 let activeJob: number | null = null;
 let comparison: Comparison | null = null;
+let activeModelJob: number | null = null;
 const previews: { input?: PreviewData; output?: PreviewData } = {};
 let activePreview: "input" | "output" = "input";
 
@@ -505,14 +510,35 @@ $("#export-report").addEventListener("click", async () => {
 async function loadModels() {
   try {
     const models = await invoke<ModelRow[]>("list_models");
-    $("#model-list").innerHTML = models.map((model) => `<div class="model-row"><div class="model-icon">AI</div><div class="model-info"><div><b>${escapeHtml(model.name)}</b><span class="pill ${model.installed ? "installed" : ""}">${model.installed ? "インストール済み" : "未導入"}</span></div><p>${escapeHtml(model.backend)} · ${model.sampleRate.toLocaleString()} Hz · ${escapeHtml(model.license)}</p><small>${escapeHtml(model.path)}</small></div><div class="model-actions">${model.installed ? `<button data-model="${model.name}" data-action="verify">検証</button><button data-model="${model.name}" data-action="update">更新</button><button class="remove" data-model="${model.name}" data-action="remove">削除</button>` : `<button class="install" data-model="${model.name}" data-action="install">導入</button>`}</div></div>`).join("");
+    $("#model-list").innerHTML = models.map((model) => `<div class="model-row" data-model-row="${model.name}"><div class="model-icon">AI</div><div class="model-info"><div><b>${escapeHtml(model.name)}</b><span class="pill ${model.installed ? "installed" : ""}">${model.installed ? "インストール済み" : "未導入"}</span></div><p>${escapeHtml(model.backend)} · ${model.sampleRate.toLocaleString()} Hz · ${escapeHtml(model.license)}</p><small>${escapeHtml(model.path)}</small><div class="model-progress hidden"><div><i></i></div><span></span></div></div><div class="model-actions">${model.installed ? `<button data-model="${model.name}" data-action="verify">検証</button><button data-model="${model.name}" data-action="update">更新</button><button class="remove" data-model="${model.name}" data-action="remove">削除</button>` : `<button class="install" data-model="${model.name}" data-action="install">導入</button>`}<button class="remove hidden" data-cancel-model>中断</button></div></div>`).join("");
     document.querySelectorAll<HTMLButtonElement>("[data-model]").forEach((button) => button.addEventListener("click", async () => {
-      try { button.disabled = true; const result = await invoke<string>("model_action", { name: button.dataset.model, action: button.dataset.action }); showToast(result); await loadModels(); }
-      catch (error) { showToast(errorText(error), true); } finally { button.disabled = false; }
+      try {
+        document.querySelectorAll<HTMLButtonElement>("[data-model]").forEach((item) => item.disabled = true);
+        activeModelJob = await invoke<number>("model_action", { name: button.dataset.model, action: button.dataset.action });
+        const row = button.closest<HTMLElement>("[data-model-row]")!;
+        row.querySelector(".model-progress")?.classList.remove("hidden"); row.querySelector("[data-cancel-model]")?.classList.remove("hidden");
+      } catch (error) { showToast(errorText(error), true); document.querySelectorAll<HTMLButtonElement>("[data-model]").forEach((item) => item.disabled = false); }
+    }));
+    document.querySelectorAll<HTMLButtonElement>("[data-cancel-model]").forEach((button) => button.addEventListener("click", async () => {
+      if (activeModelJob !== null) await invoke("cancel_job", { jobId: activeModelJob });
     }));
   } catch (error) { $("#model-list").textContent = errorText(error); }
 }
 $("#refresh-models").addEventListener("click", loadModels);
+listen<ModelProgress>("model-progress", ({ payload }) => {
+  if (payload.jobId !== activeModelJob) return;
+  const row = document.querySelector<HTMLElement>(`[data-model-row="${CSS.escape(payload.name)}"]`);
+  if (row) {
+    const progress = row.querySelector<HTMLElement>(".model-progress")!; progress.classList.remove("hidden");
+    const percent = payload.fraction == null ? null : Math.min(100, Math.round(payload.fraction * 100));
+    progress.querySelector<HTMLElement>("i")!.style.width = `${percent ?? 100}%`;
+    progress.classList.toggle("indeterminate", percent == null);
+    progress.querySelector("span")!.textContent = `${payload.message}${percent == null ? "" : ` · ${percent}%`}`;
+  }
+  if (payload.status !== "running") {
+    activeModelJob = null; showToast(payload.message, payload.status === "failed"); void loadModels();
+  }
+});
 
 let checkingUpdate = false;
 async function checkForUpdate(interactive: boolean) {

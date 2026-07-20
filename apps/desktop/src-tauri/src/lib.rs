@@ -124,6 +124,18 @@ struct JobProgress {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct ModelProgress {
+    job_id: u64,
+    name: String,
+    status: &'static str,
+    message: String,
+    downloaded: u64,
+    total: Option<u64>,
+    fraction: Option<f64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct AppInfo {
     version: &'static str,
     backends: Vec<BackendInfo>,
@@ -583,22 +595,63 @@ fn list_models() -> Result<Vec<ModelRow>, String> {
 }
 
 #[tauri::command]
-async fn model_action(name: String, action: String) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let model = denoize::models::find(&name).ok_or_else(|| format!("不明なモデル: {name}"))?;
-        match action.as_str() {
-            "install" => Ok(denoize::models::install(model)?.display().to_string()),
-            "update" => Ok(denoize::models::update(model)?.display().to_string()),
-            "verify" => Ok(denoize::models::verify(model)?.display().to_string()),
-            "remove" => {
-                denoize::models::remove(model)?;
-                Ok("削除しました".into())
-            }
-            _ => Err(format!("不明な操作: {action}")),
+fn model_action(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    name: String,
+    action: String,
+) -> Result<u64, String> {
+    let model = denoize::models::find(&name).ok_or_else(|| format!("不明なモデル: {name}"))?;
+    if !matches!(action.as_str(), "install" | "update" | "verify" | "remove") {
+        return Err(format!("不明な操作: {action}"));
+    }
+    let (job_id, cancelled) = register_job(&state)?;
+    let jobs = Arc::clone(&state.jobs);
+    std::thread::spawn(move || {
+        emit_model_progress(&app, job_id, &name, "running", "準備しています", 0, None);
+        let progress = |downloaded, total| {
+            emit_model_progress(
+                &app,
+                job_id,
+                &name,
+                "running",
+                "モデルをダウンロードしています",
+                downloaded,
+                total,
+            );
+        };
+        let result = match action.as_str() {
+            "install" => denoize::models::install_with_progress(
+                model,
+                || cancelled.load(Ordering::Relaxed),
+                progress,
+            )
+            .map(|path| path.display().to_string()),
+            "update" => denoize::models::update_with_progress(
+                model,
+                || cancelled.load(Ordering::Relaxed),
+                progress,
+            )
+            .map(|path| path.display().to_string()),
+            "verify" => denoize::models::verify(model).map(|path| path.display().to_string()),
+            "remove" => denoize::models::remove(model).map(|_| "削除しました".into()),
+            _ => unreachable!(),
+        };
+        match result {
+            Ok(message) => emit_model_progress(&app, job_id, &name, "completed", &message, 1, Some(1)),
+            Err(error) if error == "cancelled" => emit_model_progress(&app, job_id, &name, "cancelled", "モデル操作を中断しました", 0, None),
+            Err(error) => emit_model_progress(&app, job_id, &name, "failed", &error, 0, None),
         }
-    })
-    .await
-    .map_err(|error| format!("モデル操作に失敗しました: {error}"))?
+        if let Ok(mut jobs) = jobs.lock() { jobs.remove(&job_id); }
+    });
+    Ok(job_id)
+}
+
+fn emit_model_progress(app: &AppHandle, job_id: u64, name: &str, status: &'static str, message: &str, downloaded: u64, total: Option<u64>) {
+    let _ = app.emit("model-progress", ModelProgress {
+        job_id, name: name.into(), status, message: message.into(), downloaded, total,
+        fraction: total.filter(|total| *total > 0).map(|total| downloaded as f64 / total as f64),
+    });
 }
 
 #[tauri::command]

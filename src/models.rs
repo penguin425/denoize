@@ -72,6 +72,20 @@ pub fn verify(model: &ModelInfo) -> Result<PathBuf, String> {
 }
 
 pub fn install(model: &ModelInfo) -> Result<PathBuf, String> {
+    install_with_progress(model, || false, |_, _| {})
+}
+
+/// Install a model while reporting downloaded bytes and supporting cancellation.
+/// Interrupted downloads remain as `.part` files and are resumed next time.
+pub fn install_with_progress<C, P>(
+    model: &ModelInfo,
+    mut cancelled: C,
+    mut progress: P,
+) -> Result<PathBuf, String>
+where
+    C: FnMut() -> bool,
+    P: FnMut(u64, Option<u64>),
+{
     if let Ok(path) = verify(model) {
         return Ok(path);
     }
@@ -91,6 +105,12 @@ pub fn install(model: &ModelInfo) -> Result<PathBuf, String> {
         .call()
         .map_err(|error| format!("failed to download {}: {error}", model.url))?;
     let resumed = downloaded > 0 && response.status() == 206;
+    let response_length = response
+        .header("Content-Length")
+        .and_then(|value| value.parse::<u64>().ok());
+    let total = response_length.map(|length| if resumed { downloaded + length } else { length });
+    let mut received = if resumed { downloaded } else { 0 };
+    progress(received, total);
     let mut output = OpenOptions::new()
         .create(true)
         .write(true)
@@ -99,8 +119,26 @@ pub fn install(model: &ModelInfo) -> Result<PathBuf, String> {
         .open(&partial)
         .map_err(|error| format!("failed to open {}: {error}", partial.display()))?;
     let mut reader = response.into_reader();
-    std::io::copy(&mut reader, &mut output)
-        .map_err(|error| format!("failed to save {}: {error}", partial.display()))?;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        if cancelled() {
+            output
+                .flush()
+                .map_err(|error| format!("failed to flush {}: {error}", partial.display()))?;
+            return Err("cancelled".into());
+        }
+        let count = reader
+            .read(&mut buffer)
+            .map_err(|error| format!("failed to download {}: {error}", model.url))?;
+        if count == 0 {
+            break;
+        }
+        output
+            .write_all(&buffer[..count])
+            .map_err(|error| format!("failed to save {}: {error}", partial.display()))?;
+        received += count as u64;
+        progress(received, total);
+    }
     output
         .flush()
         .map_err(|error| format!("failed to flush {}: {error}", partial.display()))?;
@@ -141,6 +179,20 @@ pub fn remove(model: &ModelInfo) -> Result<bool, String> {
 
 /// Re-download a model while retaining the verified old file if the update fails.
 pub fn update(model: &ModelInfo) -> Result<PathBuf, String> {
+    update_with_progress(model, || false, |_, _| {})
+}
+
+/// Update a model with progress and cancellation, restoring the old verified
+/// model whenever the replacement is not completed.
+pub fn update_with_progress<C, P>(
+    model: &ModelInfo,
+    cancelled: C,
+    progress: P,
+) -> Result<PathBuf, String>
+where
+    C: FnMut() -> bool,
+    P: FnMut(u64, Option<u64>),
+{
     let destination = path(model)?;
     let backup = destination.with_extension("onnx.backup");
     let had_existing = destination.is_file();
@@ -152,7 +204,7 @@ pub fn update(model: &ModelInfo) -> Result<PathBuf, String> {
             )
         })?;
     }
-    match install(model) {
+    match install_with_progress(model, cancelled, progress) {
         Ok(path) => {
             let _ = std::fs::remove_file(backup);
             Ok(path)
