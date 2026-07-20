@@ -311,6 +311,14 @@ Batch mode continues after per-file failures and reports a final success/failure
 summary. Existing outputs remain protected unless `--force` is supplied. Omit
 `--output-format` to retain each input file's format.
 
+### Automatic backend selection
+
+Use `--backend auto` when the build contains multiple denoisers. Short and
+quality-prioritized files use DeepFilterNet when available; long files use
+RNNoise to bound processing cost. Realtime sessions prefer RNNoise. The
+classical backend is the dependency-free fallback, and the selected backend is
+reported before processing.
+
 ```
 -b, --backend <NAME>     classical|rnnoise|deepfilter
 -a, --algorithm <NAME>    omlsa|logmmse|mmse|wiener|specsub|specsub-nl|specsub-geo
