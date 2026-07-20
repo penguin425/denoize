@@ -3,6 +3,8 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open, save } from "@tauri-apps/plugin-dialog";
+import { relaunch } from "@tauri-apps/plugin-process";
+import { check } from "@tauri-apps/plugin-updater";
 import "./styles.css";
 
 type BackendInfo = { name: string; externalModel: boolean; managedModel: string | null; sampleRate: number | null };
@@ -49,7 +51,7 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
       <div class="sidebar-foot"><span class="status-dot"></span><span id="engine-label">エンジンを確認中</span><small id="version"></small></div>
     </aside>
     <main>
-      <header><div><p class="eyebrow">AUDIO RESTORATION</p><h1 id="page-title">ノイズ除去</h1></div><div class="header-actions"><button id="import-config">設定を読込</button><button id="export-config">設定を書出</button><button id="reset-config">初期化</button><div class="header-badge">LOCAL · PRIVATE</div></div></header>
+      <header><div><p class="eyebrow">AUDIO RESTORATION</p><h1 id="page-title">ノイズ除去</h1></div><div class="header-actions"><button id="check-update">更新を確認</button><button id="import-config">設定を読込</button><button id="export-config">設定を書出</button><button id="reset-config">初期化</button><div class="header-badge">LOCAL · PRIVATE</div></div></header>
 
       <section class="page active" id="page-process">
         <div class="grid process-grid">
@@ -295,6 +297,7 @@ async function init() {
   restoreSettings();
   renderCompareInputs();
   await loadModels();
+  window.setTimeout(() => void checkForUpdate(false), 1500);
 }
 
 function updateBackendSettings() {
@@ -510,6 +513,30 @@ async function loadModels() {
   } catch (error) { $("#model-list").textContent = errorText(error); }
 }
 $("#refresh-models").addEventListener("click", loadModels);
+
+let checkingUpdate = false;
+async function checkForUpdate(interactive: boolean) {
+  if (checkingUpdate) return;
+  checkingUpdate = true; const button = $<HTMLButtonElement>("#check-update"); button.disabled = true;
+  try {
+    const update = await check();
+    if (!update) { if (interactive) showToast("最新版を使用しています"); return; }
+    const accepted = window.confirm(`denoize ${update.version} を利用できます。ダウンロードして再起動しますか？\n\n${update.body ?? ""}`);
+    if (!accepted) return;
+    let downloaded = 0; let total = 0;
+    await update.downloadAndInstall((event) => {
+      if (event.event === "Started") total = event.data.contentLength ?? 0;
+      if (event.event === "Progress") downloaded += event.data.chunkLength;
+      if (event.event === "Finished") showToast("更新をインストールしました。再起動します");
+      else if (total) button.textContent = `更新 ${Math.min(100, Math.round(downloaded / total * 100))}%`;
+      else button.textContent = "更新をダウンロード中";
+    });
+    await relaunch();
+  } catch (error) {
+    if (interactive) showToast(`更新確認: ${errorText(error)}`, true);
+  } finally { checkingUpdate = false; button.disabled = false; button.textContent = "更新を確認"; }
+}
+$("#check-update").addEventListener("click", () => void checkForUpdate(true));
 
 async function loadLiveDevices() {
   const message = $("#live-device-message");

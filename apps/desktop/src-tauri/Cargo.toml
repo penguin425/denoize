@@ -27,3 +27,7 @@ default = ["full", "live"]
 full = ["denoize/full"]
 live = ["denoize/live"]
 fdk-aac-encoder = ["denoize/fdk-aac-encoder"]
+
+[target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
+tauri-plugin-process = "2.3.1"
+tauri-plugin-updater = "2.9.0"

@@ -209,15 +209,18 @@ jobs:
         run: npm ci
 
       - name: Build and upload desktop bundles
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         with:
           projectPath: apps/desktop
           tagName: ${{ github.ref_name }}
           releaseName: denoize ${{ github.ref_name }}
           releaseDraft: true
           prerelease: false
+          uploadUpdaterJson: true
+          updaterJsonPreferNsis: true
           args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
 
   publish:
