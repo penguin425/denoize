@@ -164,9 +164,65 @@ jobs:
             denoize-${GITHUB_REF_NAME}-${{ matrix.target }}.${{ matrix.archive }}.sha256 \
             --clobber
 
+  desktop-build:
+    name: Desktop ${{ matrix.target }}
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bundles: deb,appimage
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            bundles: dmg
+          - os: macos-14
+            target: aarch64-apple-darwin
+            bundles: dmg
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bundles: msi,nsis
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v6
+
+      - name: Install Linux desktop dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends \
+            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev patchelf \
+            libasound2-dev libayatana-appindicator3-dev
+
+      - name: Select stable Rust
+        shell: bash
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup target add "${{ matrix.target }}"
+
+      - name: Install frontend dependencies
+        working-directory: apps/desktop
+        run: npm ci
+
+      - name: Build and upload desktop bundles
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          projectPath: apps/desktop
+          tagName: ${{ github.ref_name }}
+          releaseName: denoize ${{ github.ref_name }}
+          releaseDraft: true
+          prerelease: false
+          args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+
   publish:
     name: Publish release
-    needs: [build, publish-crate]
+    needs: [build, desktop-build, publish-crate]
     runs-on: ubuntu-latest
     steps:
       - name: Publish draft release
