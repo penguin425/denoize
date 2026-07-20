@@ -8,7 +8,7 @@ Input/output: WAV, FLAC, Ogg Opus, MP3, M4A (built in; no ffmpeg).
 
 USAGE:
     denoize <INPUT> <OUTPUT.wav|flac|opus|ogg|mp3|m4a> [OPTIONS]
-    denoize models <list|install|verify|path> [MODEL]
+    denoize models <list|info|install|update|verify|remove|path|cache-dir> [MODEL|all]
     denoize metrics <REFERENCE> <TEST> [--json|--markdown]
 
 OPTIONS:

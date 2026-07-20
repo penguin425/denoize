@@ -22,7 +22,7 @@ USAGE:
     denoize <INPUT> <OUTPUT.wav|flac|opus|ogg|mp3|m4a> [OPTIONS]
     denoize live [--input-device NAME] [--output-device NAME] [OPTIONS]
     denoize live --list-devices
-    denoize models <list|install|verify|path> [MODEL]
+    denoize models <list|info|install|update|verify|remove|path|cache-dir> [MODEL|all]
     denoize metrics <REFERENCE> <TEST> [--json|--markdown]
 
 OPTIONS:
@@ -922,16 +922,46 @@ fn run_models(args: &[String]) -> Result<(), String> {
         }
         return Ok(());
     }
+    if command == "cache-dir" {
+        println!("{}", denoize::models::cache_dir()?.display());
+        return Ok(());
+    }
     let name = args
         .get(1)
         .ok_or_else(|| format!("models {command} requires MODEL"))?;
-    let model = denoize::models::find(name)
-        .ok_or_else(|| format!("unknown model: {name} (run `denoize models list`)"))?;
-    match command {
-        "install" => println!("{}", denoize::models::install(model)?.display()),
-        "verify" => println!("verified {}", denoize::models::verify(model)?.display()),
-        "path" => println!("{}", denoize::models::path(model)?.display()),
-        _ => return Err(format!("unknown models command: {command}")),
+    let models: Vec<_> = if name == "all" {
+        denoize::models::MODELS.iter().collect()
+    } else {
+        vec![denoize::models::find(name)
+            .ok_or_else(|| format!("unknown model: {name} (run `denoize models list`)"))?]
+    };
+    for model in models {
+        match command {
+            "info" => {
+                println!("name: {}", model.name);
+                println!("backend: {}", model.backend);
+                println!("sample-rate: {}", model.sample_rate);
+                println!("license: {}", model.license);
+                println!("revision: {}", model.revision);
+                println!("sha256: {}", model.sha256);
+                println!("url: {}", model.url);
+                println!("path: {}", denoize::models::path(model)?.display());
+            }
+            "install" => println!("{}", denoize::models::install(model)?.display()),
+            "update" => println!("{}", denoize::models::update(model)?.display()),
+            "verify" => println!("verified {}", denoize::models::verify(model)?.display()),
+            "remove" => println!(
+                "{} {}",
+                if denoize::models::remove(model)? {
+                    "removed"
+                } else {
+                    "not-installed"
+                },
+                model.name
+            ),
+            "path" => println!("{}", denoize::models::path(model)?.display()),
+            _ => return Err(format!("unknown models command: {command}")),
+        }
     }
     Ok(())
 }
