@@ -3,7 +3,8 @@ import { listen } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import "./styles.css";
 
-type AppInfo = { version: string; backends: string[]; formats: string[]; fdkAvailable: boolean };
+type BackendInfo = { name: string; externalModel: boolean; managedModel: string | null; sampleRate: number | null };
+type AppInfo = { version: string; backends: BackendInfo[]; formats: string[]; fdkAvailable: boolean };
 type JobProgress = {
   jobId: number; kind: string; status: string; message: string; current: number; total: number;
   fraction: number; elapsedSeconds: number; output?: string; error?: string;
@@ -52,6 +53,11 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
                 <label>モード<select id="mode"><option value="speech">音声</option><option value="music">音楽</option><option value="ambient">環境音</option></select></label>
                 <label>プリセット<select id="preset"><option value="hifi">Hi-Fi</option><option value="speech">Speech</option><option value="music">Music</option><option value="gentle">Gentle</option><option value="aggressive">Aggressive</option><option value="restore">Restore</option></select></label>
                 <label>バックエンド<select id="backend"><option value="auto">自動</option></select></label>
+              </div>
+              <div id="backend-settings" class="backend-settings hidden">
+                <div class="file-row"><div><label>ONNXモデル</label><div id="model-path-display" class="path empty">モデルファイルを選択</div></div><button class="secondary" id="choose-model">選択</button></div>
+                <div class="form-grid two"><label>モデルレート Hz<input id="onnx-rate" type="number" value="16000" min="1"></label><label id="sgmse-profile-field" class="hidden">SGMSE品質<select id="sgmse-profile"><option value="fast">Fast</option><option value="balanced" selected>Balanced</option><option value="quality">Quality</option></select></label></div>
+                <input type="hidden" id="model-path"><p id="backend-hint" class="field-hint"></p>
               </div>
               <div class="strength-row"><div><label>除去強度</label><span id="strength-value">40%</span></div><input id="strength" type="range" min="0" max="1" step="0.01" value="0.4"><div class="range-labels"><span>自然</span><span>強力</span></div></div>
               <div class="toggle-grid">
@@ -130,6 +136,9 @@ function options() {
     mp3BitrateKbps: Number($<HTMLInputElement>("#mp3-bitrate").value),
     aacBitrateKbps: Number($<HTMLInputElement>("#aac-bitrate").value),
     aacEncoder: $<HTMLSelectElement>("#aac-encoder").value,
+    onnxModel: $<HTMLInputElement>("#model-path").value || null,
+    onnxSampleRate: Number($<HTMLInputElement>("#onnx-rate").value),
+    sgmseProfile: $<HTMLSelectElement>("#sgmse-profile").value,
   };
 }
 
@@ -138,11 +147,30 @@ async function init() {
   $("#version").textContent = `v${appInfo.version}`;
   $("#engine-label").textContent = `${appInfo.backends.length} backend${appInfo.backends.length > 1 ? "s" : ""} ready`;
   const backend = $<HTMLSelectElement>("#backend");
-  appInfo.backends.forEach((name) => backend.add(new Option(name === "classical" ? "Classical DSP" : name, name)));
+  appInfo.backends.forEach(({ name }) => backend.add(new Option(name === "classical" ? "Classical DSP" : name, name)));
   if (appInfo.fdkAvailable) $<HTMLSelectElement>("#aac-encoder").add(new Option("FDK-AAC", "fdk"));
   renderCompareInputs();
   await loadModels();
 }
+
+function updateBackendSettings() {
+  const selected = $<HTMLSelectElement>("#backend").value;
+  const descriptor = appInfo.backends.find(({ name }) => name === selected);
+  const needsModel = descriptor?.externalModel ?? false;
+  $("#backend-settings").classList.toggle("hidden", !needsModel);
+  $("#sgmse-profile-field").classList.toggle("hidden", selected !== "sgmse");
+  if (descriptor?.sampleRate) $<HTMLInputElement>("#onnx-rate").value = String(descriptor.sampleRate);
+  $("#backend-hint").textContent = selected === "sgmse"
+    ? "変換済みSGMSE+モデルと推論ステップ数を指定します。"
+    : needsModel ? "このバックエンド用に変換したONNXモデルが必要です。" : "";
+}
+
+$("#backend").addEventListener("change", updateBackendSettings);
+$("#choose-model").addEventListener("click", async () => {
+  const path = await open({ multiple: false, filters: [{ name: "ONNX model", extensions: ["onnx"] }] });
+  if (typeof path !== "string") return;
+  setPath("#model-path", "#model-path-display", path);
+});
 
 document.querySelectorAll<HTMLButtonElement>(".nav-item").forEach((button) => button.addEventListener("click", () => {
   document.querySelectorAll(".nav-item,.page").forEach((node) => node.classList.remove("active"));

@@ -55,6 +55,24 @@ pub fn backend_name(backend: Backend) -> &'static str {
     }
 }
 
+/// Whether a backend needs a user-selected ONNX file rather than embedded or
+/// managed weights.
+pub fn requires_external_model(backend: Backend) -> bool {
+    match backend {
+        #[cfg(feature = "onnx")]
+        Backend::Onnx => true,
+        #[cfg(feature = "mpsenet")]
+        Backend::MpSenet => true,
+        #[cfg(feature = "bsrnn")]
+        Backend::Bsrnn => true,
+        #[cfg(feature = "mossformer2")]
+        Backend::Mossformer2 => true,
+        #[cfg(feature = "sgmse")]
+        Backend::Sgmse => true,
+        _ => false,
+    }
+}
+
 /// Select a backend consistently for CLI and graphical processing.
 pub fn select_backend(
     choice: BackendChoice,
@@ -138,5 +156,16 @@ mod tests {
     fn automatic_backend_is_compiled() {
         let selected = select_backend(BackendChoice::Auto, 10.0, None);
         assert!(Backend::available_names().contains(&backend_name(selected)));
+    }
+
+    #[test]
+    fn classical_does_not_require_external_weights() {
+        assert!(!requires_external_model(Backend::Classical));
+    }
+
+    #[cfg(feature = "onnx")]
+    #[test]
+    fn generic_onnx_requires_external_weights() {
+        assert!(requires_external_model(Backend::Onnx));
     }
 }
