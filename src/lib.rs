@@ -49,6 +49,7 @@ pub mod noise;
 pub mod perceptual;
 pub mod postfilter;
 pub mod resample;
+pub mod service;
 pub mod stft;
 pub mod stream;
 pub mod vad;

@@ -2,9 +2,10 @@
 
 use denoize::audio::{read_audio, read_wav_bytes, write_audio, write_wav_bytes};
 use denoize::denoiser::{DenoiserConfig, Preset, ProcessingMode};
+use denoize::service::{self, BackendChoice, ProcessingOptions};
 use denoize::{
-    denoise_audio_with_backend_config, AacEncoder, Algorithm, Backend, BackendOptions, ChannelMode,
-    EncodeOptions, OnnxModelConfig, SgmseProfile, WindowType,
+    AacEncoder, Algorithm, Backend, BackendOptions, ChannelMode, EncodeOptions, OnnxModelConfig,
+    SgmseProfile, WindowType,
 };
 use serde::Deserialize;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -698,16 +699,21 @@ fn run_one(input: &str, output: &str, ov: Overrides) -> Result<(), String> {
         read_audio(input)?
     };
     let cfg = build_config(&ov, audio.sample_rate);
-    let backend = if ov.auto_backend {
-        select_auto_backend(
-            audio.frames() as f64 / audio.sample_rate as f64,
-            ov.quality.as_deref(),
-        )
+    let backend_choice = if ov.auto_backend {
+        BackendChoice::Auto
     } else {
-        ov.backend.unwrap_or(Backend::Classical)
+        BackendChoice::Explicit(ov.backend.unwrap_or(Backend::Classical))
     };
+    let backend = service::select_backend(
+        backend_choice,
+        audio.frames() as f64 / audio.sample_rate as f64,
+        ov.quality.as_deref(),
+    );
     if ov.auto_backend && !ov.json {
-        eprintln!("denoize: auto-selected backend {}", backend_name(backend));
+        eprintln!(
+            "denoize: auto-selected backend {}",
+            service::backend_name(backend)
+        );
     }
 
     if ov.report {
@@ -731,8 +737,7 @@ fn run_one(input: &str, output: &str, ov: Overrides) -> Result<(), String> {
         enc.aac_encoder = encoder;
     }
 
-    #[allow(unused_mut)]
-    let mut backend_options = BackendOptions {
+    let backend_options = BackendOptions {
         onnx: ov.onnx_model.map(|path| OnnxModelConfig {
             path: path.into(),
             sample_rate: ov.onnx_sample_rate.unwrap_or(16_000),
@@ -740,20 +745,18 @@ fn run_one(input: &str, output: &str, ov: Overrides) -> Result<(), String> {
         channel_mode: ov.channel_mode.unwrap_or_default(),
         sgmse_profile: ov.sgmse_profile.unwrap_or_default(),
     };
-    #[cfg(feature = "gtcrn")]
-    if backend == Backend::Gtcrn && backend_options.onnx.is_none() {
-        let model = denoize::models::find("gtcrn").expect("built-in GTCRN manifest entry");
-        backend_options.onnx = Some(OnnxModelConfig {
-            path: denoize::models::verify(model).map_err(|_| {
-                "GTCRN model is not installed; run `denoize models install gtcrn`".to_string()
-            })?,
-            sample_rate: model.sample_rate,
-        });
-    }
-    let elapsed = denoise_audio_with_backend_config(&mut audio, cfg, backend, &backend_options)?;
-    if let Some(target) = ov.loudness_lufs {
-        let report =
-            denoize::loudness::normalize(&mut audio, target, ov.true_peak_dbtp.unwrap_or(-1.0))?;
+    let result = service::process_audio(
+        &mut audio,
+        ProcessingOptions {
+            backend: backend_choice,
+            quality: ov.quality.clone(),
+            denoiser: cfg,
+            backend_options,
+            loudness_lufs: ov.loudness_lufs,
+            true_peak_dbtp: ov.true_peak_dbtp.unwrap_or(-1.0),
+        },
+    )?;
+    if let Some(report) = result.loudness {
         if !ov.json {
             eprintln!(
                 "denoize: loudness {:.2} -> {:.2} LUFS, true peak {:.2} dBTP, gain {:+.2} dB",
@@ -793,49 +796,10 @@ fn run_one(input: &str, output: &str, ov: Overrides) -> Result<(), String> {
             denoize::metadata::write(metadata, output_path)?;
         }
         if ov.json {
-            println!("{{\"input\":{:?},\"output\":{:?},\"backend\":{:?},\"channels\":{},\"frames\":{},\"sample_rate\":{},\"elapsed_ms\":{:.3}}}", input, output, format!("{backend:?}").to_ascii_lowercase(), audio.channels(), audio.frames(), audio.sample_rate, elapsed.as_secs_f64() * 1000.0);
+            println!("{{\"input\":{:?},\"output\":{:?},\"backend\":{:?},\"channels\":{},\"frames\":{},\"sample_rate\":{},\"elapsed_ms\":{:.3}}}", input, output, service::backend_name(result.backend), audio.channels(), audio.frames(), audio.sample_rate, result.elapsed.as_secs_f64() * 1000.0);
         }
     }
     Ok(())
-}
-
-fn backend_name(backend: Backend) -> &'static str {
-    match backend {
-        Backend::Classical => "classical",
-        #[cfg(feature = "rnnoise")]
-        Backend::Rnnoise => "rnnoise",
-        #[cfg(feature = "deepfilter")]
-        Backend::DeepFilter => "deepfilter",
-        #[cfg(feature = "onnx")]
-        Backend::Onnx => "onnx",
-        #[cfg(feature = "mpsenet")]
-        Backend::MpSenet => "mpsenet",
-        #[cfg(feature = "bsrnn")]
-        Backend::Bsrnn => "bsrnn",
-        #[cfg(feature = "mossformer2")]
-        Backend::Mossformer2 => "mossformer2",
-        #[cfg(feature = "sgmse")]
-        Backend::Sgmse => "sgmse",
-        #[cfg(feature = "gtcrn")]
-        Backend::Gtcrn => "gtcrn",
-    }
-}
-
-/// Choose the strongest built-in backend whose expected cost fits the request.
-fn select_auto_backend(_duration_seconds: f64, _quality: Option<&str>) -> Backend {
-    #[cfg(feature = "deepfilter")]
-    {
-        let high_quality = matches!(_quality, Some("high" | "ultra" | "max" | "highest"));
-        if high_quality || _duration_seconds <= 10.0 * 60.0 {
-            return Backend::DeepFilter;
-        }
-    }
-    #[cfg(feature = "rnnoise")]
-    {
-        return Backend::Rnnoise;
-    }
-    #[allow(unreachable_code)]
-    Backend::Classical
 }
 
 #[cfg(feature = "live")]
@@ -1205,8 +1169,8 @@ mod auto_backend_tests {
 
     #[test]
     fn automatic_selection_uses_an_available_backend() {
-        let selected = select_auto_backend(30.0, None);
-        assert!(Backend::available_names().contains(&backend_name(selected)));
+        let selected = service::select_backend(BackendChoice::Auto, 30.0, None);
+        assert!(Backend::available_names().contains(&service::backend_name(selected)));
     }
 }
 

@@ -1,9 +1,9 @@
 use denoize::audio::{read_audio, write_audio};
 use denoize::benchmark::ComparisonReport;
 use denoize::denoiser::{DenoiserConfig, Preset, ProcessingMode};
+use denoize::service::{self, BackendChoice, ProcessingOptions};
 use denoize::{
-    denoise_audio_with_backend_config, AacEncoder, Backend, BackendOptions, ChannelMode,
-    EncodeOptions, OutputFormat,
+    AacEncoder, Backend, BackendOptions, ChannelMode, EncodeOptions, OutputFormat,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -439,18 +439,34 @@ fn process_file(
     progress(1, "ノイズ除去を実行しています");
     check_cancelled(cancelled)?;
     let config = processing_config(&request.options, audio.sample_rate)?;
-    let backend = select_backend(&request.options.backend)?;
+    let backend = if request.options.backend == "auto" {
+        BackendChoice::Auto
+    } else {
+        BackendChoice::Explicit(Backend::parse(&request.options.backend).ok_or_else(|| {
+            format!(
+                "このビルドでは利用できないバックエンドです: {}",
+                request.options.backend
+            )
+        })?)
+    };
     let backend_options = BackendOptions {
         channel_mode: ChannelMode::parse(&request.options.channel_mode)
             .ok_or_else(|| format!("不明なチャンネルモード: {}", request.options.channel_mode))?,
         ..BackendOptions::default()
     };
-    denoise_audio_with_backend_config(&mut audio, config, backend, &backend_options)?;
     progress(2, "ラウドネスと出力を準備しています");
+    service::process_audio(
+        &mut audio,
+        ProcessingOptions {
+            backend,
+            quality: None,
+            denoiser: config,
+            backend_options,
+            loudness_lufs: request.options.loudness_lufs,
+            true_peak_dbtp: request.options.true_peak_dbtp,
+        },
+    )?;
     check_cancelled(cancelled)?;
-    if let Some(target) = request.options.loudness_lufs {
-        denoize::loudness::normalize(&mut audio, target, request.options.true_peak_dbtp)?;
-    }
     let encode = EncodeOptions {
         mp3_bitrate_kbps: request.options.mp3_bitrate_kbps,
         m4a_bitrate_bps: request.options.aac_bitrate_kbps.saturating_mul(1000),
@@ -513,19 +529,6 @@ fn processing_config(options: &ProcessOptions, sample_rate: u32) -> Result<Denoi
     config.adaptive_noise = options.adaptive_noise;
     config.vad = options.vad;
     Ok(config)
-}
-
-fn select_backend(value: &str) -> Result<Backend, String> {
-    if value != "auto" {
-        return Backend::parse(value)
-            .ok_or_else(|| format!("このビルドでは利用できないバックエンドです: {value}"));
-    }
-    for candidate in ["deepfilter", "rnnoise", "classical"] {
-        if let Some(backend) = Backend::parse(candidate) {
-            return Ok(backend);
-        }
-    }
-    Err("利用可能なバックエンドがありません".into())
 }
 
 fn check_cancelled(cancelled: &AtomicBool) -> Result<(), String> {
@@ -619,11 +622,12 @@ mod tests {
         let config = processing_config(&options(), 48_000).unwrap();
         assert_eq!(config.strength, 0.4);
         assert!(config.transient_protect);
-        assert!(select_backend("auto").is_ok());
+        let selected = service::select_backend(BackendChoice::Auto, 30.0, None);
+        assert_eq!(Backend::parse(service::backend_name(selected)), Some(selected));
     }
 
     #[test]
     fn invalid_backend_is_rejected() {
-        assert!(select_backend("missing").is_err());
+        assert!(Backend::parse("missing").is_none());
     }
 }
