@@ -58,6 +58,9 @@ OPTIONS:
         --channels <MODE>     independent|linked|mid-side (default: independent)
         --sgmse-profile <P>   fast|balanced|quality (default: balanced)
         --batch               process files in INPUT directory into OUTPUT directory
+        --recursive           include subdirectories in batch mode
+        --jobs <N>            concurrent batch workers (default: CPU count)
+        --output-format <EXT> convert every batch output to this format
         --force               allow replacing existing output files
         --json                emit a machine-readable result
         --input-device <NAME> live capture device (default: system default)
@@ -119,6 +122,9 @@ struct Overrides {
     channel_mode: Option<ChannelMode>,
     sgmse_profile: Option<SgmseProfile>,
     batch: bool,
+    recursive: bool,
+    jobs: Option<usize>,
+    output_format: Option<String>,
     force: bool,
     json: bool,
     input_device: Option<String>,
@@ -229,6 +235,9 @@ fn parse_args(args: &[String]) -> Result<(String, String, Overrides), String> {
                 })?);
             }
             "--batch" => ov.batch = true,
+            "--recursive" => ov.recursive = true,
+            "--jobs" => ov.jobs = Some(parse_value(args, &mut i, a)?),
+            "--output-format" => ov.output_format = Some(parse_value(args, &mut i, a)?),
             "--force" => ov.force = true,
             "--json" => ov.json = true,
             "--input-device" => ov.input_device = Some(parse_value(args, &mut i, a)?),
@@ -567,49 +576,227 @@ fn run_one(input: &str, output: &str, ov: Overrides) -> Result<(), String> {
 }
 
 fn run_batch(input: &str, output: &str, ov: &Overrides) -> Result<(), String> {
+    use rayon::prelude::*;
+
     let input_dir = std::path::Path::new(input);
     let output_dir = std::path::Path::new(output);
     if !input_dir.is_dir() {
         return Err(format!("batch input is not a directory: {input}"));
     }
+    if let Some(jobs) = ov.jobs {
+        if jobs == 0 {
+            return Err("--jobs must be at least 1".into());
+        }
+    }
+    let output_extension = ov
+        .output_format
+        .as_deref()
+        .map(normalize_output_extension)
+        .transpose()?;
     std::fs::create_dir_all(output_dir).map_err(|e| format!("create batch output: {e}"))?;
-    let mut files: Vec<_> = std::fs::read_dir(input_dir)
-        .map_err(|e| format!("read batch input: {e}"))?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.extension()
-                .and_then(|x| x.to_str())
-                .map(|x| {
-                    matches!(
-                        x.to_ascii_lowercase().as_str(),
-                        "wav" | "mp3" | "m4a" | "flac" | "opus" | "ogg"
-                    )
-                })
-                .unwrap_or(false)
-        })
-        .collect();
-    files.sort();
+    let files = collect_batch_files(input_dir, ov.recursive)?;
     if files.is_empty() {
         return Err("batch input contains no supported audio files".into());
     }
-    for (index, path) in files.iter().enumerate() {
-        let destination = output_dir.join(path.file_name().ok_or("invalid batch filename")?);
-        eprintln!(
-            "denoize: batch {}/{} {}",
-            index + 1,
-            files.len(),
-            path.display()
-        );
-        let mut options = ov.clone();
-        options.batch = false;
-        run_one(
-            &path.to_string_lossy(),
-            &destination.to_string_lossy(),
-            options,
-        )?;
+    if let Some(extension) = output_extension {
+        let mut destinations = std::collections::HashSet::new();
+        for path in &files {
+            let relative = path.strip_prefix(input_dir).map_err(|e| e.to_string())?;
+            let mut destination = output_dir.join(relative);
+            destination.set_extension(extension);
+            if !destinations.insert(destination.clone()) {
+                return Err(format!(
+                    "multiple inputs map to the same batch output: {}",
+                    destination.display()
+                ));
+            }
+        }
     }
-    Ok(())
+
+    let process = || {
+        files
+            .par_iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let relative = path.strip_prefix(input_dir).map_err(|e| e.to_string())?;
+                let mut destination = output_dir.join(relative);
+                if let Some(extension) = output_extension {
+                    destination.set_extension(extension);
+                }
+                if let Some(parent) = destination.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| format!("create {}: {e}", parent.display()))?;
+                }
+                eprintln!(
+                    "denoize: batch {}/{} {}",
+                    index + 1,
+                    files.len(),
+                    path.display()
+                );
+                let mut options = ov.clone();
+                options.batch = false;
+                options.json = false;
+                run_one(
+                    &path.to_string_lossy(),
+                    &destination.to_string_lossy(),
+                    options,
+                )?;
+                Ok::<_, String>((path.clone(), destination))
+            })
+            .collect::<Vec<_>>()
+    };
+    let results = if let Some(jobs) = ov.jobs {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(jobs)
+            .build()
+            .map_err(|e| format!("create batch worker pool: {e}"))?
+            .install(process)
+    } else {
+        process()
+    };
+    let succeeded = results.iter().filter(|result| result.is_ok()).count();
+    let failures: Vec<_> = results
+        .iter()
+        .filter_map(|result| result.as_ref().err())
+        .collect();
+    if ov.json {
+        println!(
+            "{{\"total\":{},\"succeeded\":{},\"failed\":{},\"output\":{:?}}}",
+            files.len(),
+            succeeded,
+            failures.len(),
+            output
+        );
+    } else {
+        eprintln!(
+            "denoize: batch complete: {succeeded} succeeded, {} failed",
+            failures.len()
+        );
+        for error in &failures {
+            eprintln!("denoize: batch error: {error}");
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("{} batch file(s) failed", failures.len()))
+    }
+}
+
+fn collect_batch_files(
+    root: &std::path::Path,
+    recursive: bool,
+) -> Result<Vec<std::path::PathBuf>, String> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut files = Vec::new();
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(&directory)
+            .map_err(|e| format!("read batch input {}: {e}", directory.display()))?
+        {
+            let path = entry.map_err(|e| format!("read batch entry: {e}"))?.path();
+            if path.is_dir() && recursive {
+                pending.push(path);
+            } else if path.is_file() && is_supported_audio_path(&path) {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn is_supported_audio_path(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "wav" | "mp3" | "m4a" | "flac" | "opus" | "ogg"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn normalize_output_extension(value: &str) -> Result<&str, String> {
+    let extension = value.trim_start_matches('.');
+    if matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "wav" | "mp3" | "m4a" | "flac" | "opus" | "ogg"
+    ) {
+        Ok(extension)
+    } else {
+        Err(format!("unsupported --output-format: {value}"))
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+
+    fn temporary_directory() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "denoize-batch-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ))
+    }
+
+    #[test]
+    fn batch_collection_is_recursive_and_sorted() {
+        let root = temporary_directory();
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(root.join("b.wav"), []).unwrap();
+        std::fs::write(root.join("ignore.txt"), []).unwrap();
+        std::fs::write(nested.join("a.FLAC"), []).unwrap();
+
+        assert_eq!(
+            collect_batch_files(&root, false).unwrap(),
+            vec![root.join("b.wav")]
+        );
+        assert_eq!(
+            collect_batch_files(&root, true).unwrap(),
+            vec![root.join("b.wav"), nested.join("a.FLAC")]
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn validates_batch_output_format() {
+        assert_eq!(normalize_output_extension(".flac").unwrap(), "flac");
+        assert!(normalize_output_extension("aac").is_err());
+    }
+
+    #[test]
+    fn batch_processes_nested_audio_and_converts_format() {
+        let root = temporary_directory();
+        let input = root.join("input");
+        let output = root.join("output");
+        std::fs::create_dir_all(input.join("nested")).unwrap();
+        let audio = denoize::Audio {
+            sample_rate: 16_000,
+            channels: vec![vec![0.0; 3_200]],
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        denoize::write_audio(
+            input.join("nested/sample.wav"),
+            &audio,
+            EncodeOptions::default(),
+        )
+        .unwrap();
+        let options = Overrides {
+            batch: true,
+            recursive: true,
+            jobs: Some(2),
+            output_format: Some("flac".into()),
+            ..Overrides::default()
+        };
+
+        run_batch(input.to_str().unwrap(), output.to_str().unwrap(), &options).unwrap();
+        assert!(output.join("nested/sample.flac").is_file());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 fn run_metrics(args: &[String]) -> Result<(), String> {
