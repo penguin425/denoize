@@ -250,6 +250,8 @@ The Tauri desktop app exposes single-file denoising, batch conversion, quality
 comparison, and model management without sending audio off the computer. Its
 default build includes every backend in the repository's `full` feature set;
 FDK-AAC remains an explicit opt-in because of its separate licensing terms.
+ONNX-based backends expose model-file, model-rate, and SGMSE quality controls
+when selected; managed GTCRN weights are resolved automatically after install.
 
 ```sh
 cd apps/desktop

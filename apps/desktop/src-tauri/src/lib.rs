@@ -3,7 +3,8 @@ use denoize::benchmark::ComparisonReport;
 use denoize::denoiser::{DenoiserConfig, Preset, ProcessingMode};
 use denoize::service::{self, BackendChoice, ProcessingOptions};
 use denoize::{
-    AacEncoder, Backend, BackendOptions, ChannelMode, EncodeOptions, OutputFormat,
+    AacEncoder, Backend, BackendOptions, ChannelMode, EncodeOptions, OnnxModelConfig,
+    OutputFormat, SgmseProfile,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -37,6 +38,9 @@ struct ProcessOptions {
     mp3_bitrate_kbps: u32,
     aac_bitrate_kbps: u32,
     aac_encoder: String,
+    onnx_model: Option<String>,
+    onnx_sample_rate: u32,
+    sgmse_profile: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -75,9 +79,18 @@ struct JobProgress {
 #[serde(rename_all = "camelCase")]
 struct AppInfo {
     version: &'static str,
-    backends: Vec<&'static str>,
+    backends: Vec<BackendInfo>,
     formats: Vec<&'static str>,
     fdk_available: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BackendInfo {
+    name: &'static str,
+    external_model: bool,
+    managed_model: Option<&'static str>,
+    sample_rate: Option<u32>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -107,7 +120,20 @@ struct ModelRow {
 fn app_info() -> AppInfo {
     AppInfo {
         version: env!("CARGO_PKG_VERSION"),
-        backends: Backend::available_names().to_vec(),
+        backends: Backend::available_names()
+            .iter()
+            .filter_map(|name| Backend::parse(name))
+            .map(|backend| BackendInfo {
+                name: service::backend_name(backend),
+                external_model: service::requires_external_model(backend),
+                managed_model: (service::backend_name(backend) == "gtcrn").then_some("gtcrn"),
+                sample_rate: match service::backend_name(backend) {
+                    "bsrnn" | "mossformer2" | "gtcrn" => Some(48_000),
+                    "onnx" | "mpsenet" | "sgmse" => Some(16_000),
+                    _ => None,
+                },
+            })
+            .collect(),
         formats: vec!["wav", "flac", "opus", "mp3", "m4a", "aac"],
         fdk_available: cfg!(feature = "fdk-aac-encoder"),
     }
@@ -419,6 +445,25 @@ fn validate_request(input: &str, output: &str, options: &ProcessOptions) -> Resu
     if options.mp3_bitrate_kbps < 32 || options.aac_bitrate_kbps < 32 {
         return Err("ビットレートは32kbps以上にしてください".into());
     }
+    let backend = if options.backend == "auto" {
+        None
+    } else {
+        Some(Backend::parse(&options.backend).ok_or_else(|| {
+            format!(
+                "このビルドでは利用できないバックエンドです: {}",
+                options.backend
+            )
+        })?)
+    };
+    if backend.is_some_and(service::requires_external_model) {
+        let model = options.onnx_model.as_deref().unwrap_or_default();
+        if !Path::new(model).is_file() {
+            return Err("選択したバックエンドのONNXモデルファイルを指定してください".into());
+        }
+    }
+    if options.onnx_sample_rate == 0 {
+        return Err("モデルのサンプルレートは1Hz以上にしてください".into());
+    }
     Ok(())
 }
 
@@ -450,9 +495,18 @@ fn process_file(
         })?)
     };
     let backend_options = BackendOptions {
+        onnx: request.options.onnx_model.as_ref().map(|path| OnnxModelConfig {
+            path: path.into(),
+            sample_rate: request.options.onnx_sample_rate,
+        }),
         channel_mode: ChannelMode::parse(&request.options.channel_mode)
             .ok_or_else(|| format!("不明なチャンネルモード: {}", request.options.channel_mode))?,
-        ..BackendOptions::default()
+        sgmse_profile: SgmseProfile::parse(&request.options.sgmse_profile).ok_or_else(|| {
+            format!(
+                "不明なSGMSEプロファイル: {}",
+                request.options.sgmse_profile
+            )
+        })?,
     };
     progress(2, "ラウドネスと出力を準備しています");
     service::process_audio(
@@ -614,6 +668,9 @@ mod tests {
             mp3_bitrate_kbps: 192,
             aac_bitrate_kbps: 192,
             aac_encoder: "oxide".into(),
+            onnx_model: None,
+            onnx_sample_rate: 16_000,
+            sgmse_profile: "balanced".into(),
         }
     }
 
