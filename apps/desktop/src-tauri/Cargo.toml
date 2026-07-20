@@ -17,6 +17,7 @@ tauri-build = { version = "2.5.3", features = [] }
 denoize = { path = "../../.." }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "0.8"
 rayon = "1.11"
 tauri = { version = "2.11.5", features = ["protocol-asset"] }
 tauri-plugin-dialog = "2.7.2"

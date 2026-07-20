@@ -257,6 +257,9 @@ configurable worker count, continue after individual failures, and can resume
 from the `.denoize-gui-state` journal in the output directory.
 Single-file processing also provides local waveform previews, RMS-matched
 before/after switching, click-to-seek, and configurable section looping.
+Desktop settings are restored automatically, can be stored as named presets,
+and can be imported or exported as CLI-compatible TOML. Recent input files are
+kept locally for quick reuse.
 
 ```sh
 cd apps/desktop
