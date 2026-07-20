@@ -373,6 +373,12 @@ from `full` and official release binaries. Fraunhofer's codec source has its own
 license and MPEG-AAC patent language; downstream distributors are responsible
 for reviewing both. Enabling it raises the minimum Rust version to 1.87.
 
+### Raw ADTS AAC
+
+`.aac` files are decoded and encoded directly as ADTS streams without an MP4
+container or an ffmpeg conversion step. M4A and raw AAC share
+`--m4a-bitrate`; raw ADTS output currently uses the default oxideav encoder.
+
 ```
 -b, --backend <NAME>     classical|rnnoise|deepfilter
 -a, --algorithm <NAME>    omlsa|logmmse|mmse|wiener|specsub|specsub-nl|specsub-geo
