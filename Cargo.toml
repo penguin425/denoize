@@ -48,7 +48,7 @@ serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
 fdk-aac-rust = { version = "0.2.2", optional = true, default-features = false }
 cpal = { version = "0.15.3", optional = true }
-ctrlc = { version = "3.4.5", optional = true }
+ctrlc = "3.4.5"
 
 [features]
 default = ["m4a-encode"]
@@ -61,7 +61,7 @@ mossformer2 = ["onnx", "dep:rustfft", "dep:kaldi-native-fbank"]
 sgmse = ["onnx", "dep:rustfft"]
 gtcrn = ["onnx", "dep:rustfft"]
 m4a-encode = ["dep:oxideav-aac-encoder"]
-live = ["dep:cpal", "dep:ctrlc"]
+live = ["dep:cpal"]
 fdk-aac-encoder = ["dep:fdk-aac-rust"]
 full = ["rnnoise", "deepfilter", "onnx", "mpsenet", "bsrnn", "mossformer2", "sgmse", "gtcrn", "m4a-encode"]
 

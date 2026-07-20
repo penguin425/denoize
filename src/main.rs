@@ -7,8 +7,22 @@ use denoize::{
     EncodeOptions, OnnxModelConfig, SgmseProfile, WindowType,
 };
 use serde::Deserialize;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+static CANCELLED: AtomicBool = AtomicBool::new(false);
+static CANCEL_HANDLER: OnceLock<Result<(), String>> = OnceLock::new();
+
+fn install_cancel_handler() -> Result<(), String> {
+    CANCEL_HANDLER
+        .get_or_init(|| {
+            ctrlc::set_handler(|| CANCELLED.store(true, Ordering::SeqCst))
+                .map_err(|error| format!("install Ctrl+C handler: {error}"))
+        })
+        .clone()
+}
 
 fn usage() -> String {
     let backends = Backend::available_names().join("|");
@@ -71,6 +85,8 @@ OPTIONS:
         --jobs <N>            concurrent batch workers (default: CPU count)
         --output-format <EXT> convert every batch output to this format
         --force               allow replacing existing output files
+        --resume              skip completed files recorded by batch state
+        --no-progress         suppress batch progress and ETA output
         --json                emit a machine-readable result
         --no-metadata         do not copy input tags/artwork to the output
         --input-device <NAME> live capture device (default: system default)
@@ -143,6 +159,8 @@ struct Overrides {
     jobs: Option<usize>,
     output_format: Option<String>,
     force: bool,
+    resume: bool,
+    no_progress: bool,
     json: bool,
     no_metadata: bool,
     input_device: Option<String>,
@@ -176,6 +194,8 @@ struct FileConfig {
     jobs: Option<usize>,
     output_format: Option<String>,
     force: bool,
+    resume: bool,
+    progress: Option<bool>,
     preserve_metadata: Option<bool>,
 }
 
@@ -242,6 +262,8 @@ fn parse_config(source: &str, path: &str) -> Result<Overrides, String> {
     ov.jobs = config.jobs;
     ov.output_format = config.output_format;
     ov.force = config.force;
+    ov.resume = config.resume;
+    ov.no_progress = config.progress == Some(false);
     ov.no_metadata = config.preserve_metadata == Some(false);
     Ok(ov)
 }
@@ -388,6 +410,8 @@ fn parse_args(args: &[String]) -> Result<(String, String, Overrides), String> {
             "--jobs" => ov.jobs = Some(parse_value(args, &mut i, a)?),
             "--output-format" => ov.output_format = Some(parse_value(args, &mut i, a)?),
             "--force" => ov.force = true,
+            "--resume" => ov.resume = true,
+            "--no-progress" => ov.no_progress = true,
             "--json" => ov.json = true,
             "--no-metadata" => ov.no_metadata = true,
             "--input-device" => ov.input_device = Some(parse_value(args, &mut i, a)?),
@@ -843,6 +867,8 @@ fn run_batch(input: &str, output: &str, ov: &Overrides) -> Result<(), String> {
         .map(normalize_output_extension)
         .transpose()?;
     std::fs::create_dir_all(output_dir).map_err(|e| format!("create batch output: {e}"))?;
+    install_cancel_handler()?;
+    CANCELLED.store(false, Ordering::SeqCst);
     let files = collect_batch_files(input_dir, ov.recursive)?;
     if files.is_empty() {
         return Err("batch input contains no supported audio files".into());
@@ -862,26 +888,48 @@ fn run_batch(input: &str, output: &str, ov: &Overrides) -> Result<(), String> {
         }
     }
 
+    let state_path = output_dir.join(".denoize-state");
+    let completed_paths = if ov.resume {
+        read_batch_state(&state_path)?
+    } else {
+        std::collections::HashSet::new()
+    };
+    let state_file = if ov.resume {
+        Some(Arc::new(Mutex::new(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&state_path)
+                .map_err(|error| format!("open resume state {}: {error}", state_path.display()))?,
+        )))
+    } else {
+        None
+    };
+    let finished = AtomicUsize::new(0);
+    let skipped = AtomicUsize::new(0);
+    let started = Instant::now();
     let process = || {
         files
             .par_iter()
-            .enumerate()
-            .map(|(index, path)| {
+            .map(|path| {
+                if CANCELLED.load(Ordering::SeqCst) {
+                    return Err("cancelled".into());
+                }
                 let relative = path.strip_prefix(input_dir).map_err(|e| e.to_string())?;
                 let mut destination = output_dir.join(relative);
                 if let Some(extension) = output_extension {
                     destination.set_extension(extension);
                 }
+                let state_key = relative.to_string_lossy().replace('\\', "/");
+                if ov.resume && completed_paths.contains(&state_key) && destination.is_file() {
+                    skipped.fetch_add(1, Ordering::Relaxed);
+                    report_batch_progress(&finished, files.len(), started, path, "skipped", ov);
+                    return Ok::<_, String>((path.clone(), destination));
+                }
                 if let Some(parent) = destination.parent() {
                     std::fs::create_dir_all(parent)
                         .map_err(|e| format!("create {}: {e}", parent.display()))?;
                 }
-                eprintln!(
-                    "denoize: batch {}/{} {}",
-                    index + 1,
-                    files.len(),
-                    path.display()
-                );
                 let mut options = ov.clone();
                 options.batch = false;
                 options.json = false;
@@ -890,6 +938,15 @@ fn run_batch(input: &str, output: &str, ov: &Overrides) -> Result<(), String> {
                     &destination.to_string_lossy(),
                     options,
                 )?;
+                if let Some(file) = &state_file {
+                    use std::io::Write;
+                    let mut file = file.lock().map_err(|_| "resume state lock poisoned")?;
+                    writeln!(file, "{state_key}")
+                        .map_err(|error| format!("write resume state: {error}"))?;
+                    file.flush()
+                        .map_err(|error| format!("flush resume state: {error}"))?;
+                }
+                report_batch_progress(&finished, files.len(), started, path, "completed", ov);
                 Ok::<_, String>((path.clone(), destination))
             })
             .collect::<Vec<_>>()
@@ -910,15 +967,18 @@ fn run_batch(input: &str, output: &str, ov: &Overrides) -> Result<(), String> {
         .collect();
     if ov.json {
         println!(
-            "{{\"total\":{},\"succeeded\":{},\"failed\":{},\"output\":{:?}}}",
+            "{{\"event\":\"summary\",\"total\":{},\"succeeded\":{},\"skipped\":{},\"failed\":{},\"cancelled\":{},\"output\":{:?}}}",
             files.len(),
             succeeded,
+            skipped.load(Ordering::Relaxed),
             failures.len(),
+            CANCELLED.load(Ordering::SeqCst),
             output
         );
     } else {
         eprintln!(
-            "denoize: batch complete: {succeeded} succeeded, {} failed",
+            "denoize: batch complete: {succeeded} succeeded ({} skipped), {} failed",
+            skipped.load(Ordering::Relaxed),
             failures.len()
         );
         for error in &failures {
@@ -929,6 +989,46 @@ fn run_batch(input: &str, output: &str, ov: &Overrides) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("{} batch file(s) failed", failures.len()))
+    }
+}
+
+fn read_batch_state(path: &std::path::Path) -> Result<std::collections::HashSet<String>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(source) => Ok(source
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Default::default()),
+        Err(error) => Err(format!("read resume state {}: {error}", path.display())),
+    }
+}
+
+fn report_batch_progress(
+    finished: &AtomicUsize,
+    total: usize,
+    started: Instant,
+    path: &std::path::Path,
+    status: &str,
+    ov: &Overrides,
+) {
+    let count = finished.fetch_add(1, Ordering::Relaxed) + 1;
+    let elapsed = started.elapsed().as_secs_f64();
+    let eta = if count == 0 {
+        0.0
+    } else {
+        elapsed / count as f64 * total.saturating_sub(count) as f64
+    };
+    if ov.json {
+        println!(
+            "{{\"event\":\"progress\",\"status\":{:?},\"completed\":{},\"total\":{},\"elapsed_seconds\":{:.3},\"eta_seconds\":{:.3},\"input\":{:?}}}",
+            status, count, total, elapsed, eta, path.to_string_lossy()
+        );
+    } else if !ov.no_progress {
+        eprintln!(
+            "denoize: batch {count}/{total} {status} {} ({elapsed:.1}s elapsed, ETA {eta:.1}s)",
+            path.display()
+        );
     }
 }
 
@@ -1045,6 +1145,43 @@ mod batch_tests {
 
         run_batch(input.to_str().unwrap(), output.to_str().unwrap(), &options).unwrap();
         assert!(output.join("nested/sample.flac").is_file());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resume_skips_outputs_recorded_as_complete() {
+        let root = temporary_directory();
+        let input = root.join("input");
+        let output = root.join("output");
+        std::fs::create_dir_all(&input).unwrap();
+        let audio = denoize::Audio {
+            sample_rate: 16_000,
+            channels: vec![vec![0.0; 1_600]],
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        denoize::write_audio(input.join("sample.wav"), &audio, EncodeOptions::default()).unwrap();
+        let options = Overrides {
+            batch: true,
+            resume: true,
+            no_progress: true,
+            ..Overrides::default()
+        };
+
+        run_batch(input.to_str().unwrap(), output.to_str().unwrap(), &options).unwrap();
+        let first_modified = std::fs::metadata(output.join("sample.wav"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        run_batch(input.to_str().unwrap(), output.to_str().unwrap(), &options).unwrap();
+        let second_modified = std::fs::metadata(output.join("sample.wav"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(first_modified, second_modified);
+        assert!(read_batch_state(&output.join(".denoize-state"))
+            .unwrap()
+            .contains("sample.wav"));
         std::fs::remove_dir_all(root).unwrap();
     }
 }

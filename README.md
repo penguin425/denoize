@@ -418,6 +418,15 @@ true_peak_dbtp = -1.0
 denoize input.wav output.flac --config denoize.toml --strength 0.55
 ```
 
+### Batch progress and recovery
+
+Batch runs show completed files, elapsed time, and ETA. `--resume` records
+successful outputs in `.denoize-state` under the output directory and skips
+them on the next run. Ctrl+C stops scheduling new files; each output is first
+written to a temporary file so an interrupted encode cannot replace a valid
+destination. Use `--no-progress` for quiet operation or `--json` for NDJSON
+progress and summary records.
+
 ```
 -b, --backend <NAME>     classical|rnnoise|deepfilter
 -a, --algorithm <NAME>    omlsa|logmmse|mmse|wiener|specsub|specsub-nl|specsub-geo
