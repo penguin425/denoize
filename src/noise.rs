@@ -41,6 +41,9 @@ pub struct NoiseConfig {
     /// fast `lambda_d` can rise in the blind (no-profile) case. `f64::INFINITY`
     /// disables the rate limiter.
     pub up_rate_dbps: f64,
+    /// Learn and refresh the profile from confidently noise-only frames found
+    /// throughout the signal, rather than only from a leading segment.
+    pub adaptive_profile: bool,
 }
 
 impl Default for NoiseConfig {
@@ -54,6 +57,7 @@ impl Default for NoiseConfig {
             sigma: 0.25,
             anchor_cap_db: 15.0,
             up_rate_dbps: 6.0,
+            adaptive_profile: false,
         }
     }
 }
@@ -166,6 +170,11 @@ impl NoiseEstimator {
         &self.p
     }
 
+    #[inline]
+    pub fn has_profile(&self) -> bool {
+        self.has_profile
+    }
+
     /// Update with one frame of noisy power `y2[k] = |Y[k]|^2` (length `nbins`).
     pub fn update(&mut self, y2: &[f64]) {
         debug_assert_eq!(y2.len(), self.nbins);
@@ -271,5 +280,64 @@ impl NoiseEstimator {
                 self.lambda_d[k] = new_ld;
             }
         }
+
+        if cfg.adaptive_profile && self.adapt && self.is_noise_only_frame(y2) {
+            // About five seconds to move 63% toward a changed stationary floor.
+            let alpha = 0.995;
+            for (profile, power) in self.profile_psd.iter_mut().zip(y2) {
+                if self.has_profile {
+                    *profile = alpha * *profile + (1.0 - alpha) * power.max(1e-12);
+                } else {
+                    *profile = power.max(1e-12);
+                }
+            }
+            self.has_profile = true;
+        }
+    }
+
+    fn is_noise_only_frame(&self, y2: &[f64]) -> bool {
+        let mean_speech = self.p.iter().sum::<f64>() / self.p.len().max(1) as f64;
+        if mean_speech >= 0.2 {
+            return false;
+        }
+        let arithmetic = y2.iter().sum::<f64>() / y2.len().max(1) as f64;
+        if arithmetic <= 1e-12 {
+            return false;
+        }
+        let geometric = (y2.iter().map(|power| power.max(1e-20).ln()).sum::<f64>()
+            / y2.len().max(1) as f64)
+            .exp();
+        geometric / arithmetic >= 0.2
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adaptive_profile_learns_noise_only_frames() {
+        let cfg = NoiseConfig {
+            adaptive_profile: true,
+            ..NoiseConfig::default()
+        };
+        let mut estimator = NoiseEstimator::new(cfg, 8, 48_000, 480);
+        let flat_noise = vec![0.01; 8];
+        estimator.update(&flat_noise);
+        estimator.update(&flat_noise);
+        assert!(estimator.has_profile());
+    }
+
+    #[test]
+    fn adaptive_profile_rejects_tonal_frames() {
+        let cfg = NoiseConfig {
+            adaptive_profile: true,
+            ..NoiseConfig::default()
+        };
+        let mut estimator = NoiseEstimator::new(cfg, 8, 48_000, 480);
+        let tonal = vec![1.0, 1e-20, 1e-20, 1e-20, 1e-20, 1e-20, 1e-20, 1e-20];
+        estimator.update(&tonal);
+        estimator.update(&tonal);
+        assert!(!estimator.has_profile());
     }
 }
