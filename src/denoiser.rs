@@ -139,6 +139,54 @@ pub enum Preset {
     HiFi,
 }
 
+/// High-level intent that coordinates denoising features for the material.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcessingMode {
+    Speech,
+    Music,
+    Ambient,
+}
+
+impl ProcessingMode {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "speech" | "voice" => Some(Self::Speech),
+            "music" => Some(Self::Music),
+            "ambient" | "environment" => Some(Self::Ambient),
+            _ => None,
+        }
+    }
+
+    pub fn apply(self, config: &mut DenoiserConfig) {
+        match self {
+            Self::Speech => {
+                config.strength = config.strength.max(0.7);
+                config.vad = true;
+                config.adaptive_noise = true;
+                config.transient_protect = true;
+                config.cepstral_smoothing = true;
+            }
+            Self::Music => {
+                config.strength = config.strength.min(0.35);
+                config.vad = false;
+                config.adaptive_noise = false;
+                config.transient_protect = true;
+                config.perceptual_weighting = true;
+                config.musical_noise_postfilter = true;
+                config.smoothing = config.smoothing.max(0.75);
+            }
+            Self::Ambient => {
+                config.strength = config.strength.min(0.4);
+                config.vad = false;
+                config.adaptive_noise = true;
+                config.transient_protect = true;
+                config.perceptual_weighting = true;
+                config.smoothing = config.smoothing.max(0.7);
+            }
+        }
+    }
+}
+
 impl Preset {
     pub fn parse(s: &str) -> Option<Self> {
         Some(match s.to_ascii_lowercase().as_str() {
@@ -1051,5 +1099,24 @@ mod tests {
         assert!(c.perceptual_weighting);
         assert!(c.musical_noise_postfilter);
         assert_eq!(c.window, WindowType::Kaiser);
+    }
+
+    #[test]
+    fn content_modes_coordinate_processing_controls() {
+        let mut speech = DenoiserConfig::default(48_000);
+        ProcessingMode::Speech.apply(&mut speech);
+        assert!(speech.vad && speech.adaptive_noise);
+        assert!(speech.strength >= 0.7);
+
+        let mut music = DenoiserConfig::default(48_000);
+        ProcessingMode::Music.apply(&mut music);
+        assert!(!music.vad && music.transient_protect);
+        assert!(music.strength <= 0.35);
+        assert!(music.perceptual_weighting);
+
+        let mut ambient = DenoiserConfig::default(48_000);
+        ProcessingMode::Ambient.apply(&mut ambient);
+        assert!(ambient.adaptive_noise && !ambient.vad);
+        assert!(ambient.strength <= 0.4);
     }
 }

@@ -349,6 +349,15 @@ denoize input.wav output.flac --loudness -16 --true-peak -1
 The applied gain is reduced when necessary to satisfy the peak ceiling, so
 peak safety takes precedence over reaching the requested LUFS exactly.
 
+### Content modes
+
+`--mode speech`, `--mode music`, and `--mode ambient` coordinate related DSP
+controls instead of changing only one strength value. Speech mode enables VAD
+and adaptive profiling; music mode prioritizes transients, stereo content, and
+low suppression; ambient mode preserves environmental texture while tracking
+slowly changing noise. Explicit options such as `--strength` still override the
+mode defaults.
+
 ```
 -b, --backend <NAME>     classical|rnnoise|deepfilter
 -a, --algorithm <NAME>    omlsa|logmmse|mmse|wiener|specsub|specsub-nl|specsub-geo

@@ -58,7 +58,7 @@ pub use audio::{
 };
 pub use backend::{Backend, BackendOptions, ChannelMode, OnnxModelConfig, SgmseProfile};
 pub use decode::{decode_file, AudioFormat, DecodedPcm};
-pub use denoiser::{Denoiser, DenoiserConfig, Preset};
+pub use denoiser::{Denoiser, DenoiserConfig, Preset, ProcessingMode};
 pub use encode::{EncodeOptions, OutputFormat};
 pub use gain::{Algorithm, SpecSubLaw};
 pub use window::{WindowParams, WindowType};

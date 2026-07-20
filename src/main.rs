@@ -1,7 +1,7 @@
 //! `denoize` command-line interface.
 
 use denoize::audio::{read_audio, read_wav_bytes, write_audio, write_wav_bytes};
-use denoize::denoiser::{DenoiserConfig, Preset};
+use denoize::denoiser::{DenoiserConfig, Preset, ProcessingMode};
 use denoize::{
     denoise_audio_with_backend_config, Algorithm, Backend, BackendOptions, ChannelMode,
     EncodeOptions, OnnxModelConfig, SgmseProfile, WindowType,
@@ -29,6 +29,7 @@ OPTIONS:
     -b, --backend <NAME>     auto|{backends}  (default: classical)
     -a, --algorithm <NAME>   omlsa|logmmse|mmse|wiener|specsub|specsub-nl|specsub-geo
     -p, --preset <NAME>      speech|music|aggressive|gentle|restore|hifi
+        --mode <NAME>        speech|music|ambient processing intent
     -s, --strength <0..1>    denoising strength (default: 0.6)
         --profile <MS>       learn noise from first MS ms (default: auto-detect)
         --no-profile         no profiling; rely on blind IMCRA bootstrap
@@ -98,6 +99,7 @@ struct Overrides {
     auto_backend: bool,
     algorithm: Option<Algorithm>,
     preset: Option<Preset>,
+    mode: Option<ProcessingMode>,
     strength: Option<f64>,
     profile_ms: Option<f64>,
     no_profile: bool,
@@ -198,6 +200,12 @@ fn parse_args(args: &[String]) -> Result<(String, String, Overrides), String> {
                 ov.preset =
                     Some(Preset::parse(&name).ok_or_else(|| format!("unknown preset: {name}"))?);
             }
+            "--mode" => {
+                let name: String = parse_value(args, &mut i, a)?;
+                ov.mode = Some(ProcessingMode::parse(&name).ok_or_else(|| {
+                    format!("unknown mode: {name} (expected speech, music, or ambient)")
+                })?);
+            }
             "-s" | "--strength" => ov.strength = Some(parse_value(args, &mut i, a)?),
             "--profile" => ov.profile_ms = Some(parse_value(args, &mut i, a)?),
             "--no-profile" => ov.no_profile = true,
@@ -297,6 +305,9 @@ fn build_config(ov: &Overrides, sample_rate: u32) -> DenoiserConfig {
         Some(p) => p.config(sample_rate),
         None => DenoiserConfig::default(sample_rate),
     };
+    if let Some(mode) = ov.mode {
+        mode.apply(&mut cfg);
+    }
     if let Some(a) = ov.algorithm {
         cfg.algorithm = a;
     }
