@@ -655,7 +655,7 @@ fn run_live(args: &[String]) -> Result<(), String> {
         return Ok(());
     }
     let backend = if ov.auto_backend {
-        select_live_backend()
+        service::select_live_backend()
     } else {
         ov.backend.unwrap_or(Backend::Classical)
     };
@@ -800,16 +800,6 @@ fn run_one(input: &str, output: &str, ov: Overrides) -> Result<(), String> {
         }
     }
     Ok(())
-}
-
-#[cfg(feature = "live")]
-fn select_live_backend() -> Backend {
-    #[cfg(feature = "rnnoise")]
-    {
-        return Backend::Rnnoise;
-    }
-    #[allow(unreachable_code)]
-    Backend::Classical
 }
 
 fn run_batch(input: &str, output: &str, ov: &Overrides) -> Result<(), String> {

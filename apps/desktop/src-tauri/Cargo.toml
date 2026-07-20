@@ -23,6 +23,7 @@ tauri = { version = "2.11.5", features = ["protocol-asset"] }
 tauri-plugin-dialog = "2.7.2"
 
 [features]
-default = ["full"]
+default = ["full", "live"]
 full = ["denoize/full"]
+live = ["denoize/live"]
 fdk-aac-encoder = ["denoize/fdk-aac-encoder"]

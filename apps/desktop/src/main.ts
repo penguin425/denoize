@@ -21,6 +21,12 @@ type ModelRow = {
 };
 type PreviewData = { source: string; playablePath: string; durationSeconds: number; rmsDb: number; waveform: number[] };
 type DropSelection = { audioFiles: string[]; directories: string[]; ignored: string[] };
+type LiveDevices = { inputs: string[]; outputs: string[] };
+type LiveEvent = {
+  status: "running" | "stopped" | "failed"; message: string; sampleRate: number;
+  inputChannels: number; outputChannels: number; chunkFrames: number;
+  inputLevel: number; outputLevel: number; processedChunks: number; droppedChunks: number;
+};
 
 const audioFilters = [{ name: "Audio", extensions: ["wav", "flac", "opus", "ogg", "mp3", "m4a", "aac"] }];
 let appInfo: AppInfo;
@@ -36,6 +42,7 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
       <nav>
         <button class="nav-item active" data-page="process"><span>◈</span>ノイズ除去</button>
         <button class="nav-item" data-page="batch"><span>▦</span>バッチ</button>
+        <button class="nav-item" data-page="live"><span>◉</span>リアルタイム</button>
         <button class="nav-item" data-page="compare"><span>◒</span>品質比較</button>
         <button class="nav-item" data-page="models"><span>⬡</span>モデル</button>
       </nav>
@@ -112,6 +119,26 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
         </div>
       </section>
 
+      <section class="page" id="page-live">
+        <div class="grid two-col">
+          <article class="card">
+            <div class="card-heading"><div><span class="step">LIVE</span><h2>オーディオ経路</h2></div><button class="secondary" id="refresh-live-devices">再読込</button></div>
+            <p class="section-copy">マイク入力を低遅延でノイズ除去し、選択した再生デバイスへ出力します。ヘッドホンの使用を推奨します。</p>
+            <div class="form-grid two"><label>入力デバイス<select id="live-input"><option value="">既定の入力</option></select></label><label>出力デバイス<select id="live-output"><option value="">既定の出力</option></select></label></div>
+            <div class="form-grid two"><label>バックエンド<select id="live-backend"><option value="auto">自動（低遅延優先）</option></select></label><label>チャンク長 ms<input id="live-chunk" type="number" value="20" min="10" max="2000"></label></div>
+            <p id="live-device-message" class="field-hint">デバイスを確認しています。</p>
+          </article>
+          <article class="card action-card live-monitor">
+            <div class="ready-icon">◉</div><h3 id="live-status">停止中</h3><p id="live-meta">開始すると入出力レベルを表示します</p>
+            <div class="meter-row"><span>INPUT</span><div class="level-meter"><i id="live-input-level"></i></div></div>
+            <div class="meter-row"><span>OUTPUT</span><div class="level-meter"><i id="live-output-level"></i></div></div>
+            <p id="live-counters">処理 0 · ドロップ 0</p>
+            <button class="primary wide" id="start-live">ライブ処理を開始 <span>→</span></button>
+            <button class="danger wide hidden" id="stop-live">停止</button>
+          </article>
+        </div>
+      </section>
+
       <section class="page" id="page-compare">
         <div class="compare-layout">
           <article class="card"><div class="card-heading"><div><span class="step">01</span><h2>参照ファイル</h2></div></div><div id="compare-inputs" class="compare-inputs"></div><button class="primary wide" id="run-compare">品質を比較</button></article>
@@ -140,7 +167,7 @@ const errorText = (error: unknown) => error instanceof Error ? error.message : S
 const SETTINGS_KEY = "denoize.desktop.settings.v1";
 const PRESETS_KEY = "denoize.desktop.presets.v1";
 const RECENT_KEY = "denoize.desktop.recent.v1";
-const settingIds = ["mode", "preset", "backend", "strength", "adaptive", "vad", "metadata", "force", "channels", "mp3-bitrate", "aac-bitrate", "aac-encoder", "loudness-enabled", "loudness", "true-peak", "model-path", "onnx-rate", "sgmse-profile", "batch-format", "batch-jobs", "batch-recursive", "batch-resume", "batch-force"];
+const settingIds = ["mode", "preset", "backend", "strength", "adaptive", "vad", "metadata", "force", "channels", "mp3-bitrate", "aac-bitrate", "aac-encoder", "loudness-enabled", "loudness", "true-peak", "model-path", "onnx-rate", "sgmse-profile", "batch-format", "batch-jobs", "batch-recursive", "batch-resume", "batch-force", "live-input", "live-output", "live-backend", "live-chunk"];
 type SavedValues = Record<string, string | number | boolean>;
 
 function captureSettings(): SavedValues {
@@ -258,8 +285,13 @@ async function init() {
   $("#version").textContent = `v${appInfo.version}`;
   $("#engine-label").textContent = `${appInfo.backends.length} backend${appInfo.backends.length > 1 ? "s" : ""} ready`;
   const backend = $<HTMLSelectElement>("#backend");
-  appInfo.backends.forEach(({ name }) => backend.add(new Option(name === "classical" ? "Classical DSP" : name, name)));
+  const liveBackend = $<HTMLSelectElement>("#live-backend");
+  appInfo.backends.forEach(({ name }) => {
+    const label = name === "classical" ? "Classical DSP" : name;
+    backend.add(new Option(label, name)); liveBackend.add(new Option(label, name));
+  });
   if (appInfo.fdkAvailable) $<HTMLSelectElement>("#aac-encoder").add(new Option("FDK-AAC", "fdk"));
+  await loadLiveDevices();
   restoreSettings();
   renderCompareInputs();
   await loadModels();
@@ -478,6 +510,50 @@ async function loadModels() {
   } catch (error) { $("#model-list").textContent = errorText(error); }
 }
 $("#refresh-models").addEventListener("click", loadModels);
+
+async function loadLiveDevices() {
+  const message = $("#live-device-message");
+  try {
+    const devices = await invoke<LiveDevices>("live_devices");
+    const fill = (selector: string, names: string[], fallback: string) => {
+      const select = $<HTMLSelectElement>(selector); const selected = select.value;
+      select.innerHTML = `<option value="">${fallback}</option>`;
+      names.forEach((name) => select.add(new Option(name, name)));
+      if ([...select.options].some((option) => option.value === selected)) select.value = selected;
+    };
+    fill("#live-input", devices.inputs, "既定の入力"); fill("#live-output", devices.outputs, "既定の出力");
+    message.textContent = `入力 ${devices.inputs.length}台 · 出力 ${devices.outputs.length}台`;
+  } catch (error) { message.textContent = `デバイスを取得できません: ${errorText(error)}`; }
+}
+$("#refresh-live-devices").addEventListener("click", () => void loadLiveDevices());
+$("#start-live").addEventListener("click", async () => {
+  try {
+    const backend = $<HTMLSelectElement>("#live-backend").value;
+    await invoke("start_live", { request: {
+      inputDevice: $<HTMLSelectElement>("#live-input").value || null,
+      outputDevice: $<HTMLSelectElement>("#live-output").value || null,
+      chunkMs: Number($<HTMLInputElement>("#live-chunk").value), backend,
+      options: { ...options(), backend },
+    } });
+    $("#start-live").classList.add("hidden"); $("#stop-live").classList.remove("hidden");
+    $("#live-status").textContent = "接続中";
+  } catch (error) { showToast(errorText(error), true); }
+});
+$("#stop-live").addEventListener("click", async () => {
+  try { await invoke("stop_live"); $("#live-status").textContent = "停止しています"; }
+  catch (error) { showToast(errorText(error), true); }
+});
+listen<LiveEvent>("live-status", ({ payload }) => {
+  $("#live-status").textContent = payload.message;
+  $<HTMLElement>("#live-input-level").style.width = `${Math.min(100, payload.inputLevel * 100)}%`;
+  $<HTMLElement>("#live-output-level").style.width = `${Math.min(100, payload.outputLevel * 100)}%`;
+  $("#live-meta").textContent = payload.sampleRate ? `${payload.sampleRate.toLocaleString()} Hz · 入力 ${payload.inputChannels}ch / 出力 ${payload.outputChannels}ch · ${payload.chunkFrames} frames` : "開始すると入出力レベルを表示します";
+  $("#live-counters").textContent = `処理 ${payload.processedChunks} · ドロップ ${payload.droppedChunks}`;
+  if (payload.status !== "running") {
+    $("#start-live").classList.remove("hidden"); $("#stop-live").classList.add("hidden");
+    if (payload.status === "failed") showToast(payload.message, true);
+  }
+});
 
 listen<JobProgress>("job-progress", ({ payload }) => {
   if (payload.jobId !== activeJob) return;

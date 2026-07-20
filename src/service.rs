@@ -97,6 +97,16 @@ pub fn select_backend(
     Backend::Classical
 }
 
+/// Select the low-latency backend preferred for realtime sessions.
+pub fn select_live_backend() -> Backend {
+    #[cfg(feature = "rnnoise")]
+    {
+        return Backend::Rnnoise;
+    }
+    #[allow(unreachable_code)]
+    Backend::Classical
+}
+
 /// Fill backend options that can be resolved from the managed model library.
 pub fn resolve_backend_options(
     _backend: Backend,
@@ -156,6 +166,11 @@ mod tests {
     fn automatic_backend_is_compiled() {
         let selected = select_backend(BackendChoice::Auto, 10.0, None);
         assert!(Backend::available_names().contains(&backend_name(selected)));
+    }
+
+    #[test]
+    fn live_backend_is_compiled() {
+        assert!(Backend::available_names().contains(&backend_name(select_live_backend())));
     }
 
     #[test]

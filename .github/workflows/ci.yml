@@ -40,7 +40,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends \
-            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev patchelf
+            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev patchelf \
+            libasound2-dev
 
       - name: Install frontend dependencies
         working-directory: apps/desktop
@@ -55,4 +56,4 @@ jobs:
         run: npm audit --audit-level=moderate
 
       - name: Test desktop command layer
-        run: cargo test --locked --manifest-path apps/desktop/src-tauri/Cargo.toml --no-default-features
+        run: cargo test --locked --manifest-path apps/desktop/src-tauri/Cargo.toml --no-default-features --features live
