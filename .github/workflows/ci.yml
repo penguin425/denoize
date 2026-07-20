@@ -28,3 +28,31 @@ jobs:
 
       - name: Test crates.io feature set
         run: bash scripts/publish-crates-io.sh --test
+
+  desktop:
+    name: Desktop app
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Install Tauri system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends \
+            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev patchelf
+
+      - name: Install frontend dependencies
+        working-directory: apps/desktop
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: apps/desktop
+        run: npm run build
+
+      - name: Audit frontend dependencies
+        working-directory: apps/desktop
+        run: npm audit --audit-level=moderate
+
+      - name: Test desktop command layer
+        run: cargo test --locked --manifest-path apps/desktop/src-tauri/Cargo.toml --no-default-features
