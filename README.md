@@ -386,6 +386,18 @@ Native tags are retained for same-format output; conversions remap common
 fields such as title, artist, album, date, ReplayGain, comments, and artwork to
 the destination container's tag type. Use `--no-metadata` for a clean output.
 
+### Quality comparison
+
+```sh
+denoize compare clean.wav noisy.wav enhanced.wav
+denoize compare clean.wav noisy.wav enhanced.wav --json
+denoize compare clean.wav noisy.wav enhanced.wav --html > report.html
+```
+
+The report shows noisy and enhanced SI-SDR, SI-SNR, SNR, segmental SNR, and
+improvement deltas. Metrics requiring external models or licensed reference
+implementations are explicitly marked as unmeasured.
+
 ```
 -b, --backend <NAME>     classical|rnnoise|deepfilter
 -a, --algorithm <NAME>    omlsa|logmmse|mmse|wiener|specsub|specsub-nl|specsub-geo

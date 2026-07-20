@@ -9,6 +9,8 @@ pub struct BenchmarkReport {
     pub channels: usize,
     pub si_sdr_db: f64,
     pub si_snr_db: f64,
+    pub snr_db: f64,
+    pub segmental_snr_db: f64,
     pub stereo_side_sdr_db: Option<f64>,
     pub correlation_error: Option<f64>,
     pub stoi: Option<f64>,
@@ -53,6 +55,8 @@ impl BenchmarkReport {
             channels: reference.channels.len(),
             si_sdr_db: si_sdr(&r, &t),
             si_snr_db: si_snr(&r, &t),
+            snr_db: snr(&r, &t),
+            segmental_snr_db: segmental_snr(&r, &t, reference.sample_rate),
             stereo_side_sdr_db: side_sdr,
             correlation_error,
             stoi: None,
@@ -63,11 +67,66 @@ impl BenchmarkReport {
     }
 
     pub fn json(&self) -> String {
-        format!("{{\"frames\":{},\"sample_rate\":{},\"channels\":{},\"si_sdr_db\":{:.6},\"si_snr_db\":{:.6},\"stereo_side_sdr_db\":{},\"correlation_error\":{},\"stoi\":{},\"pesq\":{},\"elapsed_ms\":{},\"peak_rss_bytes\":{}}}", self.frames, self.sample_rate, self.channels, self.si_sdr_db, self.si_snr_db, optional(self.stereo_side_sdr_db), optional(self.correlation_error), optional(self.stoi), optional(self.pesq), optional(self.elapsed_ms), self.peak_rss_bytes.map_or_else(|| "null".into(), |v| v.to_string()))
+        format!("{{\"frames\":{},\"sample_rate\":{},\"channels\":{},\"si_sdr_db\":{:.6},\"si_snr_db\":{:.6},\"snr_db\":{:.6},\"segmental_snr_db\":{:.6},\"stereo_side_sdr_db\":{},\"correlation_error\":{},\"stoi\":{},\"pesq\":{},\"elapsed_ms\":{},\"peak_rss_bytes\":{}}}", self.frames, self.sample_rate, self.channels, self.si_sdr_db, self.si_snr_db, self.snr_db, self.segmental_snr_db, optional(self.stereo_side_sdr_db), optional(self.correlation_error), optional(self.stoi), optional(self.pesq), optional(self.elapsed_ms), self.peak_rss_bytes.map_or_else(|| "null".into(), |v| v.to_string()))
     }
 
     pub fn markdown(&self) -> String {
-        format!("| Metric | Value |\n|---|---:|\n| SI-SDR | {:.3} dB |\n| SI-SNR | {:.3} dB |\n| Stereo side SDR | {} |\n| Correlation error | {} |\n| STOI | {} |\n| PESQ | {} |", self.si_sdr_db, self.si_snr_db, db(self.stereo_side_sdr_db), display(self.correlation_error, 6), display(self.stoi, 4), display(self.pesq, 3))
+        format!("| Metric | Value |\n|---|---:|\n| SI-SDR | {:.3} dB |\n| SI-SNR | {:.3} dB |\n| SNR | {:.3} dB |\n| Segmental SNR | {:.3} dB |\n| Stereo side SDR | {} |\n| Correlation error | {} |\n| STOI | {} |\n| PESQ | {} |", self.si_sdr_db, self.si_snr_db, self.snr_db, self.segmental_snr_db, db(self.stereo_side_sdr_db), display(self.correlation_error, 6), display(self.stoi, 4), display(self.pesq, 3))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ComparisonReport {
+    pub noisy: BenchmarkReport,
+    pub enhanced: BenchmarkReport,
+}
+
+impl ComparisonReport {
+    pub fn compare(clean: &Audio, noisy: &Audio, enhanced: &Audio) -> Result<Self, String> {
+        Ok(Self {
+            noisy: BenchmarkReport::compare(clean, noisy)?,
+            enhanced: BenchmarkReport::compare(clean, enhanced)?,
+        })
+    }
+
+    pub fn json(&self) -> String {
+        format!(
+            "{{\"noisy\":{},\"enhanced\":{},\"improvement\":{{\"si_sdr_db\":{:.6},\"si_snr_db\":{:.6},\"snr_db\":{:.6},\"segmental_snr_db\":{:.6}}}}}",
+            self.noisy.json(), self.enhanced.json(),
+            self.enhanced.si_sdr_db - self.noisy.si_sdr_db,
+            self.enhanced.si_snr_db - self.noisy.si_snr_db,
+            self.enhanced.snr_db - self.noisy.snr_db,
+            self.enhanced.segmental_snr_db - self.noisy.segmental_snr_db,
+        )
+    }
+
+    pub fn markdown(&self) -> String {
+        format!(
+            "| Metric | Noisy | Enhanced | Improvement |\n|---|---:|---:|---:|\n| SI-SDR | {:.3} dB | {:.3} dB | {:+.3} dB |\n| SI-SNR | {:.3} dB | {:.3} dB | {:+.3} dB |\n| SNR | {:.3} dB | {:.3} dB | {:+.3} dB |\n| Segmental SNR | {:.3} dB | {:.3} dB | {:+.3} dB |\n\nSTOI, PESQ, and DNSMOS: not measured (no external model or licensed reference implementation configured).",
+            self.noisy.si_sdr_db, self.enhanced.si_sdr_db, self.enhanced.si_sdr_db - self.noisy.si_sdr_db,
+            self.noisy.si_snr_db, self.enhanced.si_snr_db, self.enhanced.si_snr_db - self.noisy.si_snr_db,
+            self.noisy.snr_db, self.enhanced.snr_db, self.enhanced.snr_db - self.noisy.snr_db,
+            self.noisy.segmental_snr_db, self.enhanced.segmental_snr_db, self.enhanced.segmental_snr_db - self.noisy.segmental_snr_db,
+        )
+    }
+
+    pub fn html(&self) -> String {
+        let rows = self
+            .markdown()
+            .lines()
+            .skip(2)
+            .take(4)
+            .map(|line| {
+                let cells = line
+                    .trim_matches('|')
+                    .split('|')
+                    .map(str::trim)
+                    .map(|cell| format!("<td>{cell}</td>"))
+                    .collect::<String>();
+                format!("<tr>{cells}</tr>")
+            })
+            .collect::<String>();
+        format!("<!doctype html><meta charset=\"utf-8\"><title>denoize comparison</title><style>body{{font-family:system-ui;max-width:900px;margin:3rem auto}}table{{border-collapse:collapse}}td,th{{padding:.5rem 1rem;border:1px solid #ccc;text-align:right}}td:first-child{{text-align:left}}</style><h1>denoize quality comparison</h1><table><thead><tr><th>Metric</th><th>Noisy</th><th>Enhanced</th><th>Improvement</th></tr></thead><tbody>{rows}</tbody></table><p>STOI, PESQ, and DNSMOS were not measured.</p>")
     }
 }
 
@@ -116,6 +175,28 @@ pub fn si_snr(reference: &[f64], estimate: &[f64]) -> f64 {
     )
 }
 
+pub fn snr(reference: &[f64], estimate: &[f64]) -> f64 {
+    let signal = reference.iter().map(|sample| sample * sample).sum::<f64>();
+    let noise = reference
+        .iter()
+        .zip(estimate)
+        .map(|(a, b)| (a - b).powi(2))
+        .sum::<f64>();
+    10.0 * (signal / noise.max(1e-30)).log10()
+}
+
+pub fn segmental_snr(reference: &[f64], estimate: &[f64], sample_rate: u32) -> f64 {
+    let window = (sample_rate as usize / 50).max(1);
+    let mut values = Vec::new();
+    for (r, e) in reference.chunks(window).zip(estimate.chunks(window)) {
+        let signal = r.iter().map(|sample| sample * sample).sum::<f64>();
+        if signal > 1e-12 {
+            values.push(snr(r, e).clamp(-10.0, 35.0));
+        }
+    }
+    values.iter().sum::<f64>() / values.len().max(1) as f64
+}
+
 fn correlation(a: &[f64], b: &[f64]) -> f64 {
     let dot = a.iter().zip(b).map(|(a, b)| a * b).sum::<f64>();
     dot / (a.iter().map(|x| x * x).sum::<f64>() * b.iter().map(|x| x * x).sum::<f64>())
@@ -133,5 +214,43 @@ mod tests {
         let estimate = [0.5, -0.5, 0.25, -0.25];
         assert!(si_sdr(&reference, &estimate) > 250.0);
         assert!(si_snr(&reference, &estimate) > 250.0);
+    }
+
+    #[test]
+    fn comparison_reports_quality_improvement_in_all_formats() {
+        let clean = Audio {
+            sample_rate: 16_000,
+            channels: vec![(0..1600)
+                .map(|index| (index as f64 * 0.031).sin() * 0.5)
+                .collect()],
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let noisy = Audio {
+            sample_rate: clean.sample_rate,
+            channels: vec![clean.channels[0]
+                .iter()
+                .enumerate()
+                .map(|(index, sample)| sample + if index % 2 == 0 { 0.1 } else { -0.1 })
+                .collect()],
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let enhanced = Audio {
+            sample_rate: clean.sample_rate,
+            channels: vec![clean.channels[0]
+                .iter()
+                .enumerate()
+                .map(|(index, sample)| sample + if index % 2 == 0 { 0.02 } else { -0.02 })
+                .collect()],
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+
+        let report = ComparisonReport::compare(&clean, &noisy, &enhanced).unwrap();
+        assert!(report.enhanced.snr_db > report.noisy.snr_db);
+        assert!(report.json().contains("\"improvement\""));
+        assert!(report.markdown().contains("Segmental SNR"));
+        assert!(report.html().starts_with("<!doctype html>"));
     }
 }

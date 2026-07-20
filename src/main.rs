@@ -24,6 +24,7 @@ USAGE:
     denoize live --list-devices
     denoize models <list|info|install|update|verify|remove|path|cache-dir> [MODEL|all]
     denoize metrics <REFERENCE> <TEST> [--json|--markdown]
+    denoize compare <CLEAN> <NOISY> <ENHANCED> [--json|--html]
 
 OPTIONS:
     -b, --backend <NAME>     auto|{backends}  (default: classical)
@@ -488,6 +489,9 @@ fn run(args: &[String]) -> Result<(), String> {
     }
     if args.first().map(String::as_str) == Some("metrics") {
         return run_metrics(&args[1..]);
+    }
+    if args.first().map(String::as_str) == Some("compare") {
+        return run_compare(&args[1..]);
     }
     let (input, output, ov) = parse_args(args)?;
     if ov.batch {
@@ -964,6 +968,41 @@ fn run_metrics(args: &[String]) -> Result<(), String> {
         denoize::benchmark::BenchmarkReport::compare(&read_audio(reference)?, &read_audio(test)?)?;
     if args.iter().any(|argument| argument == "--json") {
         println!("{}", report.json());
+    } else {
+        println!("{}", report.markdown());
+    }
+    Ok(())
+}
+
+fn run_compare(args: &[String]) -> Result<(), String> {
+    if args.len() < 3 {
+        return Err("compare requires CLEAN NOISY ENHANCED".into());
+    }
+    if args[3..]
+        .iter()
+        .any(|argument| argument != "--json" && argument != "--html")
+    {
+        return Err("compare accepts only --json or --html after the input files".into());
+    }
+    if args.iter().any(|argument| argument == "--json")
+        && args.iter().any(|argument| argument == "--html")
+    {
+        return Err("compare accepts only one output format".into());
+    }
+    let clean = args
+        .first()
+        .ok_or("compare requires CLEAN NOISY ENHANCED")?;
+    let noisy = args.get(1).ok_or("compare requires CLEAN NOISY ENHANCED")?;
+    let enhanced = args.get(2).ok_or("compare requires CLEAN NOISY ENHANCED")?;
+    let report = denoize::benchmark::ComparisonReport::compare(
+        &read_audio(clean)?,
+        &read_audio(noisy)?,
+        &read_audio(enhanced)?,
+    )?;
+    if args.iter().any(|argument| argument == "--json") {
+        println!("{}", report.json());
+    } else if args.iter().any(|argument| argument == "--html") {
+        println!("{}", report.html());
     } else {
         println!("{}", report.markdown());
     }
