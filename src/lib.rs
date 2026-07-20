@@ -49,6 +49,7 @@ pub mod postfilter;
 pub mod resample;
 pub mod stft;
 pub mod stream;
+pub mod vad;
 pub mod window;
 
 pub use audio::{
@@ -135,13 +136,23 @@ pub fn denoise_audio_with_backend_config(
 ) -> Result<std::time::Duration, String> {
     config.sample_rate = audio.sample_rate;
     let t0 = std::time::Instant::now();
-    audio.channels = backend::process_channels(
-        backend,
-        &audio.channels,
-        audio.sample_rate,
-        &config,
-        backend_options,
-    )?;
+    audio.channels = if config.vad {
+        process_with_vad(
+            backend,
+            &audio.channels,
+            audio.sample_rate,
+            &config,
+            backend_options,
+        )?
+    } else {
+        backend::process_channels(
+            backend,
+            &audio.channels,
+            audio.sample_rate,
+            &config,
+            backend_options,
+        )?
+    };
     let elapsed = t0.elapsed();
     eprintln!(
         "denoize: {:?} | {}ch x {} frames ({:.2}s) in {:.2?} ({:.1}x realtime)",
@@ -153,4 +164,65 @@ pub fn denoise_audio_with_backend_config(
         (audio.frames() as f64 / audio.sample_rate as f64) / elapsed.as_secs_f64().max(1e-9),
     );
     Ok(elapsed)
+}
+
+fn process_with_vad(
+    backend: Backend,
+    channels: &[Vec<f64>],
+    sample_rate: u32,
+    config: &DenoiserConfig,
+    backend_options: &BackendOptions,
+) -> Result<Vec<Vec<f64>>, String> {
+    let regions = vad::speech_regions(channels, sample_rate);
+    let fade_frames = (sample_rate as usize / 50).max(1); // 20 ms
+    let mut output: Vec<Vec<f64>> = channels
+        .iter()
+        .map(|channel| channel.iter().map(|sample| sample * 0.08).collect())
+        .collect();
+    for region in regions {
+        let input: Vec<Vec<f64>> = channels
+            .iter()
+            .map(|channel| {
+                channel[region.start.min(channel.len())..region.end.min(channel.len())].to_vec()
+            })
+            .collect();
+        let enhanced =
+            backend::process_channels(backend, &input, sample_rate, config, backend_options)?;
+        for (channel_index, enhanced_channel) in enhanced.iter().enumerate() {
+            let Some(destination) = output.get_mut(channel_index) else {
+                continue;
+            };
+            let original = &channels[channel_index];
+            for (offset, sample) in enhanced_channel.iter().enumerate() {
+                let index = region.start + offset;
+                if index >= destination.len() || index >= original.len() || index >= region.end {
+                    break;
+                }
+                let target = sample * 0.85 + original[index] * 0.15;
+                let weight = vad_mix_weight(offset, region.end - region.start, fade_frames);
+                destination[index] = destination[index] * (1.0 - weight) + target * weight;
+            }
+        }
+    }
+    Ok(output)
+}
+
+fn vad_mix_weight(offset: usize, length: usize, fade_frames: usize) -> f64 {
+    let from_start = offset.min(fade_frames) as f64 / fade_frames.max(1) as f64;
+    let from_end =
+        length.saturating_sub(offset + 1).min(fade_frames) as f64 / fade_frames.max(1) as f64;
+    from_start.min(from_end).clamp(0.0, 1.0)
+}
+
+#[cfg(test)]
+mod vad_mix_tests {
+    use super::vad_mix_weight;
+
+    #[test]
+    fn fades_vad_region_edges_without_exceeding_unity() {
+        assert_eq!(vad_mix_weight(0, 100, 10), 0.0);
+        assert_eq!(vad_mix_weight(99, 100, 10), 0.0);
+        assert_eq!(vad_mix_weight(50, 100, 10), 1.0);
+        assert!((vad_mix_weight(5, 100, 10) - 0.5).abs() < f64::EPSILON);
+    }
 }
