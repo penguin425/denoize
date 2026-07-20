@@ -263,6 +263,9 @@ kept locally for quick reuse.
 Audio files and folders can be dropped onto the single-file or batch input
 zones; output folders have dedicated drop targets. Multiple audio files switch
 the app to batch mode automatically.
+The realtime page routes a selected capture device through a low-latency
+backend to a playback device, with input/output meters, dropped-chunk counters,
+and explicit start/stop controls. Headphones help prevent acoustic feedback.
 
 ```sh
 cd apps/desktop

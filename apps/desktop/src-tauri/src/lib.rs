@@ -22,6 +22,7 @@ static NEXT_JOB_ID: AtomicU64 = AtomicU64::new(1);
 #[derive(Default)]
 struct AppState {
     jobs: Arc<Mutex<HashMap<u64, Arc<AtomicBool>>>>,
+    live: Arc<Mutex<Option<Arc<AtomicBool>>>>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -72,6 +73,35 @@ struct BatchItem {
     input: PathBuf,
     output: PathBuf,
     state_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LiveRequest {
+    input_device: Option<String>,
+    output_device: Option<String>,
+    chunk_ms: u32,
+    backend: String,
+    options: ProcessOptions,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LiveDevices { inputs: Vec<String>, outputs: Vec<String> }
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LiveEvent {
+    status: &'static str,
+    message: String,
+    sample_rate: u32,
+    input_channels: usize,
+    output_channels: usize,
+    chunk_frames: usize,
+    input_level: f32,
+    output_level: f32,
+    processed_chunks: u64,
+    dropped_chunks: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -444,6 +474,71 @@ fn cancel_job(state: State<'_, AppState>, job_id: u64) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn live_devices() -> Result<LiveDevices, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let (inputs, outputs) = denoize::live::device_names()?;
+        Ok(LiveDevices { inputs, outputs })
+    }).await.map_err(|error| format!("デバイス一覧の取得に失敗しました: {error}"))?
+}
+
+#[tauri::command]
+fn start_live(app: AppHandle, state: State<'_, AppState>, request: LiveRequest) -> Result<(), String> {
+    if !(10..=2_000).contains(&request.chunk_ms) { return Err("チャンク長は10〜2000msにしてください".into()); }
+    if !state.jobs.lock().map_err(|_| "ジョブ状態を取得できません")?.is_empty() { return Err("ファイル処理の完了後に開始してください".into()); }
+    let backend = if request.backend == "auto" { service::select_live_backend() } else {
+        Backend::parse(&request.backend).ok_or_else(|| format!("利用できないバックエンドです: {}", request.backend))?
+    };
+    if service::requires_external_model(backend) {
+        let model = request.options.onnx_model.as_deref().unwrap_or_default();
+        if !Path::new(model).is_file() { return Err("選択したバックエンドのONNXモデルを指定してください".into()); }
+    }
+    let backend_options = service::resolve_backend_options(backend, BackendOptions {
+        onnx: request.options.onnx_model.as_ref().map(|path| OnnxModelConfig { path: path.into(), sample_rate: request.options.onnx_sample_rate }),
+        channel_mode: ChannelMode::parse(&request.options.channel_mode).ok_or("不明なチャンネルモードです")?,
+        sgmse_profile: SgmseProfile::parse(&request.options.sgmse_profile).ok_or("不明なSGMSEプロファイルです")?,
+    })?;
+    let denoiser = processing_config(&request.options, 48_000)?;
+    let running = Arc::new(AtomicBool::new(true));
+    {
+        let mut live = state.live.lock().map_err(|_| "ライブ状態を更新できません")?;
+        if live.is_some() { return Err("ライブ処理は既に実行中です".into()); }
+        *live = Some(Arc::clone(&running));
+    }
+    let live_state = Arc::clone(&state.live);
+    std::thread::spawn(move || {
+        let config = denoize::live::LiveConfig {
+            input_device: request.input_device,
+            output_device: request.output_device,
+            chunk_ms: request.chunk_ms,
+            backend,
+            backend_options,
+            denoiser,
+        };
+        let result = denoize::live::run_with_status(config, running, |status| {
+            let _ = app.emit("live-status", LiveEvent {
+                status: "running", message: "ライブ処理中".into(), sample_rate: status.sample_rate,
+                input_channels: status.input_channels, output_channels: status.output_channels,
+                chunk_frames: status.chunk_frames, input_level: status.input_level,
+                output_level: status.output_level, processed_chunks: status.processed_chunks,
+                dropped_chunks: status.dropped_chunks,
+            });
+        });
+        let (status, message) = match result { Ok(()) => ("stopped", "ライブ処理を停止しました".into()), Err(error) => ("failed", error) };
+        let _ = app.emit("live-status", LiveEvent { status, message, sample_rate: 0, input_channels: 0, output_channels: 0, chunk_frames: 0, input_level: 0.0, output_level: 0.0, processed_chunks: 0, dropped_chunks: 0 });
+        if let Ok(mut live) = live_state.lock() { *live = None; }
+    });
+    Ok(())
+}
+
+#[tauri::command]
+fn stop_live(state: State<'_, AppState>) -> Result<(), String> {
+    let live = state.live.lock().map_err(|_| "ライブ状態を取得できません")?;
+    let running = live.as_ref().ok_or("ライブ処理は実行されていません")?;
+    running.store(false, Ordering::SeqCst);
+    Ok(())
+}
+
+#[tauri::command]
 async fn compare_audio(
     clean: String,
     noisy: String,
@@ -600,6 +695,14 @@ fn save_text_file(path: String, contents: String) -> Result<(), String> {
 }
 
 fn register_job(state: &State<'_, AppState>) -> Result<(u64, Arc<AtomicBool>), String> {
+    if state
+        .live
+        .lock()
+        .map_err(|_| "ライブ状態を取得できません")?
+        .is_some()
+    {
+        return Err("ライブ処理を停止してから開始してください".into());
+    }
     let job_id = NEXT_JOB_ID.fetch_add(1, Ordering::Relaxed);
     let cancelled = Arc::new(AtomicBool::new(false));
     let mut jobs = state
@@ -849,6 +952,9 @@ pub fn run() {
             start_process,
             start_batch,
             cancel_job,
+            live_devices,
+            start_live,
+            stop_live,
             compare_audio,
             list_models,
             model_action,
