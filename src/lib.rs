@@ -40,6 +40,8 @@ pub mod denoiser;
 pub mod encode;
 pub mod fft;
 pub mod gain;
+#[cfg(feature = "live")]
+pub mod live;
 pub mod models;
 pub mod noise;
 pub mod perceptual;
