@@ -7,18 +7,25 @@ Classical DSP + optional AI backends (RNNoise, DeepFilterNet v3, MP-SENet, BSRNN
 Input/output: WAV, FLAC, Ogg Opus, MP3, M4A (built in; no ffmpeg).
 
 USAGE:
-    denoize <INPUT> <OUTPUT.wav|flac|opus|ogg|mp3|m4a> [OPTIONS]
+    denoize <INPUT> <OUTPUT.wav|flac|opus|ogg|mp3|m4a|aac> [OPTIONS]
+    denoize live [--input-device NAME] [--output-device NAME] [OPTIONS]
+    denoize live --list-devices
     denoize models <list|info|install|update|verify|remove|path|cache-dir> [MODEL|all]
     denoize metrics <REFERENCE> <TEST> [--json|--markdown]
+    denoize compare <CLEAN> <NOISY> <ENHANCED> [--json|--html]
 
 OPTIONS:
-    -b, --backend <NAME>     classical|rnnoise|deepfilter|onnx|mpsenet|bsrnn|mossformer2|sgmse|gtcrn  (default: classical)
+        --config <PATH>      load TOML defaults (CLI options take precedence)
+    -b, --backend <NAME>     auto|classical  (default: classical)
     -a, --algorithm <NAME>   omlsa|logmmse|mmse|wiener|specsub|specsub-nl|specsub-geo
     -p, --preset <NAME>      speech|music|aggressive|gentle|restore|hifi
+        --mode <NAME>        speech|music|ambient processing intent
     -s, --strength <0..1>    denoising strength (default: 0.6)
         --profile <MS>       learn noise from first MS ms (default: auto-detect)
         --no-profile         no profiling; rely on blind IMCRA bootstrap
         --no-adapt           freeze the noise estimate
+        --adaptive-noise     learn noise from noise-only regions throughout the file
+        --vad                speech-aware segmentation and silence suppression
         --frame <N>          FFT size: 512|1024|2048|4096|8192 (default: 2048)
         --overlap <F>        overlap ratio 0.5..0.95 (default: 0.75)
         --window <NAME>      hann|hamming|sine|blackman|kaiser|flattop|dpss
@@ -39,13 +46,25 @@ OPTIONS:
         --report             print settings report and exit
         --mp3-bitrate <KBPS> MP3 CBR bitrate (default: 192)
         --m4a-bitrate <KBPS> M4A/AAC CBR bitrate (default: 192)
+        --aac-encoder <NAME> oxide|fdk (default: oxide)
+        --loudness <LUFS>     normalize integrated loudness after denoising
+        --true-peak <DBTP>    true-peak ceiling with --loudness (default: -1)
         --onnx-model <PATH>   waveform ONNX model (required for -b onnx)
         --onnx-rate <HZ>      ONNX model sample rate (default: 16000)
         --channels <MODE>     independent|linked|mid-side (default: independent)
         --sgmse-profile <P>   fast|balanced|quality (default: balanced)
         --batch               process files in INPUT directory into OUTPUT directory
+        --recursive           include subdirectories in batch mode
+        --jobs <N>            concurrent batch workers (default: CPU count)
+        --output-format <EXT> convert every batch output to this format
         --force               allow replacing existing output files
+        --resume              skip completed files recorded by batch state
+        --no-progress         suppress batch progress and ETA output
         --json                emit a machine-readable result
+        --no-metadata         do not copy input tags/artwork to the output
+        --input-device <NAME> live capture device (default: system default)
+        --output-device <NAME> live playback device (default: system default)
+        --chunk-ms <MS>       live processing chunk duration (default: 100)
     -h, --help               show this help
     -V, --version            show version
 
