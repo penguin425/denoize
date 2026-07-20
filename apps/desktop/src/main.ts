@@ -39,7 +39,7 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
       <div class="sidebar-foot"><span class="status-dot"></span><span id="engine-label">エンジンを確認中</span><small id="version"></small></div>
     </aside>
     <main>
-      <header><div><p class="eyebrow">AUDIO RESTORATION</p><h1 id="page-title">ノイズ除去</h1></div><div class="header-badge">LOCAL · PRIVATE</div></header>
+      <header><div><p class="eyebrow">AUDIO RESTORATION</p><h1 id="page-title">ノイズ除去</h1></div><div class="header-actions"><button id="import-config">設定を読込</button><button id="export-config">設定を書出</button><button id="reset-config">初期化</button><div class="header-badge">LOCAL · PRIVATE</div></div></header>
 
       <section class="page active" id="page-process">
         <div class="grid process-grid">
@@ -49,6 +49,7 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
               <div class="file-row"><div><label>入力</label><div id="input-display" class="path empty">音声ファイルを選択</div></div><button class="secondary" id="choose-input">選択</button></div>
               <div class="file-row"><div><label>出力</label><div id="output-display" class="path empty">保存先を選択</div></div><button class="secondary" id="choose-output">選択</button></div>
               <input type="hidden" id="input-path"><input type="hidden" id="output-path">
+              <div id="recent-files" class="recent-files"></div>
             </article>
 
             <article class="card preview-card">
@@ -89,6 +90,7 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
               <label>AACエンコーダー<select id="aac-encoder"><option value="oxide">OxideAV</option></select></label>
               <label class="toggle inline"><input id="loudness-enabled" type="checkbox"><span></span><div><b>ラウドネス正規化</b></div></label>
               <div class="form-grid two muted-fields" id="loudness-fields"><label>目標 LUFS<input id="loudness" type="number" value="-16" step="0.5"></label><label>True Peak<input id="true-peak" type="number" value="-1" step="0.1"></label></div>
+              <div class="preset-manager"><label>ユーザープリセット<select id="user-preset"><option value="">プリセットを選択</option></select></label><div><input id="preset-name" placeholder="プリセット名"><button id="save-preset">保存</button><button id="delete-preset">削除</button></div></div>
             </article>
             <article class="card action-card">
               <div id="idle-state"><div class="ready-icon">◎</div><h3>準備ができたら開始</h3><p>処理はすべてこのコンピューター内で行われます。</p></div>
@@ -131,6 +133,56 @@ const showToast = (message: string, error = false) => {
   window.setTimeout(() => toast.className = "", 4200);
 };
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
+const SETTINGS_KEY = "denoize.desktop.settings.v1";
+const PRESETS_KEY = "denoize.desktop.presets.v1";
+const RECENT_KEY = "denoize.desktop.recent.v1";
+const settingIds = ["mode", "preset", "backend", "strength", "adaptive", "vad", "metadata", "force", "channels", "mp3-bitrate", "aac-bitrate", "aac-encoder", "loudness-enabled", "loudness", "true-peak", "model-path", "onnx-rate", "sgmse-profile", "batch-format", "batch-jobs", "batch-recursive", "batch-resume", "batch-force"];
+type SavedValues = Record<string, string | number | boolean>;
+
+function captureSettings(): SavedValues {
+  return Object.fromEntries(settingIds.map((id) => {
+    const element = document.getElementById(id) as HTMLInputElement | HTMLSelectElement;
+    return [id, element instanceof HTMLInputElement && element.type === "checkbox" ? element.checked : element.value];
+  }));
+}
+
+function applySettings(values: SavedValues) {
+  for (const [id, value] of Object.entries(values)) {
+    const element = document.getElementById(id) as HTMLInputElement | HTMLSelectElement | null; if (!element) continue;
+    if (element instanceof HTMLInputElement && element.type === "checkbox") element.checked = Boolean(value);
+    else element.value = String(value);
+  }
+  $("#strength-value").textContent = `${Math.round(Number($<HTMLInputElement>("#strength").value) * 100)}%`;
+  $("#loudness-fields").classList.toggle("enabled", $<HTMLInputElement>("#loudness-enabled").checked);
+  updateBackendSettings(); renderBatch();
+}
+
+function saveSettings() { localStorage.setItem(SETTINGS_KEY, JSON.stringify(captureSettings())); }
+function restoreSettings() {
+  try { const value = localStorage.getItem(SETTINGS_KEY); if (value) applySettings(JSON.parse(value)); } catch { localStorage.removeItem(SETTINGS_KEY); }
+  renderPresets(); renderRecentFiles();
+}
+
+function presets(): Record<string, SavedValues> {
+  try { return JSON.parse(localStorage.getItem(PRESETS_KEY) ?? "{}"); } catch { return {}; }
+}
+function renderPresets() {
+  const selected = $<HTMLSelectElement>("#user-preset").value;
+  $("#user-preset").innerHTML = `<option value="">プリセットを選択</option>${Object.keys(presets()).sort().map((name) => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`).join("")}`;
+  $<HTMLSelectElement>("#user-preset").value = selected;
+}
+function recentFiles(): string[] { try { return JSON.parse(localStorage.getItem(RECENT_KEY) ?? "[]"); } catch { return []; } }
+function rememberFile(path: string) {
+  localStorage.setItem(RECENT_KEY, JSON.stringify([path, ...recentFiles().filter((item) => item !== path)].slice(0, 6)));
+  renderRecentFiles();
+}
+function renderRecentFiles() {
+  const files = recentFiles();
+  $("#recent-files").innerHTML = files.length ? `<span>最近:</span>${files.map((path) => `<button data-recent="${escapeHtml(path)}" title="${escapeHtml(path)}">${escapeHtml(path.split(/[\\/]/).pop() ?? path)}</button>`).join("")}` : "";
+  document.querySelectorAll<HTMLButtonElement>("[data-recent]").forEach((button) => button.addEventListener("click", async () => {
+    const path = button.dataset.recent!; setPath("#input-path", "#input-display", path); setPath("#output-path", "#output-display", await defaultOutput(path)); await preparePreview("input", path);
+  }));
+}
 
 function options() {
   return {
@@ -161,6 +213,7 @@ async function init() {
   const backend = $<HTMLSelectElement>("#backend");
   appInfo.backends.forEach(({ name }) => backend.add(new Option(name === "classical" ? "Classical DSP" : name, name)));
   if (appInfo.fdkAvailable) $<HTMLSelectElement>("#aac-encoder").add(new Option("FDK-AAC", "fdk"));
+  restoreSettings();
   renderCompareInputs();
   await loadModels();
 }
@@ -182,6 +235,49 @@ $("#choose-model").addEventListener("click", async () => {
   const path = await open({ multiple: false, filters: [{ name: "ONNX model", extensions: ["onnx"] }] });
   if (typeof path !== "string") return;
   setPath("#model-path", "#model-path-display", path);
+});
+
+document.addEventListener("change", (event) => {
+  if (settingIds.includes((event.target as HTMLElement).id)) saveSettings();
+});
+$("#save-preset").addEventListener("click", () => {
+  const name = $<HTMLInputElement>("#preset-name").value.trim(); if (!name) return showToast("プリセット名を入力してください", true);
+  const values = presets(); values[name] = captureSettings(); localStorage.setItem(PRESETS_KEY, JSON.stringify(values)); renderPresets(); $<HTMLSelectElement>("#user-preset").value = name; showToast("プリセットを保存しました");
+});
+$("#user-preset").addEventListener("change", (event) => {
+  const value = presets()[(event.target as HTMLSelectElement).value]; if (value) { applySettings(value); saveSettings(); }
+});
+$("#delete-preset").addEventListener("click", () => {
+  const name = $<HTMLSelectElement>("#user-preset").value; if (!name) return;
+  const values = presets(); delete values[name]; localStorage.setItem(PRESETS_KEY, JSON.stringify(values)); renderPresets();
+});
+$("#reset-config").addEventListener("click", () => { localStorage.removeItem(SETTINGS_KEY); location.reload(); });
+
+function exportConfig() {
+  const values = captureSettings();
+  return {
+    backend: values.backend, preset: values.preset, mode: values.mode, strength: Number(values.strength),
+    adaptive_noise: values.adaptive, vad: values.vad, channels: values.channels,
+    loudness_lufs: values["loudness-enabled"] ? Number(values.loudness) : null,
+    true_peak_dbtp: Number(values["true-peak"]), preserve_metadata: values.metadata, force: values.force,
+    mp3_bitrate_kbps: Number(values["mp3-bitrate"]), m4a_bitrate_kbps: Number(values["aac-bitrate"]),
+    aac_encoder: values["aac-encoder"], onnx_model: values["model-path"] || null,
+    onnx_rate: Number(values["onnx-rate"]), sgmse_profile: values["sgmse-profile"],
+  };
+}
+$("#export-config").addEventListener("click", async () => {
+  const path = await save({ defaultPath: "denoize.toml", filters: [{ name: "TOML", extensions: ["toml"] }] });
+  if (path) { await invoke("save_gui_config", { path, config: exportConfig() }); showToast("設定を書き出しました"); }
+});
+$("#import-config").addEventListener("click", async () => {
+  try {
+    const path = await open({ multiple: false, filters: [{ name: "TOML", extensions: ["toml"] }] }); if (typeof path !== "string") return;
+    const config = await invoke<Record<string, string | number | boolean>>("load_gui_config", { path });
+    const map: Record<string, string> = { adaptive_noise: "adaptive", channels: "channels", loudness_lufs: "loudness", true_peak_dbtp: "true-peak", preserve_metadata: "metadata", mp3_bitrate_kbps: "mp3-bitrate", m4a_bitrate_kbps: "aac-bitrate", aac_encoder: "aac-encoder", onnx_model: "model-path", onnx_rate: "onnx-rate", sgmse_profile: "sgmse-profile" };
+    const values: SavedValues = {}; for (const [key, value] of Object.entries(config)) values[map[key] ?? key] = value;
+    if (config.loudness_lufs != null) values["loudness-enabled"] = true;
+    applySettings(values); saveSettings(); showToast("設定を読み込みました");
+  } catch (error) { showToast(errorText(error), true); }
 });
 
 document.querySelectorAll<HTMLButtonElement>(".nav-item").forEach((button) => button.addEventListener("click", () => {
@@ -240,6 +336,7 @@ $("#choose-input").addEventListener("click", async () => {
   const path = await open({ multiple: false, filters: audioFilters }); if (typeof path !== "string") return;
   setPath("#input-path", "#input-display", path);
   const output = await defaultOutput(path); setPath("#output-path", "#output-display", output);
+  rememberFile(path);
   previews.output = undefined; $<HTMLButtonElement>("#preview-output").disabled = true;
   await preparePreview("input", path);
 });

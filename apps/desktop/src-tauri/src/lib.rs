@@ -544,6 +544,37 @@ async fn prepare_preview(path: String, points: Option<usize>) -> Result<PreviewD
 }
 
 #[tauri::command]
+fn load_gui_config(path: String) -> Result<serde_json::Value, String> {
+    let source = std::fs::read_to_string(&path)
+        .map_err(|error| format!("{path} を読めません: {error}"))?;
+    let value: toml::Value = toml::from_str(&source)
+        .map_err(|error| format!("TOML設定が不正です: {error}"))?;
+    serde_json::to_value(value).map_err(|error| format!("設定を変換できません: {error}"))
+}
+
+#[tauri::command]
+fn save_gui_config(path: String, mut config: serde_json::Value) -> Result<(), String> {
+    remove_json_nulls(&mut config);
+    let source = toml::to_string_pretty(&config)
+        .map_err(|error| format!("設定をTOMLへ変換できません: {error}"))?;
+    std::fs::write(&path, source).map_err(|error| format!("{path} を保存できません: {error}"))
+}
+
+fn remove_json_nulls(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.retain(|_, value| !value.is_null());
+            for value in map.values_mut() { remove_json_nulls(value); }
+        }
+        serde_json::Value::Array(values) => {
+            values.retain(|value| !value.is_null());
+            for value in values { remove_json_nulls(value); }
+        }
+        _ => {}
+    }
+}
+
+#[tauri::command]
 fn save_text_file(path: String, contents: String) -> Result<(), String> {
     std::fs::write(&path, contents).map_err(|error| format!("{path} を保存できません: {error}"))
 }
@@ -802,6 +833,8 @@ pub fn run() {
             list_models,
             model_action,
             prepare_preview,
+            load_gui_config,
+            save_gui_config,
             save_text_file
         ])
         .setup(|app| {
@@ -898,5 +931,24 @@ mod tests {
             NEXT_JOB_ID.fetch_add(1, Ordering::Relaxed)
         ));
         assert!(read_batch_state(&path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn gui_toml_config_round_trips_without_nulls() {
+        let path = std::env::temp_dir().join(format!(
+            "denoize-gui-config-{}-{}.toml",
+            std::process::id(),
+            NEXT_JOB_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        save_gui_config(
+            path.to_string_lossy().into_owned(),
+            serde_json::json!({"backend":"auto","strength":0.42,"onnx_model":null}),
+        )
+        .unwrap();
+        let loaded = load_gui_config(path.to_string_lossy().into_owned()).unwrap();
+        assert_eq!(loaded["backend"], "auto");
+        assert_eq!(loaded["strength"], 0.42);
+        assert!(loaded.get("onnx_model").is_none());
+        std::fs::remove_file(path).unwrap();
     }
 }
