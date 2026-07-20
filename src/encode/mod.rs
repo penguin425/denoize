@@ -7,6 +7,8 @@
 //! | M4A | `oxideav-aac` + `mp4` mux (Pure-Rust AAC-LC) |
 
 #[cfg(feature = "m4a-encode")]
+mod aac;
+#[cfg(feature = "m4a-encode")]
 mod m4a;
 #[cfg(feature = "fdk-aac-encoder")]
 mod m4a_fdk;
@@ -14,6 +16,8 @@ mod mp3;
 mod opus;
 mod pcm;
 
+#[cfg(feature = "m4a-encode")]
+pub use aac::write_adts_aac;
 #[cfg(feature = "m4a-encode")]
 pub use m4a::write_m4a;
 #[cfg(feature = "fdk-aac-encoder")]
@@ -52,6 +56,7 @@ pub enum OutputFormat {
     OggOpus,
     Mp3,
     M4a,
+    AacAdts,
 }
 
 impl OutputFormat {
@@ -67,10 +72,13 @@ impl OutputFormat {
             Some("opus" | "ogg") => Ok(OutputFormat::OggOpus),
             Some("mp3") => Ok(OutputFormat::Mp3),
             Some("m4a" | "m4b" | "mp4") => Ok(OutputFormat::M4a),
+            Some("aac") => Ok(OutputFormat::AacAdts),
             Some(ext) => Err(format!(
-                "unsupported output format '.{ext}'; use .wav, .mp3, or .m4a"
+                "unsupported output format '.{ext}'; use .wav, .flac, .opus, .mp3, .m4a, or .aac"
             )),
-            None => Err("output path has no extension; use .wav, .mp3, or .m4a".into()),
+            None => Err(
+                "output path has no extension; use .wav, .flac, .opus, .mp3, .m4a, or .aac".into(),
+            ),
         }
     }
 }
@@ -130,6 +138,25 @@ pub fn write_audio<P: AsRef<Path>>(
                 Err("M4A output is unavailable in the crates.io build; use WAV/MP3 or a GitHub release binary".into())
             }
         }
+        OutputFormat::AacAdts => {
+            #[cfg(feature = "m4a-encode")]
+            {
+                if options.aac_encoder == AacEncoder::Fdk {
+                    return Err(
+                        "FDK-AAC ADTS output is not available; use M4A or --aac-encoder oxide"
+                            .into(),
+                    );
+                }
+                write_adts_aac(path, audio, options.m4a_bitrate_bps)
+            }
+            #[cfg(not(feature = "m4a-encode"))]
+            {
+                Err(
+                    "AAC output is unavailable in this build; rebuild with --features m4a-encode"
+                        .into(),
+                )
+            }
+        }
     }
 }
 
@@ -179,6 +206,10 @@ mod tests {
         assert_eq!(
             OutputFormat::from_path(Path::new("out.m4a")).unwrap(),
             OutputFormat::M4a
+        );
+        assert_eq!(
+            OutputFormat::from_path(Path::new("out.aac")).unwrap(),
+            OutputFormat::AacAdts
         );
         assert_eq!(
             OutputFormat::from_path(Path::new("out.flac")).unwrap(),

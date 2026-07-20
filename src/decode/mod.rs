@@ -12,6 +12,7 @@
 //! | MP3  | `nanomp3`（Pure Rust / minimp3 移植） |
 //! | M4A  | `mp4` demux + `oxideav-aac` Pure-Rust AAC-LC decode |
 
+mod aac;
 mod m4a;
 mod mp3;
 mod opus;
@@ -29,7 +30,6 @@ pub enum AudioFormat {
     OggOpus,
     Mp3,
     M4a,
-    /// AAC in ADTS (.aac) — not yet supported.
     AacAdts,
     Unknown,
 }
@@ -103,9 +103,9 @@ pub fn decode_file(path: &Path) -> Result<DecodedPcm, String> {
         AudioFormat::OggOpus => opus::decode_ogg_opus(path),
         AudioFormat::Mp3 => mp3::decode_mp3_file(path),
         AudioFormat::M4a => m4a::decode_m4a(path),
-        AudioFormat::AacAdts => Err("ADTS .aac not yet supported; convert to M4A or WAV".into()),
+        AudioFormat::AacAdts => aac::decode_adts(path),
         AudioFormat::Unknown => Err(format!(
-            "unsupported audio format ({}); supported input: wav, mp3, m4a",
+            "unsupported audio format ({}); supported input: wav, flac, opus, mp3, m4a, aac",
             path.display()
         )),
     }

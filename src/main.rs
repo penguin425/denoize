@@ -19,7 +19,7 @@ Classical DSP + optional AI backends (RNNoise, DeepFilterNet v3, MP-SENet, BSRNN
 Input/output: WAV, FLAC, Ogg Opus, MP3, M4A (built in; no ffmpeg).
 
 USAGE:
-    denoize <INPUT> <OUTPUT.wav|flac|opus|ogg|mp3|m4a> [OPTIONS]
+    denoize <INPUT> <OUTPUT.wav|flac|opus|ogg|mp3|m4a|aac> [OPTIONS]
     denoize live [--input-device NAME] [--output-device NAME] [OPTIONS]
     denoize live --list-devices
     denoize models <list|info|install|update|verify|remove|path|cache-dir> [MODEL|all]
@@ -304,7 +304,7 @@ fn parse_args(args: &[String]) -> Result<(String, String, Overrides), String> {
     }
 
     let input = input.ok_or("missing INPUT")?;
-    let output = output.ok_or("missing OUTPUT (.wav|.mp3|.m4a)")?;
+    let output = output.ok_or("missing OUTPUT audio path")?;
     Ok((input, output, ov))
 }
 
@@ -833,7 +833,7 @@ fn is_supported_audio_path(path: &std::path::Path) -> bool {
         .map(|extension| {
             matches!(
                 extension.to_ascii_lowercase().as_str(),
-                "wav" | "mp3" | "m4a" | "flac" | "opus" | "ogg"
+                "wav" | "mp3" | "m4a" | "aac" | "flac" | "opus" | "ogg"
             )
         })
         .unwrap_or(false)
@@ -843,7 +843,7 @@ fn normalize_output_extension(value: &str) -> Result<&str, String> {
     let extension = value.trim_start_matches('.');
     if matches!(
         extension.to_ascii_lowercase().as_str(),
-        "wav" | "mp3" | "m4a" | "flac" | "opus" | "ogg"
+        "wav" | "mp3" | "m4a" | "aac" | "flac" | "opus" | "ogg"
     ) {
         Ok(extension)
     } else {
@@ -886,7 +886,8 @@ mod batch_tests {
     #[test]
     fn validates_batch_output_format() {
         assert_eq!(normalize_output_extension(".flac").unwrap(), "flac");
-        assert!(normalize_output_extension("aac").is_err());
+        assert_eq!(normalize_output_extension("aac").unwrap(), "aac");
+        assert!(normalize_output_extension("wma").is_err());
     }
 
     #[test]
