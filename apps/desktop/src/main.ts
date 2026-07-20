@@ -7,7 +7,8 @@ type BackendInfo = { name: string; externalModel: boolean; managedModel: string 
 type AppInfo = { version: string; backends: BackendInfo[]; formats: string[]; fdkAvailable: boolean };
 type JobProgress = {
   jobId: number; kind: string; status: string; message: string; current: number; total: number;
-  fraction: number; elapsedSeconds: number; output?: string; error?: string;
+  fraction: number; elapsedSeconds: number; output?: string; error?: string; etaSeconds?: number;
+  item?: string; itemStatus?: "completed" | "failed" | "skipped";
 };
 type Comparison = {
   markdown: string; json: string; html: string; noisySnrDb: number; enhancedSnrDb: number; improvementDb: number;
@@ -90,8 +91,8 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
 
       <section class="page" id="page-batch">
         <div class="grid two-col">
-          <article class="card tall"><div class="card-heading"><div><span class="step">01</span><h2>入力ファイル</h2></div><button class="secondary" id="choose-batch">ファイルを追加</button></div><div id="batch-files" class="empty-panel">複数の音声ファイルを選択してください</div></article>
-          <div class="stack"><article class="card"><div class="card-heading"><div><span class="step">02</span><h2>出力先</h2></div></div><div class="file-row"><div><label>フォルダ</label><div id="batch-output-display" class="path empty">出力フォルダを選択</div></div><button class="secondary" id="choose-batch-output">選択</button></div><label>形式<select id="batch-format"><option>wav</option><option>flac</option><option>opus</option><option>mp3</option><option>m4a</option><option>aac</option></select></label></article><article class="card action-card"><h3>一括処理</h3><p id="batch-summary">ファイルが未選択です</p><button class="primary wide" id="start-batch">バッチを開始 <span>→</span></button><button class="danger wide hidden" id="cancel-batch">キャンセル</button></article></div>
+          <article class="card tall"><div class="card-heading"><div><span class="step">01</span><h2>入力</h2></div><div class="button-row"><button class="secondary" id="choose-batch-folder">フォルダ</button><button class="secondary" id="choose-batch">ファイル追加</button></div></div><div id="batch-files" class="empty-panel">フォルダまたは複数ファイルを選択してください</div><div id="batch-results" class="batch-results hidden"></div></article>
+          <div class="stack"><article class="card"><div class="card-heading"><div><span class="step">02</span><h2>出力と実行</h2></div></div><div class="file-row"><div><label>出力フォルダ</label><div id="batch-output-display" class="path empty">出力フォルダを選択</div></div><button class="secondary" id="choose-batch-output">選択</button></div><div class="form-grid two"><label>形式<select id="batch-format"><option>wav</option><option>flac</option><option>opus</option><option>mp3</option><option>m4a</option><option>aac</option></select></label><label>並列数<input id="batch-jobs" type="number" value="2" min="1" max="32"></label></div><div class="toggle-grid"><label class="toggle"><input id="batch-recursive" type="checkbox" checked><span></span><div><b>サブフォルダ</b><small>相対構造を維持</small></div></label><label class="toggle"><input id="batch-resume" type="checkbox"><span></span><div><b>中断から再開</b><small>完了済みをスキップ</small></div></label><label class="toggle"><input id="batch-force" type="checkbox"><span></span><div><b>既存を上書き</b><small>出力先を置換</small></div></label></div></article><article class="card action-card"><h3>一括処理</h3><p id="batch-summary">入力が未選択です</p><button class="primary wide" id="start-batch">バッチを開始 <span>→</span></button><button class="danger wide hidden" id="cancel-batch">キャンセル</button></article></div>
         </div>
       </section>
 
@@ -207,10 +208,16 @@ $("#start-process").addEventListener("click", async () => {
 $("#cancel-process").addEventListener("click", () => cancelActive());
 
 let batchInputs: string[] = [];
+let batchInputDir = "";
 let batchOutput = "";
+const batchStatuses = new Map<string, { status: string; error?: string }>();
 $("#choose-batch").addEventListener("click", async () => {
   const paths = await open({ multiple: true, filters: audioFilters }); if (!Array.isArray(paths)) return;
   batchInputs = paths; renderBatch();
+});
+$("#choose-batch-folder").addEventListener("click", async () => {
+  const path = await open({ directory: true, multiple: false }); if (typeof path !== "string") return;
+  batchInputDir = path; batchInputs = []; renderBatch();
 });
 $("#choose-batch-output").addEventListener("click", async () => {
   const path = await open({ directory: true, multiple: false }); if (typeof path !== "string") return;
@@ -218,16 +225,19 @@ $("#choose-batch-output").addEventListener("click", async () => {
 });
 $("#start-batch").addEventListener("click", async () => {
   try {
-    if (!batchInputs.length || !batchOutput) throw new Error("入力ファイルと出力フォルダを選択してください");
-    activeJob = await invoke<number>("start_batch", { request: { inputs: batchInputs, outputDir: batchOutput, outputFormat: $<HTMLSelectElement>("#batch-format").value, options: options() } });
+    if ((!batchInputs.length && !batchInputDir) || !batchOutput) throw new Error("入力と出力フォルダを選択してください");
+    batchStatuses.clear(); $("#batch-results").innerHTML = ""; $("#batch-results").classList.remove("hidden");
+    activeJob = await invoke<number>("start_batch", { request: { inputs: batchInputs, inputDir: batchInputDir || null, outputDir: batchOutput, outputFormat: $<HTMLSelectElement>("#batch-format").value, recursive: $<HTMLInputElement>("#batch-recursive").checked, jobs: Number($<HTMLInputElement>("#batch-jobs").value), resume: $<HTMLInputElement>("#batch-resume").checked, options: { ...options(), force: $<HTMLInputElement>("#batch-force").checked } } });
     setJobUi(true, "batch");
   } catch (error) { showToast(errorText(error), true); }
 });
 $("#cancel-batch").addEventListener("click", () => cancelActive());
 function renderBatch() {
-  $("#batch-summary").textContent = `${batchInputs.length}ファイルを処理します`;
-  $("#batch-files").innerHTML = batchInputs.map((path, index) => `<div class="batch-item"><span>${String(index + 1).padStart(2, "0")}</span><div>${escapeHtml(path.split(/[\\/]/).pop() ?? path)}<small>${escapeHtml(path)}</small></div></div>`).join("");
+  $("#batch-summary").textContent = batchInputDir ? `フォルダを${$<HTMLInputElement>("#batch-recursive").checked ? "再帰的に" : ""}処理します` : `${batchInputs.length}ファイルを処理します`;
+  $("#batch-files").innerHTML = batchInputDir ? `<div class="batch-item"><span>DIR</span><div>${escapeHtml(batchInputDir.split(/[\\/]/).pop() ?? batchInputDir)}<small>${escapeHtml(batchInputDir)}</small></div></div>` : batchInputs.map((path, index) => `<div class="batch-item"><span>${String(index + 1).padStart(2, "0")}</span><div>${escapeHtml(path.split(/[\\/]/).pop() ?? path)}<small>${escapeHtml(path)}</small></div></div>`).join("");
+  $("#batch-files").classList.toggle("empty-panel", !batchInputDir && !batchInputs.length);
 }
+$("#batch-recursive").addEventListener("change", renderBatch);
 
 const comparePaths: Record<string, string> = { clean: "", noisy: "", enhanced: "" };
 function renderCompareInputs() {
@@ -268,6 +278,7 @@ $("#refresh-models").addEventListener("click", loadModels);
 
 listen<JobProgress>("job-progress", ({ payload }) => {
   if (payload.jobId !== activeJob) return;
+  if (payload.kind === "batch" && payload.item && payload.itemStatus) renderBatchResult(payload);
   updateProgress(payload);
   if (["completed", "failed", "cancelled"].includes(payload.status)) {
     activeJob = null; setJobUi(false, payload.kind); showToast(payload.error ?? payload.message, payload.status === "failed");
@@ -276,9 +287,14 @@ listen<JobProgress>("job-progress", ({ payload }) => {
 function updateProgress(progress: JobProgress) {
   const percent = Math.round(progress.fraction * 100);
   $("#progress-percent").textContent = `${percent}%`; $("#progress-message").textContent = progress.message;
-  $("#progress-meta").textContent = `${progress.current} / ${progress.total} · ${progress.elapsedSeconds.toFixed(1)}秒`;
+  $("#progress-meta").textContent = `${progress.current} / ${progress.total} · ${progress.elapsedSeconds.toFixed(1)}秒${progress.etaSeconds != null ? ` · 残り約${progress.etaSeconds.toFixed(0)}秒` : ""}`;
   $<HTMLElement>("#progress-bar").style.width = `${percent}%`;
   if (progress.kind === "batch") $("#batch-summary").textContent = `${progress.message}  ${progress.current}/${progress.total}`;
+}
+function renderBatchResult(progress: JobProgress) {
+  batchStatuses.set(progress.item!, { status: progress.itemStatus!, error: progress.error });
+  const rows = [...batchStatuses.entries()].map(([path, result]) => `<div class="batch-result ${result.status}"><b>${result.status === "completed" ? "完了" : result.status === "skipped" ? "スキップ" : "失敗"}</b><span title="${escapeHtml(path)}">${escapeHtml(path)}${result.error ? ` — ${escapeHtml(result.error)}` : ""}</span></div>`).join("");
+  $("#batch-results").innerHTML = rows;
 }
 function setJobUi(running: boolean, kind: string) {
   if (kind === "file" || kind === "process") {

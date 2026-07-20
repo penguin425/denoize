@@ -8,11 +8,13 @@ use denoize::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tauri::{AppHandle, Emitter, Manager, State};
+use rayon::prelude::*;
 
 static NEXT_JOB_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -55,9 +57,20 @@ struct ProcessRequest {
 #[serde(rename_all = "camelCase")]
 struct BatchRequest {
     inputs: Vec<String>,
+    input_dir: Option<String>,
     output_dir: String,
     output_format: String,
+    recursive: bool,
+    jobs: usize,
+    resume: bool,
     options: ProcessOptions,
+}
+
+#[derive(Clone, Debug)]
+struct BatchItem {
+    input: PathBuf,
+    output: PathBuf,
+    state_key: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -73,6 +86,9 @@ struct JobProgress {
     elapsed_seconds: f64,
     output: Option<String>,
     error: Option<String>,
+    eta_seconds: Option<f64>,
+    item: Option<String>,
+    item_status: Option<&'static str>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -218,11 +234,11 @@ fn start_batch(
     state: State<'_, AppState>,
     request: BatchRequest,
 ) -> Result<u64, String> {
-    if request.inputs.is_empty() {
-        return Err("音声ファイルを1つ以上選択してください".into());
-    }
     if !Path::new(&request.output_dir).is_dir() {
         return Err("出力フォルダが存在しません".into());
+    }
+    if !(1..=32).contains(&request.jobs) {
+        return Err("並列数は1〜32にしてください".into());
     }
     let extension = request
         .output_format
@@ -230,67 +246,75 @@ fn start_batch(
         .to_ascii_lowercase();
     let probe = PathBuf::from(format!("output.{extension}"));
     OutputFormat::from_path(&probe)?;
-    let mut outputs = HashSet::new();
-    for input in &request.inputs {
-        if !Path::new(input).is_file() {
-            return Err(format!("入力ファイルが存在しません: {input}"));
-        }
-        let stem = Path::new(input)
-            .file_stem()
-            .and_then(|value| value.to_str())
-            .unwrap_or("output");
-        let output = Path::new(&request.output_dir).join(format!("{stem}.{extension}"));
-        if !outputs.insert(output) {
-            return Err(format!(
-                "同じ出力名になるファイルがあります: {stem}.{extension}"
-            ));
-        }
+    let items = collect_batch_items(&request, &extension)?;
+    if items.is_empty() {
+        return Err("対応する音声ファイルがありません".into());
     }
     let (job_id, cancelled) = register_job(&state)?;
     let jobs = Arc::clone(&state.jobs);
     std::thread::spawn(move || {
         let started = Instant::now();
-        let total = request.inputs.len();
-        let mut failure = None;
-        for (index, input) in request.inputs.iter().enumerate() {
-            if cancelled.load(Ordering::SeqCst) {
-                break;
+        let total = items.len();
+        let state_path = Path::new(&request.output_dir).join(".denoize-gui-state");
+        let completed = if request.resume {
+            read_batch_state(&state_path).unwrap_or_default()
+        } else {
+            HashSet::new()
+        };
+        let state_file = request.resume.then(|| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&state_path)
+                .map(Mutex::new)
+        });
+        let state_file = match state_file.transpose() {
+            Ok(file) => file.map(Arc::new),
+            Err(error) => {
+                emit_progress(&app, job_id, "batch", "failed", "再開状態を開けません", 0, total, started, None, Some(error.to_string()));
+                if let Ok(mut jobs) = jobs.lock() { jobs.remove(&job_id); }
+                return;
             }
-            let stem = Path::new(input)
-                .file_stem()
-                .and_then(|value| value.to_str())
-                .unwrap_or("output");
-            let output = Path::new(&request.output_dir).join(format!("{stem}.{extension}"));
-            emit_progress(
-                &app,
-                job_id,
-                "batch",
-                "running",
-                &format!(
-                    "{} を処理しています",
-                    Path::new(input)
-                        .file_name()
-                        .and_then(|v| v.to_str())
-                        .unwrap_or(input)
-                ),
-                index,
-                total,
-                started,
-                None,
-                None,
-            );
-            let item = ProcessRequest {
-                input: input.clone(),
-                output: output.to_string_lossy().into_owned(),
-                options: request.options.clone(),
-            };
-            if let Err(error) = validate_request(&item.input, &item.output, &item.options)
-                .and_then(|_| process_file(&item, &cancelled, |_, _| {}))
-            {
-                failure = Some(format!("{}: {error}", Path::new(input).display()));
-                break;
-            }
-        }
+        };
+        let finished = AtomicUsize::new(0);
+        let succeeded = AtomicUsize::new(0);
+        let skipped = AtomicUsize::new(0);
+        let failures = Mutex::new(Vec::<String>::new());
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(request.jobs).build();
+        let run = || {
+            items.par_iter().for_each(|batch_item| {
+                if cancelled.load(Ordering::SeqCst) { return; }
+                if request.resume && completed.contains(&batch_item.state_key) && batch_item.output.is_file() {
+                    skipped.fetch_add(1, Ordering::Relaxed);
+                    let current = finished.fetch_add(1, Ordering::SeqCst) + 1;
+                    emit_batch_item(&app, job_id, "skipped", batch_item, current, total, started, None);
+                    return;
+                }
+                let process_request = ProcessRequest {
+                    input: batch_item.input.to_string_lossy().into_owned(),
+                    output: batch_item.output.to_string_lossy().into_owned(),
+                    options: request.options.clone(),
+                };
+                let result = validate_request(&process_request.input, &process_request.output, &process_request.options)
+                    .and_then(|_| process_file(&process_request, &cancelled, |_, _| {}));
+                let current = finished.fetch_add(1, Ordering::SeqCst) + 1;
+                match result {
+                    Ok(_) => {
+                        succeeded.fetch_add(1, Ordering::Relaxed);
+                        if let Some(file) = &state_file {
+                            if let Ok(mut file) = file.lock() { let _ = writeln!(file, "{}", batch_item.state_key); }
+                        }
+                        emit_batch_item(&app, job_id, "completed", batch_item, current, total, started, None);
+                    }
+                    Err(error) if error == "cancelled" => {}
+                    Err(error) => {
+                        if let Ok(mut list) = failures.lock() { list.push(format!("{}: {error}", batch_item.input.display())); }
+                        emit_batch_item(&app, job_id, "failed", batch_item, current, total, started, Some(error));
+                    }
+                }
+            });
+        };
+        match pool { Ok(pool) => pool.install(run), Err(error) => failures.lock().unwrap().push(error.to_string()) }
         if cancelled.load(Ordering::SeqCst) {
             emit_progress(
                 &app,
@@ -304,26 +328,16 @@ fn start_batch(
                 None,
                 None,
             );
-        } else if let Some(error) = failure {
-            emit_progress(
-                &app,
-                job_id,
-                "batch",
-                "failed",
-                "バッチ処理に失敗しました",
-                0,
-                total,
-                started,
-                None,
-                Some(error),
-            );
         } else {
+            let failure_count = failures.lock().map(|list| list.len()).unwrap_or(0);
+            let success_count = succeeded.load(Ordering::Relaxed);
+            let skipped_count = skipped.load(Ordering::Relaxed);
             emit_progress(
                 &app,
                 job_id,
                 "batch",
                 "completed",
-                "すべてのファイルを処理しました",
+                &format!("完了 {success_count} · スキップ {skipped_count} · 失敗 {failure_count}"),
                 total,
                 total,
                 started,
@@ -336,6 +350,67 @@ fn start_batch(
         }
     });
     Ok(job_id)
+}
+
+fn collect_batch_items(request: &BatchRequest, extension: &str) -> Result<Vec<BatchItem>, String> {
+    let output_root = Path::new(&request.output_dir);
+    let mut sources = request.inputs.iter().map(PathBuf::from).collect::<Vec<_>>();
+    let input_root = request.input_dir.as_deref().map(Path::new);
+    if let Some(root) = input_root {
+        if !root.is_dir() {
+            return Err("入力フォルダが存在しません".into());
+        }
+        if root == output_root {
+            return Err("入力フォルダと出力フォルダは分けてください".into());
+        }
+        collect_audio_files(root, request.recursive, &mut sources)?;
+        if output_root.starts_with(root) {
+            sources.retain(|path| !path.starts_with(output_root));
+        }
+    }
+    sources.sort();
+    sources.dedup();
+    let mut destinations = HashSet::new();
+    sources.into_iter().map(|input| {
+        if !input.is_file() { return Err(format!("入力ファイルが存在しません: {}", input.display())); }
+        let relative = input_root.and_then(|root| input.strip_prefix(root).ok())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(input.file_name().unwrap_or_default()));
+        let mut output = output_root.join(&relative);
+        output.set_extension(extension);
+        if !destinations.insert(output.clone()) { return Err(format!("同じ出力先になるファイルがあります: {}", output.display())); }
+        Ok(BatchItem { input, output, state_key: relative.to_string_lossy().replace('\\', "/") })
+    }).collect()
+}
+
+fn collect_audio_files(dir: &Path, recursive: bool, files: &mut Vec<PathBuf>) -> Result<(), String> {
+    for entry in std::fs::read_dir(dir)
+        .map_err(|error| format!("入力フォルダを読めません: {error}"))?
+    {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let file_type = entry.file_type().map_err(|error| error.to_string())?;
+        let path = entry.path();
+        if file_type.is_dir() && recursive {
+            collect_audio_files(&path, true, files)?;
+        } else if file_type.is_file() && is_audio_path(&path) {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn is_audio_path(path: &Path) -> bool {
+    path.extension().and_then(|value| value.to_str()).is_some_and(|value| {
+        matches!(value.to_ascii_lowercase().as_str(), "wav" | "flac" | "opus" | "ogg" | "mp3" | "m4a" | "aac")
+    })
+}
+
+fn read_batch_state(path: &Path) -> Result<HashSet<String>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(source) => Ok(source.lines().map(str::to_owned).collect()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(HashSet::new()),
+        Err(error) => Err(format!("再開状態を読めません: {error}")),
+    }
 }
 
 #[tauri::command]
@@ -619,8 +694,42 @@ fn emit_progress(
             elapsed_seconds: started.elapsed().as_secs_f64(),
             output,
             error,
+            eta_seconds: None,
+            item: None,
+            item_status: None,
         },
     );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_batch_item(
+    app: &AppHandle,
+    job_id: u64,
+    item_status: &'static str,
+    item: &BatchItem,
+    current: usize,
+    total: usize,
+    started: Instant,
+    error: Option<String>,
+) {
+    let elapsed = started.elapsed().as_secs_f64();
+    let eta = (current > 0).then(|| elapsed / current as f64 * total.saturating_sub(current) as f64);
+    let name = item.input.file_name().and_then(|value| value.to_str()).unwrap_or("audio");
+    let _ = app.emit("job-progress", JobProgress {
+        job_id,
+        kind: "batch",
+        status: "running",
+        message: format!("{name}: {item_status}"),
+        current,
+        total,
+        fraction: current as f64 / total.max(1) as f64,
+        elapsed_seconds: elapsed,
+        output: Some(item.output.to_string_lossy().into_owned()),
+        error,
+        eta_seconds: eta,
+        item: Some(item.input.to_string_lossy().into_owned()),
+        item_status: Some(item_status),
+    });
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -686,5 +795,49 @@ mod tests {
     #[test]
     fn invalid_backend_is_rejected() {
         assert!(Backend::parse("missing").is_none());
+    }
+
+    #[test]
+    fn batch_folder_preserves_relative_paths() {
+        let root = std::env::temp_dir().join(format!(
+            "denoize-gui-batch-{}-{}",
+            std::process::id(),
+            NEXT_JOB_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let input = root.join("input");
+        let nested = input.join("nested");
+        let output = root.join("output");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(&output).unwrap();
+        std::fs::write(input.join("one.wav"), []).unwrap();
+        std::fs::write(nested.join("two.flac"), []).unwrap();
+        std::fs::write(nested.join("ignored.txt"), []).unwrap();
+        let request = BatchRequest {
+            inputs: Vec::new(),
+            input_dir: Some(input.to_string_lossy().into_owned()),
+            output_dir: output.to_string_lossy().into_owned(),
+            output_format: "opus".into(),
+            recursive: true,
+            jobs: 2,
+            resume: true,
+            options: options(),
+        };
+        let items = collect_batch_items(&request, "opus").unwrap();
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().any(|item| item.output == output.join("one.opus")));
+        assert!(items
+            .iter()
+            .any(|item| item.output == output.join("nested/two.opus")));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn batch_state_missing_file_is_empty() {
+        let path = std::env::temp_dir().join(format!(
+            "denoize-missing-state-{}-{}",
+            std::process::id(),
+            NEXT_JOB_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        assert!(read_batch_state(&path).unwrap().is_empty());
     }
 }
