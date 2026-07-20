@@ -1,5 +1,7 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import "./styles.css";
 
@@ -18,6 +20,7 @@ type ModelRow = {
   installed: boolean; path: string;
 };
 type PreviewData = { source: string; playablePath: string; durationSeconds: number; rmsDb: number; waveform: number[] };
+type DropSelection = { audioFiles: string[]; directories: string[]; ignored: string[] };
 
 const audioFilters = [{ name: "Audio", extensions: ["wav", "flac", "opus", "ogg", "mp3", "m4a", "aac"] }];
 let appInfo: AppInfo;
@@ -46,8 +49,8 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
           <div class="stack">
             <article class="card file-card">
               <div class="card-heading"><div><span class="step">01</span><h2>ファイル</h2></div><span class="hint">WAV · FLAC · OPUS · MP3 · M4A · AAC</span></div>
-              <div class="file-row"><div><label>入力</label><div id="input-display" class="path empty">音声ファイルを選択</div></div><button class="secondary" id="choose-input">選択</button></div>
-              <div class="file-row"><div><label>出力</label><div id="output-display" class="path empty">保存先を選択</div></div><button class="secondary" id="choose-output">選択</button></div>
+              <div class="file-row" data-drop-zone="process-input"><div><label>入力</label><div id="input-display" class="path empty">音声ファイルを選択／ドロップ</div></div><button class="secondary" id="choose-input">選択</button></div>
+              <div class="file-row" data-drop-zone="process-output"><div><label>出力</label><div id="output-display" class="path empty">保存先またはフォルダをドロップ</div></div><button class="secondary" id="choose-output">選択</button></div>
               <input type="hidden" id="input-path"><input type="hidden" id="output-path">
               <div id="recent-files" class="recent-files"></div>
             </article>
@@ -104,8 +107,8 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
 
       <section class="page" id="page-batch">
         <div class="grid two-col">
-          <article class="card tall"><div class="card-heading"><div><span class="step">01</span><h2>入力</h2></div><div class="button-row"><button class="secondary" id="choose-batch-folder">フォルダ</button><button class="secondary" id="choose-batch">ファイル追加</button></div></div><div id="batch-files" class="empty-panel">フォルダまたは複数ファイルを選択してください</div><div id="batch-results" class="batch-results hidden"></div></article>
-          <div class="stack"><article class="card"><div class="card-heading"><div><span class="step">02</span><h2>出力と実行</h2></div></div><div class="file-row"><div><label>出力フォルダ</label><div id="batch-output-display" class="path empty">出力フォルダを選択</div></div><button class="secondary" id="choose-batch-output">選択</button></div><div class="form-grid two"><label>形式<select id="batch-format"><option>wav</option><option>flac</option><option>opus</option><option>mp3</option><option>m4a</option><option>aac</option></select></label><label>並列数<input id="batch-jobs" type="number" value="2" min="1" max="32"></label></div><div class="toggle-grid"><label class="toggle"><input id="batch-recursive" type="checkbox" checked><span></span><div><b>サブフォルダ</b><small>相対構造を維持</small></div></label><label class="toggle"><input id="batch-resume" type="checkbox"><span></span><div><b>中断から再開</b><small>完了済みをスキップ</small></div></label><label class="toggle"><input id="batch-force" type="checkbox"><span></span><div><b>既存を上書き</b><small>出力先を置換</small></div></label></div></article><article class="card action-card"><h3>一括処理</h3><p id="batch-summary">入力が未選択です</p><button class="primary wide" id="start-batch">バッチを開始 <span>→</span></button><button class="danger wide hidden" id="cancel-batch">キャンセル</button></article></div>
+          <article class="card tall" data-drop-zone="batch-input"><div class="card-heading"><div><span class="step">01</span><h2>入力</h2></div><div class="button-row"><button class="secondary" id="choose-batch-folder">フォルダ</button><button class="secondary" id="choose-batch">ファイル追加</button></div></div><div id="batch-files" class="empty-panel">フォルダまたは複数ファイルを選択／ドロップしてください</div><div id="batch-results" class="batch-results hidden"></div></article>
+          <div class="stack"><article class="card"><div class="card-heading"><div><span class="step">02</span><h2>出力と実行</h2></div></div><div class="file-row" data-drop-zone="batch-output"><div><label>出力フォルダ</label><div id="batch-output-display" class="path empty">出力フォルダを選択／ドロップ</div></div><button class="secondary" id="choose-batch-output">選択</button></div><div class="form-grid two"><label>形式<select id="batch-format"><option>wav</option><option>flac</option><option>opus</option><option>mp3</option><option>m4a</option><option>aac</option></select></label><label>並列数<input id="batch-jobs" type="number" value="2" min="1" max="32"></label></div><div class="toggle-grid"><label class="toggle"><input id="batch-recursive" type="checkbox" checked><span></span><div><b>サブフォルダ</b><small>相対構造を維持</small></div></label><label class="toggle"><input id="batch-resume" type="checkbox"><span></span><div><b>中断から再開</b><small>完了済みをスキップ</small></div></label><label class="toggle"><input id="batch-force" type="checkbox"><span></span><div><b>既存を上書き</b><small>出力先を置換</small></div></label></div></article><article class="card action-card"><h3>一括処理</h3><p id="batch-summary">入力が未選択です</p><button class="primary wide" id="start-batch">バッチを開始 <span>→</span></button><button class="danger wide hidden" id="cancel-batch">キャンセル</button></article></div>
         </div>
       </section>
 
@@ -120,6 +123,7 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
         <article class="card"><div class="card-heading"><div><span class="step">AI</span><h2>モデルライブラリ</h2></div><button class="secondary" id="refresh-models">更新</button></div><p class="section-copy">外部モデルはチェックサム検証後、ローカルキャッシュに保存されます。</p><div id="model-list" class="model-list"><div class="empty-panel">モデル情報を読み込んでいます</div></div></article>
       </section>
       <div id="toast" role="status"></div>
+      <div id="drop-overlay"><strong>ここにドロップ</strong><span>音声ファイルまたはフォルダ</span></div>
     </main>
   </div>`;
 
@@ -183,6 +187,49 @@ function renderRecentFiles() {
     const path = button.dataset.recent!; setPath("#input-path", "#input-display", path); setPath("#output-path", "#output-display", await defaultOutput(path)); await preparePreview("input", path);
   }));
 }
+
+function activatePage(page: string) { document.querySelector<HTMLButtonElement>(`.nav-item[data-page="${page}"]`)?.click(); }
+async function dropZoneAt(x: number, y: number) {
+  const scale = await getCurrentWindow().scaleFactor();
+  return (document.elementFromPoint(x / scale, y / scale)?.closest("[data-drop-zone]") as HTMLElement | null)?.dataset.dropZone ?? "auto";
+}
+async function useSingleInput(path: string) {
+  setPath("#input-path", "#input-display", path); setPath("#output-path", "#output-display", await defaultOutput(path));
+  rememberFile(path); previews.output = undefined; $<HTMLButtonElement>("#preview-output").disabled = true; activatePage("process"); await preparePreview("input", path);
+}
+async function handleDrop(paths: string[], zone: string) {
+  const selection = await invoke<DropSelection>("classify_dropped_paths", { paths });
+  if (zone === "batch-output" && selection.directories.length) {
+    batchOutput = selection.directories[0]; $("#batch-output-display").textContent = batchOutput; $("#batch-output-display").classList.remove("empty"); activatePage("batch"); return;
+  }
+  if (zone === "process-output") {
+    if (selection.audioFiles[0]) setPath("#output-path", "#output-display", selection.audioFiles[0]);
+    else if (selection.directories[0]) {
+      const input = $<HTMLInputElement>("#input-path").value; if (!input) return showToast("先に入力ファイルを選択してください", true);
+      const filename = (await defaultOutput(input)).split(/[\\/]/).pop()!; const separator = selection.directories[0].includes("\\") ? "\\" : "/";
+      setPath("#output-path", "#output-display", `${selection.directories[0]}${separator}${filename}`);
+    }
+    return;
+  }
+  if ((zone === "batch-input" || zone === "auto" || zone === "process-input") && selection.directories.length) {
+    batchInputDir = selection.directories[0]; batchInputs = []; renderBatch(); activatePage("batch");
+  } else if (zone === "batch-input" || selection.audioFiles.length > 1) {
+    batchInputDir = ""; batchInputs = selection.audioFiles; renderBatch(); activatePage("batch");
+  } else if (selection.audioFiles.length === 1) await useSingleInput(selection.audioFiles[0]);
+  if (selection.ignored.length) showToast(`${selection.ignored.length}件の未対応項目を無視しました`, true);
+}
+
+void getCurrentWebview().onDragDropEvent(async ({ payload }) => {
+  const overlay = $("#drop-overlay");
+  if (payload.type === "enter" || payload.type === "over") {
+    overlay.classList.add("show");
+    const zone = await dropZoneAt(payload.position.x, payload.position.y);
+    document.querySelectorAll("[data-drop-zone]").forEach((element) => element.classList.toggle("drop-active", (element as HTMLElement).dataset.dropZone === zone));
+  } else if (payload.type === "drop") {
+    overlay.classList.remove("show"); document.querySelectorAll(".drop-active").forEach((element) => element.classList.remove("drop-active"));
+    await handleDrop(payload.paths, await dropZoneAt(payload.position.x, payload.position.y));
+  } else { overlay.classList.remove("show"); document.querySelectorAll(".drop-active").forEach((element) => element.classList.remove("drop-active")); }
+});
 
 function options() {
   return {

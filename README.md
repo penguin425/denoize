@@ -260,6 +260,9 @@ before/after switching, click-to-seek, and configurable section looping.
 Desktop settings are restored automatically, can be stored as named presets,
 and can be imported or exported as CLI-compatible TOML. Recent input files are
 kept locally for quick reuse.
+Audio files and folders can be dropped onto the single-file or batch input
+zones; output folders have dedicated drop targets. Multiple audio files switch
+the app to batch mode automatically.
 
 ```sh
 cd apps/desktop
