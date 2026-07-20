@@ -43,6 +43,7 @@ pub mod gain;
 #[cfg(feature = "live")]
 pub mod live;
 pub mod loudness;
+pub mod metadata;
 pub mod models;
 pub mod noise;
 pub mod perceptual;
@@ -121,9 +122,15 @@ where
     P1: AsRef<std::path::Path>,
     P2: AsRef<std::path::Path>,
 {
+    let input = input.as_ref();
+    let output = output.as_ref();
+    let tag = metadata::read(input)?;
     let mut audio = read_audio(input)?;
     denoise_audio_with_backend_config(&mut audio, config, backend, &backend_options)?;
     write_audio(output, &audio, encode_opts)?;
+    if let Some(tag) = tag {
+        metadata::write(tag, output)?;
+    }
     Ok(audio)
 }
 
