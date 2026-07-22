@@ -91,6 +91,12 @@ pub struct DenoiserConfig {
     pub adaptive_noise: bool,
     /// Segment processing around detected speech and strongly attenuate silence.
     pub vad: bool,
+    /// Attenuation gain in `[0, 1]` applied to non-speech regions when VAD is enabled.
+    /// Default is 0.08 (~ -22 dB).
+    pub vad_silence_gain: f64,
+    /// Blend factor in `[0, 1]` for speech regions: `processed * mix + original * (1 - mix)`.
+    /// Default is 0.85 (85% denoised speech, 15% natural original speech blend).
+    pub vad_speech_mix: f64,
     /// Gain release-smoothing coefficient in `[0, 1]` (higher = slower).
     /// Higher values help kill musical noise for transparent results.
     pub smoothing: f64,
@@ -281,6 +287,8 @@ impl DenoiserConfig {
             adapt: true,
             adaptive_noise: false,
             vad: false,
+            vad_silence_gain: 0.08,
+            vad_speech_mix: 0.85,
             smoothing: 0.6,
             dc_block: true,
             makeup_gain_db: 0.0,
@@ -302,6 +310,8 @@ impl DenoiserConfig {
         self.strength = self.strength.clamp(0.0, 1.0);
         self.smoothing = self.smoothing.clamp(0.0, 0.95);
         self.overlap = self.overlap.clamp(0.5, 0.95);
+        self.vad_silence_gain = self.vad_silence_gain.clamp(0.0, 1.0);
+        self.vad_speech_mix = self.vad_speech_mix.clamp(0.0, 1.0);
         if !self.frame_size.is_power_of_two() || self.frame_size < 256 {
             self.frame_size = 2048;
         }
@@ -336,12 +346,18 @@ pub struct Denoiser {
     frame: Vec<f64>,
     y2: Vec<f64>,
     g: Vec<f64>,
+    lambda_d_buf: Vec<f64>,
+    spp_buf: Vec<f64>,
+    y2_snapshot_buf: Vec<f64>,
 
     // High-fidelity state
     prev_frame_energy: f64,
     prev_mag: Vec<f64>, // previous frame magnitude for spectral flux
     pre_emph_prev: f64, // for pre-emphasis filter state
     de_emph_prev: f64,  // for de-emphasis filter state
+    cepstral_fft: crate::fft::Fft,
+    cepstral_spec: Vec<Complex>,
+    cepstral_orig: Vec<f64>,
 
     // Advanced DSP state
     bark_bands: Vec<usize>,
@@ -386,6 +402,9 @@ impl Denoiser {
         let noise = NoiseEstimator::new(noise_cfg, m, sample_rate, hop);
         let makeup = 10f64.powf(config.makeup_gain_db / 20.0);
 
+        let cepstral_fft_size = (2 * m).next_power_of_two().max(32);
+        let cepstral_fft = crate::fft::Fft::new(cepstral_fft_size);
+
         Denoiser {
             config,
             stft,
@@ -407,10 +426,16 @@ impl Denoiser {
             frame: vec![0.0; frame_size],
             y2: vec![0.0; m],
             g: vec![0.0; m],
+            lambda_d_buf: vec![0.0; m],
+            spp_buf: vec![0.0; m],
+            y2_snapshot_buf: vec![0.0; m],
             prev_frame_energy: 0.0,
             prev_mag: vec![0.0; m],
             pre_emph_prev: 0.0,
             de_emph_prev: 0.0,
+            cepstral_fft,
+            cepstral_spec: vec![Complex::default(); cepstral_fft_size],
+            cepstral_orig: vec![0.0; m],
             bark_bands: bin_to_bark_band(m, sample_rate),
             postfilter: MusicalNoisePostFilter::new(
                 m,
@@ -498,14 +523,14 @@ impl Denoiser {
     /// Spectral flux = sum_k | |Y[k]| - |Y_prev[k]| |
     /// Combined with total energy delta for robustness.
     /// Returns value in [0, 1] (higher = stronger transient).
-    fn compute_transient_score(&mut self, y2: &[f64]) -> f64 {
+    fn compute_transient_score(&mut self) -> f64 {
         let m = self.m;
         let mut flux = 0.0;
         let mut energy = 0.0;
 
-        for k in 0..m {
-            let mag = y2[k].sqrt();
-            energy += y2[k];
+        for (k, &y2_k) in self.y2_snapshot_buf.iter().enumerate().take(m) {
+            let mag = y2_k.sqrt();
+            energy += y2_k;
             let prev_mag = self.prev_mag[k];
             flux += (mag - prev_mag).abs();
             self.prev_mag[k] = mag * 0.7 + prev_mag * 0.3; // light temporal smoothing on mag
@@ -530,8 +555,7 @@ impl Denoiser {
         };
 
         // Weighted combination. Flux is more reliable for musical transients.
-        let score = (0.75 * norm_flux + 0.25 * energy_rise).clamp(0.0, 1.0);
-        score
+        (0.75 * norm_flux + 0.25 * energy_rise).clamp(0.0, 1.0)
     }
 
     /// Proper **cepstral smoothing** (liftering) of the gain vector.
@@ -542,8 +566,8 @@ impl Denoiser {
     /// Then a conservative blend back to the original gains.
     /// This prevents over-smoothing on clean signals while strongly
     /// suppressing musical noise when it appears.
-    fn cepstral_smooth_gains(g: &mut [f64]) {
-        let m = g.len();
+    fn cepstral_smooth_gains(&mut self) {
+        let m = self.m;
         if m < 8 {
             return;
         }
@@ -553,7 +577,7 @@ impl Denoiser {
         let mut min_g = 1.0f64;
         let mut max_g = 0.0f64;
         let mut sum = 0.0;
-        for &v in g.iter() {
+        for &v in self.g.iter() {
             min_g = min_g.min(v);
             max_g = max_g.max(v);
             sum += v;
@@ -568,32 +592,30 @@ impl Denoiser {
         }
 
         // Save original
-        let original: Vec<f64> = g.to_vec();
+        self.cepstral_orig.copy_from_slice(&self.g);
 
-        let fft_size = (2 * m).next_power_of_two().max(32);
+        let fft_size = self.cepstral_fft.size();
         let keep = 6.min(fft_size / 10);
 
-        let mut spec = vec![Complex::default(); fft_size];
-        let fft = crate::fft::Fft::new(fft_size);
-
-        for i in 0..m {
-            spec[i] = Complex::new(g[i].max(1e-8).ln(), 0.0);
+        self.cepstral_spec.fill(Complex::default());
+        for (i, &gi) in self.g.iter().enumerate().take(m) {
+            self.cepstral_spec[i] = Complex::new(gi.max(1e-8).ln(), 0.0);
         }
 
-        fft.forward(&mut spec);
+        self.cepstral_fft.forward(&mut self.cepstral_spec);
 
-        for k in keep..fft_size - keep {
-            spec[k] = Complex::default();
+        for slot in self.cepstral_spec.iter_mut().take(fft_size - keep).skip(keep) {
+            *slot = Complex::default();
         }
 
-        fft.inverse(&mut spec);
+        self.cepstral_fft.inverse(&mut self.cepstral_spec);
 
         // Dynamic blend: more smoothing when there is more variation (more noise)
         let blend = (0.35 + 0.45 * variation.min(1.0)).min(0.75);
 
-        for i in 0..m {
-            let liftered = spec[i].re.exp().clamp(1e-6, 1.0);
-            g[i] = (blend * liftered + (1.0 - blend) * original[i]).clamp(1e-6, 1.0);
+        for (i, gi) in self.g.iter_mut().enumerate().take(m) {
+            let liftered = self.cepstral_spec[i].re.exp().clamp(1e-6, 1.0);
+            *gi = (blend * liftered + (1.0 - blend) * self.cepstral_orig[i]).clamp(1e-6, 1.0);
         }
     }
 
@@ -624,8 +646,8 @@ impl Denoiser {
             let mut sum_p = 0.0;
             let mut sum_logp = 0.0;
             let mut nz = 0usize;
-            for k in 0..m {
-                let p = spec[k].re * spec[k].re + spec[k].im * spec[k].im;
+            for &c in spec.iter().take(m) {
+                let p = c.re * c.re + c.im * c.im;
                 if p > 1e-20 {
                     sum_p += p;
                     sum_logp += p.ln();
@@ -766,8 +788,8 @@ impl Denoiser {
 
         // Copy out the noise estimate / SPP so we don't hold a borrow of
         // `self.noise` while mutating the per-bin recursion state.
-        let lambda_d: Vec<f64> = self.noise.noise_psd().to_vec();
-        let spp: Vec<f64> = self.noise.speech_presence().to_vec();
+        self.lambda_d_buf.copy_from_slice(self.noise.noise_psd());
+        self.spp_buf.copy_from_slice(self.noise.speech_presence());
 
         let g_min = self.gain_params.g_min;
         let alpha_dd = self.alpha_dd;
@@ -779,8 +801,8 @@ impl Denoiser {
         // Transient score for this frame (protects onsets for fidelity)
         // Uses proper spectral flux (not just total energy)
         let tscore = if self.config.transient_protect {
-            let y2_snapshot: Vec<f64> = self.y2.clone();
-            self.compute_transient_score(&y2_snapshot)
+            self.y2_snapshot_buf.copy_from_slice(&self.y2);
+            self.compute_transient_score()
         } else {
             0.0
         };
@@ -788,8 +810,9 @@ impl Denoiser {
         // Per-bin gamma / xi for this frame.
         let mut gamma_frame = vec![0.0f64; m];
         let mut xi_frame = vec![0.0f64; m];
-        for k in 0..m {
-            let gamma = self.y2[k] / lambda_d[k].max(1e-12);
+        for (k, &y2_k) in self.y2.iter().enumerate().take(m) {
+            let lam = self.lambda_d_buf[k].max(1e-12);
+            let gamma = y2_k / lam;
             let xi_hat = if frame_idx == 0 {
                 (gamma - 1.0).max(xi_min)
             } else {
@@ -816,12 +839,12 @@ impl Denoiser {
                 _ => SpecSubLaw::Linear,
             };
             let mb = multiband_specsub_gains(&gamma_frame, &self.bark_bands, N_BARK_BANDS, gp, law);
-            for k in 0..m {
-                self.g[k] = mb[k].max(g_min);
+            for (k, &mb_k) in mb.iter().enumerate().take(m) {
+                self.g[k] = mb_k.max(g_min);
             }
         } else {
-            for k in 0..m {
-                let mut gk = compute_gain(algo, xi_frame[k], gamma_frame[k], spp[k], gp);
+            for (k, &spp_k) in self.spp_buf.iter().enumerate().take(m) {
+                let mut gk = compute_gain(algo, xi_frame[k], gamma_frame[k], spp_k, gp);
                 if gk < g_min {
                     gk = g_min;
                 }
@@ -851,21 +874,21 @@ impl Denoiser {
 
         // Musical-noise post-filter.
         if self.config.musical_noise_postfilter {
-            self.postfilter.apply(&self.y2, &lambda_d, &mut self.g);
+            self.postfilter.apply(&self.y2, &self.lambda_d_buf, &mut self.g);
         }
 
         // Stash for decision-directed recursion.
-        for k in 0..m {
+        for (k, &lam_k) in self.lambda_d_buf.iter().enumerate().take(m) {
             self.prev_g[k] = self.g[k];
             self.prev_y2[k] = self.y2[k];
-            self.prev_lambda_d[k] = lambda_d[k];
+            self.prev_lambda_d[k] = lam_k;
         }
 
         // Cepstral smoothing on the final gain curve (after temporal smoothing)
         // for superior musical-noise suppression while retaining timbre.
         // Uses full FFT-based cepstral liftering (proper implementation).
         if self.config.cepstral_smoothing {
-            Self::cepstral_smooth_gains(&mut self.g);
+            self.cepstral_smooth_gains();
             // Re-apply min floor after smoothing
             let gmin = g_min;
             for gi in &mut self.g {
@@ -1000,9 +1023,9 @@ mod tests {
 
         // Clean: silence then a two-tone signal.
         let mut clean = vec![0.0; n];
-        for i in silence..n {
+        for (i, c) in clean.iter_mut().enumerate().take(n).skip(silence) {
             let t = i as f64 / sr as f64;
-            clean[i] = 0.30 * (2.0 * std::f64::consts::PI * 440.0 * t).sin()
+            *c = 0.30 * (2.0 * std::f64::consts::PI * 440.0 * t).sin()
                 + 0.15 * (2.0 * std::f64::consts::PI * 880.0 * t).sin();
         }
 
@@ -1038,9 +1061,9 @@ mod tests {
         let n = sr as usize * 2;
         let silence = sr as usize / 3;
         let mut clean = vec![0.0; n];
-        for i in silence..n {
+        for (i, c) in clean.iter_mut().enumerate().take(n).skip(silence) {
             let t = i as f64 / sr as f64;
-            clean[i] = 0.25 * (2.0 * std::f64::consts::PI * 660.0 * t).sin();
+            *c = 0.25 * (2.0 * std::f64::consts::PI * 660.0 * t).sin();
         }
         let mut den = Denoiser::new(Preset::Restore.config(sr));
         let out = den.process_channel(&clean);
@@ -1061,9 +1084,9 @@ mod tests {
         // Use a short leading silence like the other preservation test
         let silence = sr as usize / 4;
         let mut clean = vec![0.0; n];
-        for i in silence..n {
+        for (i, c) in clean.iter_mut().enumerate().take(n).skip(silence) {
             let t = i as f64 / sr as f64;
-            clean[i] = 0.18 * (2.0 * std::f64::consts::PI * 880.0 * t).sin()
+            *c = 0.18 * (2.0 * std::f64::consts::PI * 880.0 * t).sin()
                 + 0.09 * (2.0 * std::f64::consts::PI * 1760.0 * t).sin();
         }
 
