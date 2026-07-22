@@ -197,8 +197,8 @@ mod tests {
             }
             start += hop;
         }
-        for i in n..len - n {
-            assert!((cola[i] - 1.0).abs() < 1e-12, "cola@{i}={}", cola[i]);
+        for &c in cola.iter().take(len - n).skip(n) {
+            assert!((c - 1.0).abs() < 1e-12, "cola={c}");
         }
     }
 
@@ -210,7 +210,7 @@ mod tests {
             for &v in &w {
                 assert!(v.is_finite());
                 // Flat-top has tiny negative sidelobes at edges; clamp check.
-                assert!(v >= -0.01 && v <= 1.05, "{kind:?} value {v}");
+                assert!((-0.01..=1.05).contains(&v), "{kind:?} value {v}");
             }
         }
     }

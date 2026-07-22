@@ -7,7 +7,7 @@
 
 use std::f64::consts::PI;
 
-const EULER_MASCHERONI: f64 = 0.57721566490153286060;
+const EULER_MASCHERONI: f64 = 0.577_215_664_901_532_9;
 
 /// Modified Bessel function of the first kind, order 0: `I_0(x)`, `x >= 0`.
 pub fn bessel_i0(x: f64) -> f64 {

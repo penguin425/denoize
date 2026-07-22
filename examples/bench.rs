@@ -91,8 +91,8 @@ fn main() {
     ];
 
     println!(
-        "{:<22} {:>10} {:>10}  {}",
-        "config", "SNR (dB)", "gain (dB)", "note"
+        "{:<22} {:>10} {:>10}  note",
+        "config", "SNR (dB)", "gain (dB)"
     );
     println!("{:-<60}", "");
     for (name, cfg) in cfgs.drain(..) {

@@ -35,7 +35,7 @@ pub fn bin_to_bark_band(nbins: usize, sample_rate: u32) -> Vec<usize> {
     let nyq = sample_rate as f64 / 2.0;
     let edges = bark_edges_hz();
     let mut table = vec![0usize; nbins];
-    for k in 0..nbins {
+    for (k, slot) in table.iter_mut().enumerate().take(nbins) {
         let hz = k as f64 * sample_rate as f64 / (2 * (nbins - 1)) as f64;
         let hz = hz.min(nyq);
         let mut band = 0usize;
@@ -48,7 +48,7 @@ pub fn bin_to_bark_band(nbins: usize, sample_rate: u32) -> Vec<usize> {
                 band = b;
             }
         }
-        table[k] = band.min(N_BARK_BANDS - 1);
+        *slot = band.min(N_BARK_BANDS - 1);
     }
     table
 }
