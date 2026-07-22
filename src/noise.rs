@@ -190,8 +190,8 @@ impl NoiseEstimator {
                 self.p.fill(0.0);
                 return;
             }
-            for k in 0..self.nbins {
-                let v = y2[k].max(1e-12);
+            for (k, &y2_k) in y2.iter().enumerate().take(self.nbins) {
+                let v = y2_k.max(1e-12);
                 self.s[k] = v;
                 self.s_min[k] = v;
                 self.s_tmp[k] = v;
@@ -203,8 +203,8 @@ impl NoiseEstimator {
         }
 
         // 1. Smoothed noisy power.
-        for k in 0..self.nbins {
-            self.s[k] = cfg.alpha_s * self.s[k] + (1.0 - cfg.alpha_s) * y2[k];
+        for (k, &y2_k) in y2.iter().enumerate().take(self.nbins) {
+            self.s[k] = cfg.alpha_s * self.s[k] + (1.0 - cfg.alpha_s) * y2_k;
         }
 
         // 2. Running minimum with exponential forgetting.
@@ -246,7 +246,7 @@ impl NoiseEstimator {
         }
 
         // 3. SPP and 4. noise-PSD update.
-        for k in 0..self.nbins {
+        for (k, &y2_k) in y2.iter().enumerate().take(self.nbins) {
             let denom = (cfg.b_min * self.s_min[k]).max(1e-12);
             let zeta = self.s[k] / denom;
             let arg = (zeta - cfg.zeta0) / cfg.sigma;
@@ -260,7 +260,7 @@ impl NoiseEstimator {
             if self.adapt {
                 let old = self.lambda_d[k];
                 let a_d_eff = cfg.alpha_d + (1.0 - cfg.alpha_d) * p;
-                let mut new_ld = a_d_eff * old + (1.0 - a_d_eff) * y2[k];
+                let mut new_ld = a_d_eff * old + (1.0 - a_d_eff) * y2_k;
                 // Upward rate limiter: limit how fast lambda_d can rise, so a
                 // misclassified sustained signal cannot drag the estimate up
                 // quickly. Downward movement is unrestricted.

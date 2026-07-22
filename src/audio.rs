@@ -20,7 +20,7 @@ impl Audio {
     }
 
     pub fn frames(&self) -> usize {
-        self.channels.get(0).map(|c| c.len()).unwrap_or(0)
+        self.channels.first().map(|c| c.len()).unwrap_or(0)
     }
 
     /// A `WavSpec` matching this audio for writing.
@@ -241,8 +241,8 @@ mod tests {
         assert_eq!(audio.sample_rate, sr);
         assert_eq!(audio.channels(), 1);
         assert_eq!(audio.frames(), sr as usize);
-        for i in 0..signal.len() {
-            assert!((audio.channels[0][i] - signal[i]).abs() < 1e-3, "@{i}");
+        for (i, &sig) in signal.iter().enumerate() {
+            assert!((audio.channels[0][i] - sig).abs() < 1e-3, "@{i}");
         }
         let _ = std::fs::remove_file(&path);
     }

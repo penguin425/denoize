@@ -34,9 +34,9 @@ fn main() {
     let n = (sr as f64 * dur) as usize;
 
     let mut clean = vec![0.0f64; n];
-    for i in silence..n {
+    for (i, c) in clean.iter_mut().enumerate().take(n).skip(silence) {
         let t = i as f64 / sr as f64;
-        clean[i] = 0.30 * (2.0 * PI * 440.0 * t).sin()
+        *c = 0.30 * (2.0 * PI * 440.0 * t).sin()
             + 0.12 * (2.0 * PI * 880.0 * t).sin()
             + 0.06 * (2.0 * PI * 1320.0 * t).sin();
     }

@@ -95,8 +95,8 @@ fn append_frame(info: &FrameInfo, pcm: &[f32], out_l: &mut Vec<f64>, out_r: &mut
     }
     let samples = &pcm[..info.samples_produced];
     if n_ch == 1 {
-        for i in 0..n_frames {
-            out_l.push(super::pcm::f32_to_f64(samples[i]));
+        for &s in samples.iter().take(n_frames) {
+            out_l.push(super::pcm::f32_to_f64(s));
         }
     } else {
         for i in 0..n_frames {

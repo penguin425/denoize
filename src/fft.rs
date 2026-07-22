@@ -61,14 +61,14 @@ impl Fft {
         let bits = n.trailing_zeros() as usize;
 
         let mut rev = vec![0usize; n];
-        for i in 0..n {
+        for (i, r_slot) in rev.iter_mut().enumerate().take(n) {
             let mut x = i;
             let mut r = 0usize;
             for _ in 0..bits {
                 r = (r << 1) | (x & 1);
                 x >>= 1;
             }
-            rev[i] = r;
+            *r_slot = r;
         }
 
         let half = n / 2;
@@ -97,8 +97,7 @@ impl Fft {
     pub fn forward(&self, a: &mut [Complex]) {
         debug_assert_eq!(a.len(), self.n);
         let rev = &self.rev;
-        for i in 0..self.n {
-            let j = rev[i];
+        for (i, &j) in rev.iter().enumerate().take(self.n) {
             if i < j {
                 a.swap(i, j);
             }
@@ -149,15 +148,15 @@ mod tests {
     fn naive_dft(a: &[Complex]) -> Vec<Complex> {
         let n = a.len();
         let mut out = vec![Complex::default(); n];
-        for k in 0..n {
+        for (k, out_k) in out.iter_mut().enumerate().take(n) {
             let mut re = 0.0;
             let mut im = 0.0;
-            for t in 0..n {
+            for (t, a_t) in a.iter().enumerate().take(n) {
                 let ang = -2.0 * PI * (k as f64) * (t as f64) / n as f64;
-                re += a[t].re * ang.cos() - a[t].im * ang.sin();
-                im += a[t].re * ang.sin() + a[t].im * ang.cos();
+                re += a_t.re * ang.cos() - a_t.im * ang.sin();
+                im += a_t.re * ang.sin() + a_t.im * ang.cos();
             }
-            out[k] = Complex::new(re, im);
+            *out_k = Complex::new(re, im);
         }
         out
     }
@@ -167,8 +166,8 @@ mod tests {
         let n = 64;
         let fft = Fft::new(n);
         let mut input = vec![Complex::default(); n];
-        for i in 0..n {
-            input[i] = Complex::new(
+        for (i, in_i) in input.iter_mut().enumerate().take(n) {
+            *in_i = Complex::new(
                 (0.7 * (i as f64)).sin() + 0.3 * (0.13 * i as f64).cos(),
                 0.0,
             );
@@ -187,8 +186,8 @@ mod tests {
         let n = 256;
         let fft = Fft::new(n);
         let mut input = vec![Complex::default(); n];
-        for i in 0..n {
-            input[i] = Complex::new((0.05 * i as f64).sin(), (0.02 * i as f64).cos());
+        for (i, in_i) in input.iter_mut().enumerate().take(n) {
+            *in_i = Complex::new((0.05 * i as f64).sin(), (0.02 * i as f64).cos());
         }
         let original = input.clone();
         fft.forward(&mut input);
