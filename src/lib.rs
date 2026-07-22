@@ -184,9 +184,11 @@ fn process_with_vad(
 ) -> Result<Vec<Vec<f64>>, String> {
     let regions = vad::speech_regions(channels, sample_rate);
     let fade_frames = (sample_rate as usize / 50).max(1); // 20 ms
+    let silence_gain = config.vad_silence_gain;
+    let speech_mix = config.vad_speech_mix;
     let mut output: Vec<Vec<f64>> = channels
         .iter()
-        .map(|channel| channel.iter().map(|sample| sample * 0.08).collect())
+        .map(|channel| channel.iter().map(|sample| sample * silence_gain).collect())
         .collect();
     for region in regions {
         let input: Vec<Vec<f64>> = channels
@@ -207,7 +209,7 @@ fn process_with_vad(
                 if index >= destination.len() || index >= original.len() || index >= region.end {
                     break;
                 }
-                let target = sample * 0.85 + original[index] * 0.15;
+                let target = sample * speech_mix + original[index] * (1.0 - speech_mix);
                 let weight = vad_mix_weight(offset, region.end - region.start, fade_frames);
                 destination[index] = destination[index] * (1.0 - weight) + target * weight;
             }
