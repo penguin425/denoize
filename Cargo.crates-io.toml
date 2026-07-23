@@ -7,7 +7,7 @@
 
 [package]
 name = "denoize"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.85"
 authors = ["KAORU <133386210+penguin425@users.noreply.github.com>"]
