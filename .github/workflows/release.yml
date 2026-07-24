@@ -10,6 +10,7 @@ permissions:
 
 env:
   GH_REPO: ${{ github.repository }}
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
 
 concurrency:
   group: release-${{ github.ref_name }}
