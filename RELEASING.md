@@ -49,3 +49,8 @@ the repository's built-in `GITHUB_TOKEN`.
 The workflow first validates and tests the tag, builds and uploads every OS
 archive, publishes the crate, and only then publishes the GitHub draft release.
 If any step fails, the GitHub release remains a draft.
+
+Pull requests also run the desktop packaging matrix on Linux, macOS (Intel and
+Apple Silicon), and Windows. Those CI builds disable signing and updater
+artifact generation; the tagged release workflow enables both with the
+repository's signing key.
