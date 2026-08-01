@@ -22,17 +22,24 @@ the repository's built-in `GITHUB_TOKEN`.
 
 ## Release checklist
 
-1. Update both manifest versions and `Cargo.lock`.
-2. Update release notes or user-facing documentation.
-3. Run:
+1. Update the root, crates.io, and desktop manifest versions and all lockfiles.
+2. Regenerate the CLI reference and verify that it is committed:
+
+   ```sh
+   bash scripts/generate-cli-docs.sh
+   bash scripts/generate-cli-docs.sh --check
+   ```
+
+3. Update release notes or user-facing documentation.
+4. Run:
 
    ```sh
    cargo test --locked --all-targets --features full
    bash scripts/publish-crates-io.sh --dry-run
    ```
 
-4. Commit and push the release change.
-5. Tag that exact commit and push the tag:
+5. Commit and push the release change.
+6. Tag that exact commit and push the tag:
 
    ```sh
    git tag -a v0.1.0 -m "denoize v0.1.0"

@@ -29,6 +29,16 @@ jobs:
       - name: Test crates.io feature set
         run: bash scripts/publish-crates-io.sh --test
 
+  cli-docs:
+    name: CLI documentation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Verify generated CLI reference
+        run: bash scripts/generate-cli-docs.sh --check
+
   desktop:
     name: Desktop app
     runs-on: ubuntu-latest

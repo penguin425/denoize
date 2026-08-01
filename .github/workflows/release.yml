@@ -42,6 +42,9 @@ jobs:
       - name: Run release tests
         run: cargo test --locked --all-targets --features full
 
+      - name: Verify generated CLI reference
+        run: bash scripts/generate-cli-docs.sh --check
+
       - name: Verify crates.io package
         run: |
           bash scripts/publish-crates-io.sh --test
