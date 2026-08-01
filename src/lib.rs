@@ -57,10 +57,11 @@ pub mod window;
 
 pub use audio::{
     read_audio, read_wav, read_wav_bytes, write_audio, write_wav, write_wav_bytes, Audio,
+    WavStreamReader, WavStreamWriter,
 };
 pub use backend::{Backend, BackendOptions, ChannelMode, OnnxModelConfig, SgmseProfile};
 pub use decode::{decode_file, AudioFormat, DecodedPcm};
-pub use denoiser::{Denoiser, DenoiserConfig, Preset, ProcessingMode};
+pub use denoiser::{Denoiser, DenoiserConfig, Preset, ProcessingMode, StreamingDenoiser};
 pub use encode::{AacEncoder, EncodeOptions, OutputFormat};
 pub use gain::{Algorithm, SpecSubLaw};
 pub use window::{WindowParams, WindowType};

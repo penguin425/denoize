@@ -1,11 +1,13 @@
 //! `denoize` command-line interface.
 
-use denoize::audio::{read_audio, read_wav_bytes, write_audio, write_wav_bytes};
+use denoize::audio::{
+    read_audio, read_wav_bytes, write_audio, write_wav_bytes, WavStreamReader, WavStreamWriter,
+};
 use denoize::denoiser::{DenoiserConfig, Preset, ProcessingMode};
 use denoize::service::{self, BackendChoice, ProcessingOptions};
 use denoize::{
     AacEncoder, Algorithm, Backend, BackendOptions, ChannelMode, EncodeOptions, OnnxModelConfig,
-    SgmseProfile, WindowType,
+    SgmseProfile, StreamingDenoiser, WindowType,
 };
 use serde::Deserialize;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -13,6 +15,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const STREAM_BLOCK_FRAMES: usize = 8192;
 static CANCELLED: AtomicBool = AtomicBool::new(false);
 static CANCEL_HANDLER: OnceLock<Result<(), String>> = OnceLock::new();
 
@@ -82,6 +85,7 @@ OPTIONS:
         --channels <MODE>     independent|linked|mid-side (default: independent)
         --sgmse-profile <P>   fast|balanced|quality (default: balanced)
         --batch               process files in INPUT directory into OUTPUT directory
+        --stream              bounded-memory classical WAV-to-WAV processing
         --recursive           include subdirectories in batch mode
         --jobs <N>            concurrent batch workers (default: CPU count)
         --output-format <EXT> convert every batch output to this format
@@ -156,6 +160,7 @@ struct Overrides {
     channel_mode: Option<ChannelMode>,
     sgmse_profile: Option<SgmseProfile>,
     batch: bool,
+    stream: bool,
     recursive: bool,
     jobs: Option<usize>,
     output_format: Option<String>,
@@ -191,6 +196,7 @@ struct FileConfig {
     true_peak_dbtp: Option<f64>,
     channels: Option<String>,
     batch: bool,
+    stream: bool,
     recursive: bool,
     jobs: Option<usize>,
     output_format: Option<String>,
@@ -259,6 +265,7 @@ fn parse_config(source: &str, path: &str) -> Result<Overrides, String> {
     ov.loudness_lufs = config.loudness_lufs;
     ov.true_peak_dbtp = config.true_peak_dbtp;
     ov.batch = config.batch;
+    ov.stream = config.stream;
     ov.recursive = config.recursive;
     ov.jobs = config.jobs;
     ov.output_format = config.output_format;
@@ -407,6 +414,7 @@ fn parse_args(args: &[String]) -> Result<(String, String, Overrides), String> {
                 })?);
             }
             "--batch" => ov.batch = true,
+            "--stream" => ov.stream = true,
             "--recursive" => ov.recursive = true,
             "--jobs" => ov.jobs = Some(parse_value(args, &mut i, a)?),
             "--output-format" => ov.output_format = Some(parse_value(args, &mut i, a)?),
@@ -632,7 +640,13 @@ fn run(args: &[String]) -> Result<(), String> {
     }
     let (input, output, ov) = parse_args(args)?;
     if ov.batch {
+        if ov.stream {
+            return Err("--stream cannot be combined with --batch".into());
+        }
         return run_batch(&input, &output, &ov);
+    }
+    if ov.stream {
+        return run_streaming_wav(&input, &output, ov);
     }
     run_one(&input, &output, ov)
 }
@@ -798,6 +812,110 @@ fn run_one(input: &str, output: &str, ov: Overrides) -> Result<(), String> {
         if ov.json {
             println!("{{\"input\":{:?},\"output\":{:?},\"backend\":{:?},\"channels\":{},\"frames\":{},\"sample_rate\":{},\"elapsed_ms\":{:.3}}}", input, output, service::backend_name(result.backend), audio.channels(), audio.frames(), audio.sample_rate, result.elapsed.as_secs_f64() * 1000.0);
         }
+    }
+    Ok(())
+}
+
+fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), String> {
+    if input == "-" || output == "-" {
+        return Err("--stream requires filesystem WAV input and output paths".into());
+    }
+    let input_path = std::path::Path::new(input);
+    let output_path = std::path::Path::new(output);
+    let is_wav = |path: &std::path::Path| {
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.eq_ignore_ascii_case("wav"))
+            .unwrap_or(false)
+    };
+    if !is_wav(input_path) || !is_wav(output_path) {
+        return Err("--stream currently supports WAV-to-WAV paths only".into());
+    }
+    if output_path.exists() && !ov.force {
+        return Err(format!(
+            "output already exists: {output} (use --force to replace it)"
+        ));
+    }
+    if ov.auto_backend
+        || ov
+            .backend
+            .is_some_and(|backend| backend != Backend::Classical)
+    {
+        return Err("--stream currently supports only the classical backend".into());
+    }
+    if ov
+        .channel_mode
+        .is_some_and(|mode| mode != ChannelMode::Independent)
+    {
+        return Err("--stream requires independent channels".into());
+    }
+    if ov.vad || ov.loudness_lufs.is_some() || ov.true_peak_dbtp.is_some() {
+        return Err("--stream does not support VAD or loudness normalization".into());
+    }
+
+    let metadata = if !ov.no_metadata {
+        denoize::metadata::read(input_path)?
+    } else {
+        None
+    };
+    let mut reader = WavStreamReader::open(input_path)?;
+    let spec = reader.spec();
+    let cfg = build_config(&ov, spec.sample_rate);
+    if cfg.vad {
+        return Err("--stream does not support VAD; omit --mode speech or --vad".into());
+    }
+    if ov.report {
+        println!(
+            "input      : {input}\nformat     : {}ch, {} Hz, {}-bit {:?}\nbackend    : classical\nstream     : enabled ({} frames/block)",
+            spec.channels, spec.sample_rate, spec.bits_per_sample, spec.sample_format, STREAM_BLOCK_FRAMES
+        );
+        return Ok(());
+    }
+
+    let filename = output_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("invalid output filename")?;
+    let temporary = output_path.with_file_name(format!(".denoize-{filename}.part"));
+    let result = (|| -> Result<usize, String> {
+        let mut processor = StreamingDenoiser::new(cfg, spec.channels as usize)?;
+        let mut writer = WavStreamWriter::create(&temporary, spec)?;
+        let mut frames = 0usize;
+        while let Some(block) = reader.next_block(STREAM_BLOCK_FRAMES)? {
+            let block_frames = block.first().map(Vec::len).unwrap_or(0);
+            let enhanced = processor.process_block(&block)?;
+            writer.write_block(&enhanced)?;
+            frames = frames.saturating_add(block_frames);
+        }
+        let tail = processor.finish()?;
+        writer.write_block(&tail)?;
+        writer.finalize()?;
+        Ok(frames)
+    })();
+    let frames = match result {
+        Ok(frames) => frames,
+        Err(error) => {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error);
+        }
+    };
+    if output_path.exists() {
+        std::fs::remove_file(output_path).map_err(|e| format!("replace output: {e}"))?;
+    }
+    std::fs::rename(&temporary, output_path).map_err(|e| format!("commit output: {e}"))?;
+    if let Some(metadata) = metadata {
+        denoize::metadata::write(metadata, output_path)?;
+    }
+    if ov.json {
+        println!(
+            "{{\"input\":{:?},\"output\":{:?},\"backend\":\"classical\",\"channels\":{},\"frames\":{},\"sample_rate\":{},\"stream\":true}}",
+            input, output, spec.channels, frames, spec.sample_rate
+        );
+    } else {
+        eprintln!(
+            "denoize: streaming classical WAV complete: {}ch x {} frames",
+            spec.channels, frames
+        );
     }
     Ok(())
 }
@@ -1161,6 +1279,60 @@ mod auto_backend_tests {
     fn automatic_selection_uses_an_available_backend() {
         let selected = service::select_backend(BackendChoice::Auto, 30.0, None);
         assert!(Backend::available_names().contains(&service::backend_name(selected)));
+    }
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+
+    #[test]
+    fn parses_stream_option() {
+        let (_, _, options) =
+            parse_args(&["input.wav".into(), "output.wav".into(), "--stream".into()]).unwrap();
+        assert!(options.stream);
+    }
+
+    #[test]
+    fn streams_wav_without_loading_the_complete_audio() {
+        let root = std::env::temp_dir().join(format!(
+            "denoize-stream-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let input = root.join("input.wav");
+        let output = root.join("output.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&input, spec).unwrap();
+        for frame in 0..20_000 {
+            let sample = (0.2
+                * (2.0 * std::f64::consts::PI * 440.0 * frame as f64 / spec.sample_rate as f64)
+                    .sin()
+                * 32_767.0) as i16;
+            writer.write_sample(sample).unwrap();
+        }
+        writer.finalize().unwrap();
+
+        run_streaming_wav(
+            input.to_str().unwrap(),
+            output.to_str().unwrap(),
+            Overrides {
+                stream: true,
+                ..Overrides::default()
+            },
+        )
+        .unwrap();
+        let result = read_audio(&output).unwrap();
+        assert_eq!(result.sample_rate, spec.sample_rate);
+        assert_eq!(result.channels(), 1);
+        assert_eq!(result.frames(), 20_000);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
 

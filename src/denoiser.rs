@@ -54,6 +54,8 @@
 //!  11. ISTFT + 完全再構成 OLA 正規化
 //!  12. Optional de-emphasis + makeup gain
 
+use std::collections::VecDeque;
+
 use crate::fft::Complex;
 use crate::gain::{compute_gain, multiband_specsub_gains, Algorithm, GainParams, SpecSubLaw};
 use crate::noise::{NoiseConfig, NoiseEstimator};
@@ -355,6 +357,8 @@ pub struct Denoiser {
     prev_mag: Vec<f64>, // previous frame magnitude for spectral flux
     pre_emph_prev: f64, // for pre-emphasis filter state
     de_emph_prev: f64,  // for de-emphasis filter state
+    dc_prev_x: f64,
+    dc_prev_y: f64,
     cepstral_fft: crate::fft::Fft,
     cepstral_spec: Vec<Complex>,
     cepstral_orig: Vec<f64>,
@@ -433,6 +437,8 @@ impl Denoiser {
             prev_mag: vec![0.0; m],
             pre_emph_prev: 0.0,
             de_emph_prev: 0.0,
+            dc_prev_x: 0.0,
+            dc_prev_y: 0.0,
             cepstral_fft,
             cepstral_spec: vec![Complex::default(); cepstral_fft_size],
             cepstral_orig: vec![0.0; m],
@@ -473,6 +479,8 @@ impl Denoiser {
         self.prev_mag.fill(0.0);
         self.pre_emph_prev = 0.0;
         self.de_emph_prev = 0.0;
+        self.dc_prev_x = 0.0;
+        self.dc_prev_y = 0.0;
         self.postfilter.reset();
     }
 
@@ -491,6 +499,17 @@ impl Denoiser {
         out
     }
 
+    /// Process one sample through the stateful DC blocker used by streaming
+    /// input. The batch path keeps the equivalent vectorized implementation
+    /// above for backwards-compatible output.
+    fn dc_block_sample(&mut self, x: f64) -> f64 {
+        let r = 0.999;
+        let y = x - self.dc_prev_x + r * self.dc_prev_y;
+        self.dc_prev_x = x;
+        self.dc_prev_y = y;
+        y
+    }
+
     /// First-order pre-emphasis: y[n] = x[n] - alpha * x[n-1]
     fn pre_emphasize(&mut self, input: &[f64]) -> Vec<f64> {
         let alpha = self.config.pre_emphasis_alpha;
@@ -505,6 +524,12 @@ impl Denoiser {
         out
     }
 
+    fn pre_emphasize_sample(&mut self, x: f64) -> f64 {
+        let y = x - self.config.pre_emphasis_alpha * self.pre_emph_prev;
+        self.pre_emph_prev = x;
+        y
+    }
+
     /// Matching de-emphasis (inverse): x[n] = y[n] + alpha * x[n-1]
     fn de_emphasize(&mut self, input: &[f64]) -> Vec<f64> {
         let alpha = self.config.pre_emphasis_alpha;
@@ -517,6 +542,12 @@ impl Denoiser {
         }
         self.de_emph_prev = prev;
         out
+    }
+
+    fn de_emphasize_sample(&mut self, y: f64) -> f64 {
+        let x = y + self.config.pre_emphasis_alpha * self.de_emph_prev;
+        self.de_emph_prev = x;
+        x
     }
 
     /// Compute transient / onset score using proper **spectral flux**.
@@ -982,6 +1013,289 @@ impl Denoiser {
     }
 }
 
+/// Stateful classical denoiser for bounded-memory, block-by-block processing.
+///
+/// The stream has the same one-frame zero padding and overlap-add semantics as
+/// [`Denoiser::process_channel`].  A small, bounded prefix is retained while
+/// automatic or explicit noise profiling is initialized; after that, only the
+/// STFT overlap and the current input block are resident in memory.
+pub struct StreamingDenoiser {
+    channels: Vec<ChannelStream>,
+    finished: bool,
+}
+
+struct ChannelStream {
+    denoiser: Denoiser,
+    input: VecDeque<f64>,
+    profile: Vec<f64>,
+    profile_target: usize,
+    profile_ready: bool,
+    frame: Vec<f64>,
+    frame_out: Vec<f64>,
+    frame_norm: Vec<f64>,
+    ola_out: Vec<f64>,
+    ola_norm: Vec<f64>,
+    pending: VecDeque<f64>,
+    frame_idx: usize,
+    input_frames: usize,
+    emitted_padded: usize,
+    discarded_left: usize,
+    returned_frames: usize,
+    finished: bool,
+}
+
+impl ChannelStream {
+    fn new(config: DenoiserConfig) -> Self {
+        let denoiser = Denoiser::new(config);
+        let n = denoiser.frame_size;
+        let profile_target = if denoiser.config.profile_ms < 0.0 {
+            0
+        } else if denoiser.config.profile_ms > 0.0 {
+            ((denoiser.config.profile_ms / 1000.0 * denoiser.sample_rate as f64).round() as usize)
+                .saturating_add(n)
+                .max(n)
+        } else {
+            ((1.5 * denoiser.sample_rate as f64).round() as usize)
+                .saturating_add(n)
+                .max(n)
+        };
+        let mut input = VecDeque::with_capacity(n * 2);
+        if profile_target == 0 {
+            input.extend(std::iter::repeat(0.0).take(n));
+        }
+        Self {
+            denoiser,
+            input,
+            profile: Vec::with_capacity(profile_target),
+            profile_ready: profile_target == 0,
+            profile_target,
+            frame: vec![0.0; n],
+            frame_out: vec![0.0; n],
+            frame_norm: vec![0.0; n],
+            ola_out: vec![0.0; n],
+            ola_norm: vec![0.0; n],
+            pending: VecDeque::with_capacity(n),
+            frame_idx: 0,
+            input_frames: 0,
+            emitted_padded: 0,
+            discarded_left: 0,
+            returned_frames: 0,
+            finished: false,
+        }
+    }
+
+    #[inline]
+    fn transform_sample(&mut self, sample: f64) -> f64 {
+        let mut value = sample;
+        if self.denoiser.config.dc_block {
+            value = self.denoiser.dc_block_sample(value);
+        }
+        if self.denoiser.config.pre_emphasis {
+            value = self.denoiser.pre_emphasize_sample(value);
+        }
+        value
+    }
+
+    fn initialize_profile(&mut self) {
+        if self.profile_ready {
+            return;
+        }
+        let profile = std::mem::take(&mut self.profile);
+        let profile_frames = if self.denoiser.config.profile_ms > 0.0 {
+            ((self.denoiser.config.profile_ms / 1000.0 * self.denoiser.sample_rate as f64
+                / self.denoiser.hop as f64)
+                .round() as usize)
+                .max(1)
+        } else if self.denoiser.config.profile_ms == 0.0 {
+            self.denoiser.detect_profile_frames(&profile)
+        } else {
+            0
+        };
+        if profile_frames > 0 {
+            let frames = self
+                .denoiser
+                .collect_profile_y2(&profile, profile_frames);
+            if !frames.is_empty() {
+                self.denoiser.noise.seed_from_profile(&frames);
+            }
+        }
+        self.profile_ready = true;
+        let n = self.denoiser.frame_size;
+        self.input.extend(std::iter::repeat(0.0).take(n));
+        self.input.extend(profile);
+    }
+
+    fn push_samples(&mut self, samples: &[f64]) {
+        for &sample in samples {
+            self.input_frames += 1;
+            let value = self.transform_sample(sample);
+            if self.profile_ready {
+                self.input.push_back(value);
+            } else {
+                self.profile.push(value);
+                if self.profile.len() >= self.profile_target {
+                    self.initialize_profile();
+                }
+            }
+        }
+        if self.profile_ready {
+            self.process_available();
+        }
+    }
+
+    fn process_available(&mut self) {
+        let n = self.denoiser.frame_size;
+        let hop = self.denoiser.hop;
+        while self.input.len() >= n {
+            for i in 0..n {
+                self.frame[i] = self.input[i];
+            }
+            self.frame_out.fill(0.0);
+            self.frame_norm.fill(0.0);
+            self.denoiser.process_frame(
+                &self.frame,
+                0,
+                self.frame_idx,
+                &mut self.frame_out,
+                &mut self.frame_norm,
+            );
+            for i in 0..n {
+                self.ola_out[i] += self.frame_out[i];
+                self.ola_norm[i] += self.frame_norm[i];
+            }
+            let makeup = self.denoiser.makeup;
+            for i in 0..hop {
+                let norm = self.ola_norm[i];
+                let value = if norm > 1e-9 {
+                    (self.ola_out[i] / norm) * makeup
+                } else {
+                    0.0
+                };
+                self.pending.push_back(value);
+            }
+            self.ola_out.copy_within(hop..n, 0);
+            self.ola_norm.copy_within(hop..n, 0);
+            self.ola_out[n - hop..].fill(0.0);
+            self.ola_norm[n - hop..].fill(0.0);
+            for _ in 0..hop {
+                self.input.pop_front();
+            }
+            self.frame_idx += 1;
+            self.emitted_padded += hop;
+        }
+    }
+
+    fn drain_ready(&mut self) -> Vec<f64> {
+        let n = self.denoiser.frame_size;
+        while self.discarded_left < n {
+            if self.pending.pop_front().is_none() {
+                break;
+            }
+            self.discarded_left += 1;
+        }
+        let mut output = Vec::new();
+        while self.returned_frames < self.input_frames {
+            let Some(value) = self.pending.pop_front() else {
+                break;
+            };
+            let value = if self.denoiser.config.pre_emphasis {
+                self.denoiser.de_emphasize_sample(value)
+            } else {
+                value
+            };
+            output.push(value);
+            self.returned_frames += 1;
+        }
+        output
+    }
+
+    fn finish(&mut self) -> Vec<f64> {
+        if self.finished {
+            return Vec::new();
+        }
+        if !self.profile_ready {
+            self.initialize_profile();
+        }
+        let n = self.denoiser.frame_size;
+        self.input.extend(std::iter::repeat(0.0).take(n));
+        self.process_available();
+        let target = n.saturating_add(self.input_frames);
+        if self.emitted_padded < target {
+            let remaining = (target - self.emitted_padded).min(n);
+            let makeup = self.denoiser.makeup;
+            for i in 0..remaining {
+                let norm = self.ola_norm[i];
+                let value = if norm > 1e-9 {
+                    (self.ola_out[i] / norm) * makeup
+                } else {
+                    0.0
+                };
+                self.pending.push_back(value);
+            }
+            self.emitted_padded += remaining;
+        }
+        let output = self.drain_ready();
+        self.finished = true;
+        output
+    }
+}
+
+impl StreamingDenoiser {
+    /// Create a stateful denoiser with one independent processor per channel.
+    pub fn new(config: DenoiserConfig, channels: usize) -> Result<Self, String> {
+        if channels == 0 {
+            return Err("streaming denoiser requires at least one channel".into());
+        }
+        Ok(Self {
+            channels: (0..channels)
+                .map(|_| ChannelStream::new(config.clone()))
+                .collect(),
+            finished: false,
+        })
+    }
+
+    /// Process one interleaved-time, planar block and return any output that
+    /// is ready without waiting for the stream to finish.
+    pub fn process_block(&mut self, channels: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, String> {
+        if self.finished {
+            return Err("streaming denoiser has already been finished".into());
+        }
+        if channels.len() != self.channels.len() {
+            return Err(format!(
+                "expected {} channels, got {}",
+                self.channels.len(),
+                channels.len()
+            ));
+        }
+        let frames = channels.first().map(Vec::len).unwrap_or(0);
+        if channels.iter().any(|channel| channel.len() != frames) {
+            return Err("streaming blocks must have equal channel lengths".into());
+        }
+        for (stream, channel) in self.channels.iter_mut().zip(channels) {
+            stream.push_samples(channel);
+        }
+        Ok(self
+            .channels
+            .iter_mut()
+            .map(ChannelStream::drain_ready)
+            .collect())
+    }
+
+    /// Flush the overlap-add tail and return the final output block.
+    pub fn finish(&mut self) -> Result<Vec<Vec<f64>>, String> {
+        if self.finished {
+            return Err("streaming denoiser has already been finished".into());
+        }
+        let output = self
+            .channels
+            .iter_mut()
+            .map(ChannelStream::finish)
+            .collect();
+        self.finished = true;
+        Ok(output)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1075,6 +1389,55 @@ mod tests {
         let out_rms = (out[lo..hi].iter().map(|s| s * s).sum::<f64>() / (hi - lo) as f64).sqrt();
         let rel = (out_rms - in_rms).abs() / in_rms;
         assert!(rel < 0.06, "tone amplitude changed by {rel:.3}");
+    }
+
+    #[test]
+    fn streaming_matches_batch_with_bounded_blocks() {
+        let sr = 16_000;
+        let mut config = Preset::Gentle.config(sr);
+        config.frame_size = 512;
+        config.overlap = 0.75;
+        config.profile_ms = -1.0;
+        config.dc_block = false;
+        config.pre_emphasis = true;
+        let signal: Vec<f64> = (0..sr as usize * 2)
+            .map(|i| {
+                let t = i as f64 / sr as f64;
+                0.25 * (2.0 * std::f64::consts::PI * 330.0 * t).sin()
+                    + 0.04 * (2.0 * std::f64::consts::PI * 2_700.0 * t).sin()
+            })
+            .collect();
+
+        let mut batch = Denoiser::new(config.clone());
+        let expected = batch.process_channel(&signal);
+        let mut streaming = StreamingDenoiser::new(config, 1).unwrap();
+        let mut actual = Vec::new();
+        let mut offset = 0;
+        for block_size in [37, 1_003, 257, 4_096, 89, 777] {
+            if offset >= signal.len() {
+                break;
+            }
+            let end = (offset + block_size).min(signal.len());
+            let block = vec![signal[offset..end].to_vec()];
+            actual.extend(streaming.process_block(&block).unwrap().remove(0));
+            offset = end;
+        }
+        if offset < signal.len() {
+            actual.extend(
+                streaming
+                    .process_block(&[signal[offset..].to_vec()])
+                    .unwrap()
+                    .remove(0),
+            );
+        }
+        actual.extend(streaming.finish().unwrap().remove(0));
+        assert_eq!(actual.len(), expected.len());
+        let max_error = actual
+            .iter()
+            .zip(&expected)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f64::max);
+        assert!(max_error < 1e-9, "streaming drifted from batch by {max_error}");
     }
 
     #[test]

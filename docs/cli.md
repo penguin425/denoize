@@ -54,6 +54,7 @@ OPTIONS:
         --channels <MODE>     independent|linked|mid-side (default: independent)
         --sgmse-profile <P>   fast|balanced|quality (default: balanced)
         --batch               process files in INPUT directory into OUTPUT directory
+        --stream              bounded-memory classical WAV-to-WAV processing
         --recursive           include subdirectories in batch mode
         --jobs <N>            concurrent batch workers (default: CPU count)
         --output-format <EXT> convert every batch output to this format

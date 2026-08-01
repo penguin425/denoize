@@ -244,6 +244,22 @@ cargo build --release --features full
   -a specsub-nl -s 0.5
 ```
 
+### Long recordings with bounded memory
+
+For long WAV recordings, use the classical streaming path. It keeps only the
+STFT overlap and a fixed-size input block in memory instead of loading the
+whole file:
+
+```sh
+./target/release/denoize long-noisy.wav long-clean.wav --stream
+```
+
+`--stream` currently supports filesystem WAV-to-WAV processing with the
+classical backend and independent channels. VAD, loudness normalization,
+mid/side or linked stereo processing, and AI/encoded output require the normal
+(non-streaming) path. The default block size is 8192 frames; noise profiling
+retains only a bounded leading segment before output begins.
+
 ## Desktop app
 
 The Tauri desktop app exposes single-file denoising, batch conversion, quality
