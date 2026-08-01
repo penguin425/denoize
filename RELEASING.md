@@ -47,8 +47,18 @@ the repository's built-in `GITHUB_TOKEN`.
    ```
 
 The workflow first validates and tests the tag, builds and uploads every OS
-archive, publishes the crate, and only then publishes the GitHub draft release.
-If any step fails, the GitHub release remains a draft.
+archive, publishes the crate, and verifies the complete release asset set. The
+verification checks that every CLI archive, desktop installer, signature, and
+`latest.json` is present and non-empty, validates the SHA-256 manifests, and
+confirms that updater metadata points at uploaded assets. Only then is the
+GitHub draft release published. If any step fails, the GitHub release remains a
+draft.
+
+The same release check can be run against an existing release with:
+
+```sh
+bash scripts/verify-release-assets.sh v0.5.6
+```
 
 Pull requests also run the desktop packaging matrix on Linux, macOS (Intel and
 Apple Silicon), and Windows. Those CI builds disable signing and updater
