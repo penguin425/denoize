@@ -19,8 +19,8 @@ if [[ -z "$repo" ]]; then
   repo=$(gh repo view --json nameWithOwner --jq '.nameWithOwner')
 fi
 
-release_json=$(gh api "repos/${repo}/releases/tags/${tag}")
-release_tag=$(jq -r '.tag_name // empty' <<<"$release_json")
+release_json=$(gh release view "$tag" --repo "$repo" --json tagName,assets)
+release_tag=$(jq -r '.tagName // empty' <<<"$release_json")
 if [[ "$release_tag" != "$tag" ]]; then
   echo "release tag mismatch: expected $tag, got ${release_tag:-<missing>}" >&2
   exit 1
