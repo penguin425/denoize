@@ -43,7 +43,12 @@ jobs:
         run: cargo test --locked --all-targets --features full
 
       - name: Verify generated CLI reference
-        run: bash scripts/generate-cli-docs.sh --check
+        run: |
+          # The release test matrix builds the full-featured CLI. Rebuild the
+          # documented no-default binary so the check is independent of the
+          # preceding test targets.
+          cargo build --locked --no-default-features --bin denoize
+          bash scripts/generate-cli-docs.sh --check
 
       - name: Verify crates.io package
         run: |
