@@ -1,6 +1,6 @@
 [package]
 name = "denoize"
-version = "0.5.6"
+version = "0.5.7"
 edition = "2021"
 authors = ["denoize"]
 description = "Pure-Rust audio denoiser for the world's highest sound quality. Classical DSP + optional RNNoise / DeepFilterNet backends."
