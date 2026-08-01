@@ -89,11 +89,13 @@ pub fn decode_mp3(data: &[u8]) -> Result<DecodedPcm, String> {
 
 fn append_frame(info: &FrameInfo, pcm: &[f32], out_l: &mut Vec<f64>, out_r: &mut Vec<f64>) {
     let n_ch = info.channels.num() as usize;
-    let n_frames = info.samples_produced / n_ch;
+    // nanomp3 reports samples per channel; the PCM buffer itself is
+    // interleaved, so each frame contributes `n_ch` entries to the buffer.
+    let n_frames = info.samples_produced;
     if n_frames == 0 {
         return;
     }
-    let samples = &pcm[..info.samples_produced];
+    let samples = &pcm[..n_frames * n_ch];
     if n_ch == 1 {
         for &s in samples.iter().take(n_frames) {
             out_l.push(super::pcm::f32_to_f64(s));
