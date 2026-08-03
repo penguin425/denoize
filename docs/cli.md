@@ -1,7 +1,7 @@
 # denoize CLI reference
 
 ```text
-denoize 0.19.0 — pure-Rust audio denoiser engineered for the world's highest sound quality
+denoize 0.20.0 — pure-Rust audio denoiser engineered for the world's highest sound quality
 
 Classical DSP + optional AI backends (RNNoise, DeepFilterNet v3, MP-SENet, BSRNN).
 Input: WAV/BWF/RF64, AIFF, CAF, FLAC, Ogg Opus/Vorbis, MP3, M4A/ALAC, AAC (built in; no ffmpeg).
