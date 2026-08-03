@@ -16,6 +16,18 @@ type JobProgress = {
 };
 type Comparison = {
   markdown: string; json: string; html: string; noisySnrDb: number; enhancedSnrDb: number; improvementDb: number;
+  metrics: {
+    noisy: ComparisonMetricValues; enhanced: ComparisonMetricValues; improvement: ComparisonMetricValues;
+  };
+};
+type ArtifactMetricValues = {
+  musicalNoiseScore: number; pumpingScore: number; transientLossScore: number; phaseDistortionScore: number | null;
+};
+type ComparisonMetricValues = {
+  siSdrDb: number; siSnrDb: number; snrDb: number; segmentalSnrDb: number;
+  stereoSideSdrDb: number | null; correlationError: number | null;
+  stoi: number | null; pesq: number | null; visqol: number | null;
+  artifactScores: ArtifactMetricValues;
 };
 type ModelRow = {
   name: string; backend: string; license: string; sampleRate: number; revision: string;
@@ -151,7 +163,7 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
       <section class="page" id="page-compare">
         <div class="compare-layout">
           <article class="card"><div class="card-heading"><div><span class="step">01</span><h2>参照ファイル</h2></div></div><div id="compare-inputs" class="compare-inputs"></div><button class="primary wide" id="run-compare">品質を比較</button></article>
-          <article class="card result-card"><div class="card-heading"><div><span class="step">02</span><h2>結果</h2></div><button class="secondary hidden" id="export-report">HTMLを保存</button></div><div id="compare-empty" class="empty-panel">3つのファイルを選ぶと、改善量を可視化できます</div><div id="compare-result" class="hidden"><div class="metric-hero"><span>改善</span><strong id="improvement">+0.00 dB</strong></div><div class="metric-pair"><div><span>処理前 SNR</span><b id="noisy-snr">0</b></div><div><span>処理後 SNR</span><b id="enhanced-snr">0</b></div></div><pre id="report-markdown"></pre></div></article>
+          <article class="card result-card"><div class="card-heading"><div><span class="step">02</span><h2>結果</h2></div><button class="secondary hidden" id="export-report">HTMLを保存</button></div><div id="compare-empty" class="empty-panel">3つのファイルを選ぶと、改善量を可視化できます</div><div id="compare-result" class="hidden"><div class="metric-hero"><span>SNR改善</span><strong id="improvement">+0.00 dB</strong></div><div class="metric-pair"><div><span>処理前 SNR</span><b id="noisy-snr">0</b></div><div><span>処理後 SNR</span><b id="enhanced-snr">0</b></div></div><div id="comparison-metrics" class="metric-tables"></div><pre id="report-markdown"></pre></div></article>
         </div>
       </section>
 
@@ -504,9 +516,45 @@ $("#run-compare").addEventListener("click", async () => {
     $("#compare-empty").classList.add("hidden"); $("#compare-result").classList.remove("hidden"); $("#export-report").classList.remove("hidden");
     $("#improvement").textContent = `${comparison.improvementDb >= 0 ? "+" : ""}${comparison.improvementDb.toFixed(2)} dB`;
     $("#noisy-snr").textContent = `${comparison.noisySnrDb.toFixed(2)} dB`; $("#enhanced-snr").textContent = `${comparison.enhancedSnrDb.toFixed(2)} dB`;
+    renderComparisonMetrics(comparison.metrics);
     $("#report-markdown").textContent = comparison.markdown;
   } catch (error) { showToast(errorText(error), true); } finally { $("#run-compare").removeAttribute("disabled"); }
 });
+
+function formatMetric(value: number | null, unit = "", precision = 3) {
+  return value === null || !Number.isFinite(value) ? "n/a" : `${value.toFixed(precision)}${unit}`;
+}
+
+function formatImprovement(value: number | null, unit = "", precision = 3) {
+  if (value === null || !Number.isFinite(value)) return "n/a";
+  return `${value >= 0 ? "+" : ""}${value.toFixed(precision)}${unit}`;
+}
+
+function comparisonMetricRow(label: string, noisy: number | null, enhanced: number | null, improvement: number | null, unit = "", precision = 3) {
+  return `<div class="metric-row"><span>${label}</span><b>${formatMetric(noisy, unit, precision)}</b><b>${formatMetric(enhanced, unit, precision)}</b><b class="metric-improvement ${improvement !== null && improvement >= 0 ? "positive" : "negative"}">${formatImprovement(improvement, unit, precision)}</b></div>`;
+}
+
+function renderComparisonMetrics(metrics: Comparison["metrics"]) {
+  const qualityRows = [
+    comparisonMetricRow("SI-SDR", metrics.noisy.siSdrDb, metrics.enhanced.siSdrDb, metrics.improvement.siSdrDb, " dB"),
+    comparisonMetricRow("SI-SNR", metrics.noisy.siSnrDb, metrics.enhanced.siSnrDb, metrics.improvement.siSnrDb, " dB"),
+    comparisonMetricRow("SNR", metrics.noisy.snrDb, metrics.enhanced.snrDb, metrics.improvement.snrDb, " dB"),
+    comparisonMetricRow("セグメントSNR", metrics.noisy.segmentalSnrDb, metrics.enhanced.segmentalSnrDb, metrics.improvement.segmentalSnrDb, " dB"),
+    comparisonMetricRow("STOI", metrics.noisy.stoi, metrics.enhanced.stoi, metrics.improvement.stoi, "", 4),
+    comparisonMetricRow("ViSQOL", metrics.noisy.visqol, metrics.enhanced.visqol, metrics.improvement.visqol),
+    comparisonMetricRow("PESQ", metrics.noisy.pesq, metrics.enhanced.pesq, metrics.improvement.pesq),
+    comparisonMetricRow("ステレオSide SDR", metrics.noisy.stereoSideSdrDb, metrics.enhanced.stereoSideSdrDb, metrics.improvement.stereoSideSdrDb, " dB"),
+    comparisonMetricRow("相関誤差", metrics.noisy.correlationError, metrics.enhanced.correlationError, metrics.improvement.correlationError, "", 4),
+  ].join("");
+  const artifactRows = [
+    comparisonMetricRow("Musical noise", metrics.noisy.artifactScores.musicalNoiseScore, metrics.enhanced.artifactScores.musicalNoiseScore, metrics.improvement.artifactScores.musicalNoiseScore),
+    comparisonMetricRow("Pumping", metrics.noisy.artifactScores.pumpingScore, metrics.enhanced.artifactScores.pumpingScore, metrics.improvement.artifactScores.pumpingScore),
+    comparisonMetricRow("Transient loss", metrics.noisy.artifactScores.transientLossScore, metrics.enhanced.artifactScores.transientLossScore, metrics.improvement.artifactScores.transientLossScore),
+    comparisonMetricRow("Phase distortion", metrics.noisy.artifactScores.phaseDistortionScore, metrics.enhanced.artifactScores.phaseDistortionScore, metrics.improvement.artifactScores.phaseDistortionScore),
+  ].join("");
+  $("#comparison-metrics").innerHTML = `<section class="metric-section"><div class="metric-section-heading"><h3>品質メトリクス</h3><span>高いほど良い</span></div><div class="metric-table"><div class="metric-row metric-header"><span>指標</span><span>処理前</span><span>処理後</span><span>改善</span></div>${qualityRows}</div></section><section class="metric-section"><div class="metric-section-heading"><h3>アーティファクト指標</h3><span>低いほど良い · 0–1</span></div><div class="metric-table"><div class="metric-row metric-header"><span>指標</span><span>処理前</span><span>処理後</span><span>改善</span></div>${artifactRows}</div></section>`;
+}
+
 $("#export-report").addEventListener("click", async () => {
   if (!comparison) return; const path = await save({ defaultPath: "denoize-comparison.html", filters: [{ name: "HTML", extensions: ["html"] }] });
   if (path) { await invoke("save_text_file", { path, contents: comparison.html }); showToast("レポートを保存しました"); }

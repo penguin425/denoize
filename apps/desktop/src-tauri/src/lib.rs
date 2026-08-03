@@ -1,5 +1,5 @@
 use denoize::audio::{read_audio, write_audio};
-use denoize::benchmark::ComparisonReport;
+use denoize::benchmark::{BenchmarkReport, ComparisonReport};
 use denoize::denoiser::{DenoiserConfig, Preset, ProcessingMode};
 use denoize::service::{self, BackendChoice, ProcessingOptions};
 use denoize::{
@@ -159,6 +159,38 @@ struct BackendInfo {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct ArtifactMetrics {
+    musical_noise_score: f64,
+    pumping_score: f64,
+    transient_loss_score: f64,
+    phase_distortion_score: Option<f64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ComparisonMetrics {
+    si_sdr_db: f64,
+    si_snr_db: f64,
+    snr_db: f64,
+    segmental_snr_db: f64,
+    stereo_side_sdr_db: Option<f64>,
+    correlation_error: Option<f64>,
+    stoi: Option<f64>,
+    pesq: Option<f64>,
+    visqol: Option<f64>,
+    artifact_scores: ArtifactMetrics,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ComparisonMetricSet {
+    noisy: ComparisonMetrics,
+    enhanced: ComparisonMetrics,
+    improvement: ComparisonMetrics,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ComparisonOutput {
     markdown: String,
     json: String,
@@ -166,6 +198,73 @@ struct ComparisonOutput {
     noisy_snr_db: f64,
     enhanced_snr_db: f64,
     improvement_db: f64,
+    metrics: ComparisonMetricSet,
+}
+
+fn comparison_metrics(report: &BenchmarkReport) -> ComparisonMetrics {
+    ComparisonMetrics {
+        si_sdr_db: report.si_sdr_db,
+        si_snr_db: report.si_snr_db,
+        snr_db: report.snr_db,
+        segmental_snr_db: report.segmental_snr_db,
+        stereo_side_sdr_db: report.stereo_side_sdr_db,
+        correlation_error: report.correlation_error,
+        stoi: report.stoi,
+        pesq: report.pesq,
+        visqol: report.visqol,
+        artifact_scores: ArtifactMetrics {
+            musical_noise_score: report.artifact_scores.musical_noise_score,
+            pumping_score: report.artifact_scores.pumping_score,
+            transient_loss_score: report.artifact_scores.transient_loss_score,
+            phase_distortion_score: report.artifact_scores.phase_distortion_score,
+        },
+    }
+}
+
+fn optional_metric_difference(a: Option<f64>, b: Option<f64>) -> Option<f64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a - b),
+        _ => None,
+    }
+}
+
+fn comparison_metric_set(report: &ComparisonReport) -> ComparisonMetricSet {
+    let noisy = comparison_metrics(&report.noisy);
+    let enhanced = comparison_metrics(&report.enhanced);
+    let improvement = ComparisonMetrics {
+        si_sdr_db: report.enhanced.si_sdr_db - report.noisy.si_sdr_db,
+        si_snr_db: report.enhanced.si_snr_db - report.noisy.si_snr_db,
+        snr_db: report.enhanced.snr_db - report.noisy.snr_db,
+        segmental_snr_db: report.enhanced.segmental_snr_db - report.noisy.segmental_snr_db,
+        stereo_side_sdr_db: optional_metric_difference(
+            report.enhanced.stereo_side_sdr_db,
+            report.noisy.stereo_side_sdr_db,
+        ),
+        correlation_error: optional_metric_difference(
+            report.noisy.correlation_error,
+            report.enhanced.correlation_error,
+        ),
+        stoi: optional_metric_difference(report.enhanced.stoi, report.noisy.stoi),
+        pesq: optional_metric_difference(report.enhanced.pesq, report.noisy.pesq),
+        visqol: optional_metric_difference(report.enhanced.visqol, report.noisy.visqol),
+        artifact_scores: ArtifactMetrics {
+            musical_noise_score: report.noisy.artifact_scores.musical_noise_score
+                - report.enhanced.artifact_scores.musical_noise_score,
+            pumping_score: report.noisy.artifact_scores.pumping_score
+                - report.enhanced.artifact_scores.pumping_score,
+            transient_loss_score: report.noisy.artifact_scores.transient_loss_score
+                - report.enhanced.artifact_scores.transient_loss_score,
+            phase_distortion_score: optional_metric_difference(
+                report.noisy.artifact_scores.phase_distortion_score,
+                report.enhanced.artifact_scores.phase_distortion_score,
+            ),
+        },
+    };
+    ComparisonMetricSet {
+        noisy,
+        enhanced,
+        improvement,
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -581,6 +680,7 @@ async fn compare_audio(
             noisy_snr_db: report.noisy.snr_db,
             enhanced_snr_db: report.enhanced.snr_db,
             improvement_db: report.enhanced.snr_db - report.noisy.snr_db,
+            metrics: comparison_metric_set(&report),
         })
     })
     .await
@@ -1091,6 +1191,43 @@ mod tests {
     #[test]
     fn invalid_backend_is_rejected() {
         assert!(Backend::parse("missing").is_none());
+    }
+
+    #[test]
+    fn comparison_metrics_include_quality_and_artifact_improvements() {
+        let report = |snr_db: f64, stoi: f64, musical_noise_score: f64| BenchmarkReport {
+            frames: 1,
+            sample_rate: 48_000,
+            channels: 1,
+            si_sdr_db: snr_db,
+            si_snr_db: snr_db + 1.0,
+            snr_db,
+            segmental_snr_db: snr_db - 1.0,
+            stereo_side_sdr_db: None,
+            correlation_error: None,
+            artifact_scores: denoize::benchmark::ArtifactReport {
+                musical_noise_score,
+                pumping_score: musical_noise_score + 0.1,
+                transient_loss_score: musical_noise_score + 0.2,
+                phase_distortion_score: None,
+            },
+            stoi: Some(stoi),
+            pesq: None,
+            visqol: Some(stoi + 1.0),
+            elapsed_ms: None,
+            peak_rss_bytes: None,
+        };
+        let comparison = ComparisonReport {
+            noisy: report(2.0, 0.5, 0.4),
+            enhanced: report(5.0, 0.8, 0.1),
+        };
+        let metrics = comparison_metric_set(&comparison);
+        assert_eq!(metrics.noisy.snr_db, 2.0);
+        assert_eq!(metrics.enhanced.stoi, Some(0.8));
+        assert_eq!(metrics.improvement.snr_db, 3.0);
+        assert!((metrics.improvement.stoi.unwrap() - 0.3).abs() < 1e-10);
+        assert!((metrics.improvement.artifact_scores.musical_noise_score - 0.3).abs() < 1e-10);
+        assert!((metrics.improvement.visqol.unwrap() - 0.3).abs() < 1e-10);
     }
 
     #[test]
