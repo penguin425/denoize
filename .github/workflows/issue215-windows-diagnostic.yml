@@ -21,18 +21,21 @@ jobs:
             plugin: denoize
             parameters: 7
             normalized: 0
+            model: 0
             archive_url: https://github.com/penguin425/denoize/releases/download/v0.82.0/denoize-plugin-v0.82.0-x86_64-pc-windows-msvc.zip
             archive_sha256: 358CE6399E70BDBBA6B58562B161444B6164C4A593C7B9C7B60927BBFBA9F1C0
           - case: Neural v0.82.0
             plugin: denoize Neural
             parameters: 4
             normalized: 0
+            model: 1
             archive_url: https://github.com/penguin425/denoize/releases/download/v0.82.0/denoize-plugin-v0.82.0-x86_64-pc-windows-msvc.zip
             archive_sha256: 358CE6399E70BDBBA6B58562B161444B6164C4A593C7B9C7B60927BBFBA9F1C0
           - case: Neural v0.90.0
             plugin: denoize Neural
             parameters: 4
             normalized: 0
+            model: 1
             archive_url: https://github.com/penguin425/denoize/releases/download/v0.90.0/denoize-plugin-v0.90.0-x86_64-pc-windows-msvc.zip
             archive_sha256: 4BCE101B95148DD5DF1FDF6DC095F7962F13082F54D4D8039BCA9AFB8BD93127
     steps:
@@ -51,6 +54,7 @@ jobs:
           $diagnosticDir = Join-Path $env:RUNNER_TEMP "reaper-diagnostics"
           $result = Join-Path $env:RUNNER_TEMP "reaper-parameters.tsv"
           $tone = Join-Path $env:RUNNER_TEMP "tone.wav"
+          $modelRoot = Join-Path $env:RUNNER_TEMP "denoize-models"
 
           Invoke-WebRequest -Uri https://www.reaper.fm/files/7.x/reaper779_x64-install.exe -OutFile $reaperInstaller
           if ((Get-FileHash $reaperInstaller -Algorithm SHA256).Hash -ne "F07714D894A073DF40E88568F8AA524A74230F574B0688DF681F9B7C0877F9DF") {
@@ -69,6 +73,19 @@ jobs:
             Select-Object -First 1 -ExpandProperty FullName
           if (-not (Test-Path $reaper) -or -not $plugin) {
             throw "REAPER or denoize.clap was not installed"
+          }
+
+          if ("${{ matrix.model }}" -eq "1") {
+            $modelDir = Join-Path $modelRoot "gtcrn-dns3"
+            $model = Join-Path $modelDir "gtcrn_simple.onnx"
+            New-Item -ItemType Directory -Force $modelDir | Out-Null
+            Invoke-WebRequest `
+              -Uri https://raw.githubusercontent.com/Xiaobin-Rong/gtcrn/3862c44808dca492ea5a8a145d2dc2a1028d08c8/stream/onnx_models/gtcrn_simple.onnx `
+              -OutFile $model
+            if ((Get-FileHash $model -Algorithm SHA256).Hash -ne "B4718DF6228E7BDF1A8A435CF98F838636EB2FD331ACABF86BA87C5192EBCB87") {
+              throw "unexpected GTCRN model digest"
+            }
+            $env:DENOIZE_MODEL_DIR = $modelRoot
           }
 
           @(
