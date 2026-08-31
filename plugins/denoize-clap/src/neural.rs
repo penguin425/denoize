@@ -1134,19 +1134,15 @@ impl<'a> NeuralEngine<'a> {
                 );
             })
             .map_err(|error| format!("start neural inference worker: {error}"))?;
-        match ready_rx.recv() {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
+        let worker = match ready_rx.recv() {
+            Ok(Ok(())) => Some(worker),
+            Ok(Err(_)) | Err(_) => {
+                metrics.worker_errors.fetch_add(1, Ordering::Relaxed);
                 running.store(false, Ordering::Release);
                 let _ = worker.join();
-                return Err(error);
+                None
             }
-            Err(_) => {
-                running.store(false, Ordering::Release);
-                let _ = worker.join();
-                return Err("neural inference worker exited during initialization".into());
-            }
-        }
+        };
 
         Ok(Self {
             channels,
@@ -1165,7 +1161,7 @@ impl<'a> NeuralEngine<'a> {
             generation: 1,
             last_safe_gain: [1.0; 2],
             running,
-            worker: Some(worker),
+            worker,
             metrics,
         })
     }
@@ -1287,6 +1283,12 @@ impl<'a> NeuralEngine<'a> {
         let Some(mut completed) = self.capture.take() else {
             return;
         };
+        if self.worker.is_none() {
+            completed.frames = 0;
+            self.capture = Some(completed);
+            self.capture_frames = 0;
+            return;
+        }
         completed.generation = self.generation;
         completed.start_frame = self.input_frame.saturating_sub(self.chunk_frames as u64);
         completed.frames = self.chunk_frames;
@@ -1651,6 +1653,32 @@ mod tests {
         assert_eq!(delayed_impulse, 0.5);
         assert!(started.elapsed() < Duration::from_millis(100));
         assert!(engine.metrics.overload_blocks.load(Ordering::Relaxed) > 0);
+    }
+
+    #[test]
+    fn unavailable_model_keeps_the_processor_active_with_delayed_dry() {
+        let shared = Box::leak(Box::new(NeuralShared::new().unwrap()));
+        let mut engine = NeuralEngine::new_with_factory(48_000.0, 1, shared, || {
+            Err("pinned model is unavailable".to_owned())
+        })
+        .unwrap();
+        assert!(engine.worker.is_none());
+        assert_eq!(shared.worker_errors.load(Ordering::Relaxed), 1);
+
+        let parameters = RuntimeParameters::from(NeuralParameters::default());
+        let latency = engine.latency_frames as usize;
+        let frames = latency + engine.chunk_frames * (QUEUE_BLOCKS + 4);
+        for frame in 0..frames {
+            let input = if frame == 0 { 0.5 } else { 0.0 };
+            let output = engine.process_frame([input, 0.0], parameters)[0];
+            if frame < latency {
+                assert_eq!(output, 0.0);
+            } else if frame == latency {
+                assert_eq!(output, 0.5);
+            }
+        }
+        assert_eq!(engine.input_queue.len(), 0);
+        assert_eq!(engine.output_queue.len(), 0);
     }
 
     #[test]
