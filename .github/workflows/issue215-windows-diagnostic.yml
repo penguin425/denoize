@@ -56,6 +56,31 @@ jobs:
           $env:DENOIZE_REAPER_PLUGIN = "denoize Neural"
           $env:DENOIZE_REAPER_OSARA_STYLE = "1"
           $env:DENOIZE_REAPER_SET_DELAY = "1"
+          Add-Type @"
+          using System;
+          using System.Runtime.InteropServices;
+
+          public static class ReaperDialog {
+              [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+              public static extern IntPtr FindWindow(string className, string windowName);
+
+              [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+              public static extern IntPtr FindWindowEx(
+                  IntPtr parent,
+                  IntPtr childAfter,
+                  string className,
+                  string windowName
+              );
+
+              [DllImport("user32.dll")]
+              public static extern IntPtr SendMessage(
+                  IntPtr window,
+                  uint message,
+                  IntPtr word,
+                  IntPtr data
+              );
+          }
+          "@
           $arguments = @(
             "-newinst",
             "-cfgfile",
@@ -67,6 +92,23 @@ jobs:
             $deadline = (Get-Date).AddSeconds(30)
             do {
               Start-Sleep -Milliseconds 500
+              $dialog = [ReaperDialog]::FindWindow("#32770", "REAPER")
+              if ($dialog -ne [IntPtr]::Zero) {
+                $noButton = [ReaperDialog]::FindWindowEx(
+                  $dialog,
+                  [IntPtr]::Zero,
+                  "Button",
+                  "No"
+                )
+                if ($noButton -ne [IntPtr]::Zero) {
+                  [void][ReaperDialog]::SendMessage(
+                    $noButton,
+                    0x00F5,
+                    [IntPtr]::Zero,
+                    [IntPtr]::Zero
+                  )
+                }
+              }
               if (Test-Path $result) {
                 $evidence = Get-Content -LiteralPath $result
                 if ($evidence -match '^summary\t') {
