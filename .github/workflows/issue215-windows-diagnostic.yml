@@ -67,7 +67,15 @@ jobs:
             throw "REAPER or denoize.clap was not installed"
           }
 
-          @("[reaper]", "loadlastproj=0", "warnmaxram64=0") |
+          @(
+            "[reaper]",
+            "loadlastproj=0",
+            "warnmaxram64=0",
+            "[audioconfig]",
+            "mode=5",
+            "dummy_blocksize=1024",
+            "dummy_srate=48000"
+          ) |
             Set-Content -LiteralPath (Join-Path $resourceDir "reaper.ini") -Encoding ascii
 
           $env:CLAP_PATH = Split-Path $plugin
