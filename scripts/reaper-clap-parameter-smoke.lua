@@ -74,6 +74,12 @@ local _, fx_name = reaper.TrackFX_GetFXName(track, fx)
 local parameter_count = reaper.TrackFX_GetNumParams(track, fx)
 write_line("plugin", fx, fx_name, parameter_count)
 
+if os.getenv("DENOIZE_REAPER_OPEN_AUDIO_DEVICE") == "1" then
+  -- Audio device configuration...; this opens Preferences on Audio > Device.
+  reaper.Main_OnCommand(40099, 0)
+  write_line("preferences", "audio device")
+end
+
 local osara_style = os.getenv("DENOIZE_REAPER_OSARA_STYLE") == "1"
 
 local function osara_target(parameter, before, minimum, maximum)

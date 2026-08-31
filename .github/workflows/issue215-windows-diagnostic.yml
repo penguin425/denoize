@@ -104,6 +104,7 @@ jobs:
           $env:DENOIZE_REAPER_SET_DELAY = "5"
           $env:DENOIZE_REAPER_AUDIO = $tone
           $env:DENOIZE_REAPER_PLAY = "1"
+          $env:DENOIZE_REAPER_OPEN_AUDIO_DEVICE = "1"
           Add-Type @"
           using System;
           using System.Collections.Generic;
@@ -309,6 +310,24 @@ jobs:
               Set-Content -LiteralPath (Join-Path $diagnosticDir "windows.tsv")
             Copy-Item -LiteralPath (Join-Path $resourceDir "reaper.ini") `
               -Destination (Join-Path $diagnosticDir "reaper.ini") -Force
+            try {
+              Add-Type -AssemblyName System.Windows.Forms
+              Add-Type -AssemblyName System.Drawing
+              $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+              $bitmap = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
+              $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+              $graphics.CopyFromScreen(
+                $bounds.Location,
+                [System.Drawing.Point]::Empty,
+                $bounds.Size
+              )
+              $bitmap.Save((Join-Path $diagnosticDir "desktop.png"))
+              $graphics.Dispose()
+              $bitmap.Dispose()
+            } catch {
+              $_ | Out-String |
+                Set-Content (Join-Path $diagnosticDir "screenshot-error.txt")
+            }
             if (-not (Test-Path $result)) {
               Get-Process reaper -ErrorAction SilentlyContinue |
                 Format-List Id, ProcessName, MainWindowHandle, MainWindowTitle, Responding |
@@ -329,19 +348,6 @@ jobs:
                   Out-String |
                   Tee-Object -FilePath (Join-Path $diagnosticDir "default-resource-files.txt") |
                   Write-Host
-              }
-              try {
-                Add-Type -AssemblyName System.Windows.Forms
-                Add-Type -AssemblyName System.Drawing
-                $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
-                $bitmap = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
-                $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
-                $graphics.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
-                $bitmap.Save((Join-Path $diagnosticDir "desktop.png"))
-                $graphics.Dispose()
-                $bitmap.Dispose()
-              } catch {
-                $_ | Out-String | Set-Content (Join-Path $diagnosticDir "screenshot-error.txt")
               }
             }
             if (-not $process.HasExited) {
