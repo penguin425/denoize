@@ -73,6 +73,9 @@ jobs:
               );
 
               [DllImport("user32.dll")]
+              public static extern IntPtr GetDlgItem(IntPtr dialog, int controlId);
+
+              [DllImport("user32.dll")]
               public static extern IntPtr SendMessage(
                   IntPtr window,
                   uint message,
@@ -94,12 +97,15 @@ jobs:
               Start-Sleep -Milliseconds 500
               $dialog = [ReaperDialog]::FindWindow("#32770", "REAPER")
               if ($dialog -ne [IntPtr]::Zero) {
-                $noButton = [ReaperDialog]::FindWindowEx(
-                  $dialog,
-                  [IntPtr]::Zero,
-                  "Button",
-                  "No"
-                )
+                $noButton = [ReaperDialog]::GetDlgItem($dialog, 7)
+                if ($noButton -eq [IntPtr]::Zero) {
+                  $noButton = [ReaperDialog]::FindWindowEx(
+                    $dialog,
+                    [IntPtr]::Zero,
+                    "Button",
+                    "&No"
+                  )
+                }
                 if ($noButton -ne [IntPtr]::Zero) {
                   [void][ReaperDialog]::SendMessage(
                     $noButton,
