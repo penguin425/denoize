@@ -57,6 +57,9 @@ jobs:
           Start-Process -FilePath $reaperInstaller -ArgumentList "/S", "/D=$reaperDir" -Wait
           $reaper = Join-Path $reaperDir "reaper.exe"
           if ("${{ matrix.build }}" -eq "1") {
+            # audiopus_sys still declares compatibility with CMake versions older
+            # than 3.5, which current Windows runners require us to opt into.
+            $env:CMAKE_POLICY_VERSION_MINIMUM = "3.5"
             cargo build --locked --release --target x86_64-pc-windows-msvc `
               -p denoize-clap
             if ($LASTEXITCODE -ne 0) {
