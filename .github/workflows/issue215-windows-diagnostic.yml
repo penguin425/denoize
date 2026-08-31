@@ -9,10 +9,29 @@ permissions:
   contents: read
 
 jobs:
-  reaper-v082:
-    name: REAPER 7.79 / denoize v0.82.0
+  reaper:
+    name: REAPER 7.79 / ${{ matrix.case }}
     runs-on: windows-latest
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - case: Neural v0.82.0
+            plugin: denoize Neural
+            parameters: 4
+            archive_url: https://github.com/penguin425/denoize/releases/download/v0.82.0/denoize-plugin-v0.82.0-x86_64-pc-windows-msvc.zip
+            archive_sha256: 358CE6399E70BDBBA6B58562B161444B6164C4A593C7B9C7B60927BBFBA9F1C0
+          - case: regular v0.82.0
+            plugin: denoize
+            parameters: 7
+            archive_url: https://github.com/penguin425/denoize/releases/download/v0.82.0/denoize-plugin-v0.82.0-x86_64-pc-windows-msvc.zip
+            archive_sha256: 358CE6399E70BDBBA6B58562B161444B6164C4A593C7B9C7B60927BBFBA9F1C0
+          - case: Neural v0.90.0
+            plugin: denoize Neural
+            parameters: 4
+            archive_url: https://github.com/penguin425/denoize/releases/download/v0.90.0/denoize-plugin-v0.90.0-x86_64-pc-windows-msvc.zip
+            archive_sha256: 4BCE101B95148DD5DF1FDF6DC095F7962F13082F54D4D8039BCA9AFB8BD93127
     steps:
       - name: Check out diagnostic script
         uses: actions/checkout@v6
@@ -33,9 +52,9 @@ jobs:
           if ((Get-FileHash $reaperInstaller -Algorithm SHA256).Hash -ne "F07714D894A073DF40E88568F8AA524A74230F574B0688DF681F9B7C0877F9DF") {
             throw "unexpected REAPER installer digest"
           }
-          Invoke-WebRequest -Uri https://github.com/penguin425/denoize/releases/download/v0.82.0/denoize-plugin-v0.82.0-x86_64-pc-windows-msvc.zip -OutFile $pluginArchive
-          if ((Get-FileHash $pluginArchive -Algorithm SHA256).Hash -ne "358CE6399E70BDBBA6B58562B161444B6164C4A593C7B9C7B60927BBFBA9F1C0") {
-            throw "unexpected denoize v0.82.0 archive digest"
+          Invoke-WebRequest -Uri "${{ matrix.archive_url }}" -OutFile $pluginArchive
+          if ((Get-FileHash $pluginArchive -Algorithm SHA256).Hash -ne "${{ matrix.archive_sha256 }}") {
+            throw "unexpected denoize plug-in archive digest"
           }
 
           New-Item -ItemType Directory -Force $reaperDir, $pluginDir, $resourceDir, $diagnosticDir | Out-Null
@@ -53,7 +72,7 @@ jobs:
 
           $env:CLAP_PATH = Split-Path $plugin
           $env:DENOIZE_REAPER_RESULT = $result
-          $env:DENOIZE_REAPER_PLUGIN = "denoize Neural"
+          $env:DENOIZE_REAPER_PLUGIN = "${{ matrix.plugin }}"
           $env:DENOIZE_REAPER_OSARA_STYLE = "1"
           $env:DENOIZE_REAPER_SET_DELAY = "1"
           Add-Type @"
@@ -172,14 +191,14 @@ jobs:
           $evidence = Get-Content -LiteralPath $result
           $evidence | ForEach-Object { Write-Host $_ }
           $parameters = @($evidence | Where-Object { $_ -match '^parameter\t' })
-          if ($parameters.Count -ne 4 -or $evidence -notcontains "summary`t0") {
-            throw "one or more OSARA-visible Neural parameters were not adjustable"
+          if ($parameters.Count -ne ${{ matrix.parameters }} -or $evidence -notcontains "summary`t0") {
+            throw "one or more OSARA-visible parameters were not adjustable"
           }
 
       - name: Upload runner diagnostics
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: issue215-windows-diagnostics
+          name: issue215-windows-diagnostics-${{ strategy.job-index }}
           path: ${{ runner.temp }}/reaper-diagnostics
           if-no-files-found: ignore
