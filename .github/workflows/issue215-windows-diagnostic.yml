@@ -47,6 +47,7 @@ jobs:
           $resourceDir = Join-Path $env:RUNNER_TEMP "reaper-resource"
           $diagnosticDir = Join-Path $env:RUNNER_TEMP "reaper-diagnostics"
           $result = Join-Path $env:RUNNER_TEMP "reaper-parameters.tsv"
+          $tone = Join-Path $env:RUNNER_TEMP "tone.wav"
 
           Invoke-WebRequest -Uri https://www.reaper.fm/files/7.x/reaper779_x64-install.exe -OutFile $reaperInstaller
           if ((Get-FileHash $reaperInstaller -Algorithm SHA256).Hash -ne "F07714D894A073DF40E88568F8AA524A74230F574B0688DF681F9B7C0877F9DF") {
@@ -78,11 +79,38 @@ jobs:
           ) |
             Set-Content -LiteralPath (Join-Path $resourceDir "reaper.ini") -Encoding ascii
 
+          $sampleRate = 48000
+          $sampleCount = $sampleRate * 2
+          $dataSize = $sampleCount * 2
+          $writer = [System.IO.BinaryWriter]::new([System.IO.File]::Create($tone))
+          try {
+            $writer.Write([System.Text.Encoding]::ASCII.GetBytes("RIFF"))
+            $writer.Write([int](36 + $dataSize))
+            $writer.Write([System.Text.Encoding]::ASCII.GetBytes("WAVEfmt "))
+            $writer.Write([int]16)
+            $writer.Write([int16]1)
+            $writer.Write([int16]1)
+            $writer.Write([int]$sampleRate)
+            $writer.Write([int]($sampleRate * 2))
+            $writer.Write([int16]2)
+            $writer.Write([int16]16)
+            $writer.Write([System.Text.Encoding]::ASCII.GetBytes("data"))
+            $writer.Write([int]$dataSize)
+            for ($sample = 0; $sample -lt $sampleCount; $sample++) {
+              $value = [int16](12000 * [Math]::Sin(2 * [Math]::PI * 440 * $sample / $sampleRate))
+              $writer.Write($value)
+            }
+          } finally {
+            $writer.Dispose()
+          }
+
           $env:CLAP_PATH = Split-Path $plugin
           $env:DENOIZE_REAPER_RESULT = $result
           $env:DENOIZE_REAPER_PLUGIN = "${{ matrix.plugin }}"
           $env:DENOIZE_REAPER_OSARA_STYLE = "1"
           $env:DENOIZE_REAPER_SET_DELAY = "1"
+          $env:DENOIZE_REAPER_AUDIO = $tone
+          $env:DENOIZE_REAPER_PLAY = "1"
           Add-Type @"
           using System;
           using System.Runtime.InteropServices;
