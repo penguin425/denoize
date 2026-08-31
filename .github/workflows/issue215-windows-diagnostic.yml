@@ -26,6 +26,7 @@ jobs:
           $reaperDir = Join-Path $env:RUNNER_TEMP "reaper779"
           $pluginDir = Join-Path $env:RUNNER_TEMP "denoize-v082"
           $resourceDir = Join-Path $env:RUNNER_TEMP "reaper-resource"
+          $diagnosticDir = Join-Path $env:RUNNER_TEMP "reaper-diagnostics"
           $result = Join-Path $env:RUNNER_TEMP "reaper-parameters.tsv"
 
           Invoke-WebRequest -Uri https://www.reaper.fm/files/7.x/reaper779_x64-install.exe -OutFile $reaperInstaller
@@ -37,7 +38,7 @@ jobs:
             throw "unexpected denoize v0.82.0 archive digest"
           }
 
-          New-Item -ItemType Directory -Force $reaperDir, $pluginDir, $resourceDir | Out-Null
+          New-Item -ItemType Directory -Force $reaperDir, $pluginDir, $resourceDir, $diagnosticDir | Out-Null
           Start-Process -FilePath $reaperInstaller -ArgumentList "/S", "/D=$reaperDir" -Wait
           Expand-Archive -LiteralPath $pluginArchive -DestinationPath $pluginDir
           $reaper = Join-Path $reaperDir "reaper.exe"
@@ -63,7 +64,7 @@ jobs:
           )
           $process = Start-Process -FilePath $reaper -ArgumentList $arguments -PassThru
           try {
-            $deadline = (Get-Date).AddSeconds(90)
+            $deadline = (Get-Date).AddSeconds(30)
             do {
               Start-Sleep -Milliseconds 500
               if (Test-Path $result) {
@@ -77,6 +78,41 @@ jobs:
               }
             } while ((Get-Date) -lt $deadline)
           } finally {
+            if (-not (Test-Path $result)) {
+              Get-Process reaper -ErrorAction SilentlyContinue |
+                Format-List Id, ProcessName, MainWindowHandle, MainWindowTitle, Responding |
+                Out-String |
+                Tee-Object -FilePath (Join-Path $diagnosticDir "processes.txt") |
+                Write-Host
+              Get-ChildItem $resourceDir -Recurse -Force |
+                Select-Object FullName, Length, LastWriteTime |
+                Format-Table -AutoSize |
+                Out-String |
+                Tee-Object -FilePath (Join-Path $diagnosticDir "resource-files.txt") |
+                Write-Host
+              $defaultResource = Join-Path $env:APPDATA "REAPER"
+              if (Test-Path $defaultResource) {
+                Get-ChildItem $defaultResource -Recurse -Force |
+                  Select-Object FullName, Length, LastWriteTime |
+                  Format-Table -AutoSize |
+                  Out-String |
+                  Tee-Object -FilePath (Join-Path $diagnosticDir "default-resource-files.txt") |
+                  Write-Host
+              }
+              try {
+                Add-Type -AssemblyName System.Windows.Forms
+                Add-Type -AssemblyName System.Drawing
+                $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+                $bitmap = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
+                $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+                $graphics.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+                $bitmap.Save((Join-Path $diagnosticDir "desktop.png"))
+                $graphics.Dispose()
+                $bitmap.Dispose()
+              } catch {
+                $_ | Out-String | Set-Content (Join-Path $diagnosticDir "screenshot-error.txt")
+              }
+            }
             if (-not $process.HasExited) {
               Stop-Process -Id $process.Id -Force
             }
@@ -91,3 +127,11 @@ jobs:
           if ($parameters.Count -ne 4 -or $evidence -notcontains "summary`t0") {
             throw "one or more OSARA-visible Neural parameters were not adjustable"
           }
+
+      - name: Upload runner diagnostics
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: issue215-windows-diagnostics
+          path: ${{ runner.temp }}/reaper-diagnostics
+          if-no-files-found: ignore
