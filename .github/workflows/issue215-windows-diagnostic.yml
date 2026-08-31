@@ -163,18 +163,22 @@ jobs:
               Start-Sleep -Milliseconds 500
               $dialog = [ReaperDialog]::FindWindow("#32770", "REAPER")
               if ($dialog -ne [IntPtr]::Zero) {
-                $noButton = [ReaperDialog]::GetDlgItem($dialog, 7)
-                if ($noButton -eq [IntPtr]::Zero) {
-                  $noButton = [ReaperDialog]::FindWindowEx(
-                    $dialog,
+                $yesButton = [ReaperDialog]::GetDlgItem($dialog, 6)
+                if ($yesButton -ne [IntPtr]::Zero) {
+                  [void][ReaperDialog]::SendMessage(
+                    $yesButton,
+                    0x00F5,
                     [IntPtr]::Zero,
-                    "Button",
-                    "&No"
+                    [IntPtr]::Zero
                   )
                 }
-                if ($noButton -ne [IntPtr]::Zero) {
+              }
+              $preferences = [ReaperDialog]::FindWindow("#32770", "REAPER Preferences")
+              if ($preferences -ne [IntPtr]::Zero) {
+                $okButton = [ReaperDialog]::GetDlgItem($preferences, 1)
+                if ($okButton -ne [IntPtr]::Zero) {
                   [void][ReaperDialog]::SendMessage(
-                    $noButton,
+                    $okButton,
                     0x00F5,
                     [IntPtr]::Zero,
                     [IntPtr]::Zero
