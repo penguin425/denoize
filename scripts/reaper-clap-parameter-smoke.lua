@@ -36,6 +36,12 @@ if audio_path ~= nil and audio_path ~= "" then
   reaper.SetOnlyTrackSelected(track)
   reaper.SetEditCurPos(0, false, false)
   reaper.InsertMedia(audio_path, 0)
+  write_line(
+    "media",
+    audio_path,
+    reaper.CountMediaItems(0),
+    reaper.CountTrackMediaItems(track)
+  )
 end
 
 local plugin_name = os.getenv("DENOIZE_REAPER_PLUGIN") or "denoize Neural"
@@ -236,8 +242,26 @@ if set_delay <= 0 then
   set_parameters()
 end
 
-if os.getenv("DENOIZE_REAPER_PLAY") == "1" then
+local play_delay = tonumber(os.getenv("DENOIZE_REAPER_PLAY_DELAY") or "0") or 0
+local function start_playback()
   reaper.Main_OnCommand(1007, 0)
+  write_line("play", reaper.GetPlayState())
+end
+
+if os.getenv("DENOIZE_REAPER_PLAY") == "1" then
+  if play_delay <= 0 then
+    start_playback()
+  else
+    local script_started = reaper.time_precise()
+    local function play_after_delay()
+      if reaper.time_precise() - script_started < play_delay then
+        reaper.defer(play_after_delay)
+        return
+      end
+      start_playback()
+    end
+    reaper.defer(play_after_delay)
+  end
 end
 
 if set_delay > 0 then
