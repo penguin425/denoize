@@ -1,0 +1,93 @@
+name: Issue 215 Windows diagnostic
+
+on:
+  push:
+    branches:
+      - fix/osara-neural-parameters
+
+permissions:
+  contents: read
+
+jobs:
+  reaper-v082:
+    name: REAPER 7.79 / denoize v0.82.0
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out diagnostic script
+        uses: actions/checkout@v6
+
+      - name: Exercise OSARA parameter path
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $reaperInstaller = Join-Path $env:RUNNER_TEMP "reaper779_x64-install.exe"
+          $pluginArchive = Join-Path $env:RUNNER_TEMP "denoize-plugin-v0.82.0.zip"
+          $reaperDir = Join-Path $env:RUNNER_TEMP "reaper779"
+          $pluginDir = Join-Path $env:RUNNER_TEMP "denoize-v082"
+          $resourceDir = Join-Path $env:RUNNER_TEMP "reaper-resource"
+          $result = Join-Path $env:RUNNER_TEMP "reaper-parameters.tsv"
+
+          Invoke-WebRequest -Uri https://www.reaper.fm/files/7.x/reaper779_x64-install.exe -OutFile $reaperInstaller
+          if ((Get-FileHash $reaperInstaller -Algorithm SHA256).Hash -ne "F07714D894A073DF40E88568F8AA524A74230F574B0688DF681F9B7C0877F9DF") {
+            throw "unexpected REAPER installer digest"
+          }
+          Invoke-WebRequest -Uri https://github.com/penguin425/denoize/releases/download/v0.82.0/denoize-plugin-v0.82.0-x86_64-pc-windows-msvc.zip -OutFile $pluginArchive
+          if ((Get-FileHash $pluginArchive -Algorithm SHA256).Hash -ne "358CE6399E70BDBBA6B58562B161444B6164C4A593C7B9C7B60927BBFBA9F1C0") {
+            throw "unexpected denoize v0.82.0 archive digest"
+          }
+
+          New-Item -ItemType Directory -Force $reaperDir, $pluginDir, $resourceDir | Out-Null
+          Start-Process -FilePath $reaperInstaller -ArgumentList "/S", "/D=$reaperDir" -Wait
+          Expand-Archive -LiteralPath $pluginArchive -DestinationPath $pluginDir
+          $reaper = Join-Path $reaperDir "reaper.exe"
+          $plugin = Get-ChildItem $pluginDir -Recurse -File -Filter "denoize.clap" |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not (Test-Path $reaper) -or -not $plugin) {
+            throw "REAPER or denoize.clap was not installed"
+          }
+
+          @("[reaper]", "loadlastproj=0", "warnmaxram64=0") |
+            Set-Content -LiteralPath (Join-Path $resourceDir "reaper.ini") -Encoding ascii
+
+          $env:CLAP_PATH = Split-Path $plugin
+          $env:DENOIZE_REAPER_RESULT = $result
+          $env:DENOIZE_REAPER_PLUGIN = "denoize Neural"
+          $env:DENOIZE_REAPER_OSARA_STYLE = "1"
+          $env:DENOIZE_REAPER_SET_DELAY = "1"
+          $arguments = @(
+            "-newinst",
+            "-cfgfile",
+            (Join-Path $resourceDir "reaper.ini"),
+            (Join-Path $env:GITHUB_WORKSPACE "scripts/reaper-clap-parameter-smoke.lua")
+          )
+          $process = Start-Process -FilePath $reaper -ArgumentList $arguments -PassThru
+          try {
+            $deadline = (Get-Date).AddSeconds(90)
+            do {
+              Start-Sleep -Milliseconds 500
+              if (Test-Path $result) {
+                $evidence = Get-Content -LiteralPath $result
+                if ($evidence -match '^summary\t') {
+                  break
+                }
+              }
+              if ($process.HasExited) {
+                throw "REAPER exited before producing parameter evidence"
+              }
+            } while ((Get-Date) -lt $deadline)
+          } finally {
+            if (-not $process.HasExited) {
+              Stop-Process -Id $process.Id -Force
+            }
+          }
+
+          if (-not (Test-Path $result)) {
+            throw "REAPER did not produce parameter evidence"
+          }
+          $evidence = Get-Content -LiteralPath $result
+          $evidence | ForEach-Object { Write-Host $_ }
+          $parameters = @($evidence | Where-Object { $_ -match '^parameter\t' })
+          if ($parameters.Count -ne 4 -or $evidence -notcontains "summary`t0") {
+            throw "one or more OSARA-visible Neural parameters were not adjustable"
+          }
