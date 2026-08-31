@@ -17,12 +17,24 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - case: regular v0.82.0 audio setup
+          - case: regular v0.82.0
             plugin: denoize
             parameters: 7
             normalized: 0
             archive_url: https://github.com/penguin425/denoize/releases/download/v0.82.0/denoize-plugin-v0.82.0-x86_64-pc-windows-msvc.zip
             archive_sha256: 358CE6399E70BDBBA6B58562B161444B6164C4A593C7B9C7B60927BBFBA9F1C0
+          - case: Neural v0.82.0
+            plugin: denoize Neural
+            parameters: 4
+            normalized: 0
+            archive_url: https://github.com/penguin425/denoize/releases/download/v0.82.0/denoize-plugin-v0.82.0-x86_64-pc-windows-msvc.zip
+            archive_sha256: 358CE6399E70BDBBA6B58562B161444B6164C4A593C7B9C7B60927BBFBA9F1C0
+          - case: Neural v0.90.0
+            plugin: denoize Neural
+            parameters: 4
+            normalized: 0
+            archive_url: https://github.com/penguin425/denoize/releases/download/v0.90.0/denoize-plugin-v0.90.0-x86_64-pc-windows-msvc.zip
+            archive_sha256: 4BCE101B95148DD5DF1FDF6DC095F7962F13082F54D4D8039BCA9AFB8BD93127
     steps:
       - name: Check out diagnostic script
         uses: actions/checkout@v6
