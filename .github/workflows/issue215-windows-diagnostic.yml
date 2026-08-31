@@ -17,28 +17,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - case: Neural v0.82.0
-            plugin: denoize Neural
-            parameters: 4
-            normalized: 0
-            archive_url: https://github.com/penguin425/denoize/releases/download/v0.82.0/denoize-plugin-v0.82.0-x86_64-pc-windows-msvc.zip
-            archive_sha256: 358CE6399E70BDBBA6B58562B161444B6164C4A593C7B9C7B60927BBFBA9F1C0
-          - case: Neural v0.82.0 normalized
-            plugin: denoize Neural
-            parameters: 4
-            normalized: 1
-            archive_url: https://github.com/penguin425/denoize/releases/download/v0.82.0/denoize-plugin-v0.82.0-x86_64-pc-windows-msvc.zip
-            archive_sha256: 358CE6399E70BDBBA6B58562B161444B6164C4A593C7B9C7B60927BBFBA9F1C0
-          - case: regular v0.82.0
+          - case: regular v0.82.0 audio setup
             plugin: denoize
             parameters: 7
             normalized: 0
-            archive_url: https://github.com/penguin425/denoize/releases/download/v0.82.0/denoize-plugin-v0.82.0-x86_64-pc-windows-msvc.zip
-            archive_sha256: 358CE6399E70BDBBA6B58562B161444B6164C4A593C7B9C7B60927BBFBA9F1C0
-          - case: regular v0.82.0 normalized
-            plugin: denoize
-            parameters: 7
-            normalized: 1
             archive_url: https://github.com/penguin425/denoize/releases/download/v0.82.0/denoize-plugin-v0.82.0-x86_64-pc-windows-msvc.zip
             archive_sha256: 358CE6399E70BDBBA6B58562B161444B6164C4A593C7B9C7B60927BBFBA9F1C0
     steps:
@@ -124,9 +106,13 @@ jobs:
           $env:DENOIZE_REAPER_PLAY = "1"
           Add-Type @"
           using System;
+          using System.Collections.Generic;
           using System.Runtime.InteropServices;
+          using System.Text;
 
           public static class ReaperDialog {
+              public delegate bool EnumWindowsProc(IntPtr window, IntPtr data);
+
               [DllImport("user32.dll", CharSet = CharSet.Unicode)]
               public static extern IntPtr FindWindow(string className, string windowName);
 
@@ -142,12 +128,77 @@ jobs:
               public static extern IntPtr GetDlgItem(IntPtr dialog, int controlId);
 
               [DllImport("user32.dll")]
+              public static extern int GetDlgCtrlID(IntPtr window);
+
+              [DllImport("user32.dll")]
+              public static extern IntPtr GetParent(IntPtr window);
+
+              [DllImport("user32.dll")]
+              public static extern bool IsWindowVisible(IntPtr window);
+
+              [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+              public static extern int GetClassName(
+                  IntPtr window,
+                  StringBuilder className,
+                  int maximum
+              );
+
+              [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+              public static extern int GetWindowText(
+                  IntPtr window,
+                  StringBuilder text,
+                  int maximum
+              );
+
+              [DllImport("user32.dll")]
+              public static extern bool EnumChildWindows(
+                  IntPtr parent,
+                  EnumWindowsProc callback,
+                  IntPtr data
+              );
+
+              [DllImport("user32.dll")]
               public static extern IntPtr SendMessage(
                   IntPtr window,
                   uint message,
                   IntPtr word,
                   IntPtr data
               );
+
+              [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "SendMessageW")]
+              public static extern IntPtr SendMessageString(
+                  IntPtr window,
+                  uint message,
+                  IntPtr word,
+                  StringBuilder data
+              );
+
+              public static IntPtr[] Descendants(IntPtr parent) {
+                  var children = new List<IntPtr>();
+                  EnumChildWindows(parent, delegate(IntPtr window, IntPtr data) {
+                      children.Add(window);
+                      return true;
+                  }, IntPtr.Zero);
+                  return children.ToArray();
+              }
+
+              public static string ClassName(IntPtr window) {
+                  var value = new StringBuilder(256);
+                  GetClassName(window, value, value.Capacity);
+                  return value.ToString();
+              }
+
+              public static string WindowText(IntPtr window) {
+                  var value = new StringBuilder(1024);
+                  GetWindowText(window, value, value.Capacity);
+                  return value.ToString();
+              }
+
+              public static string ComboItem(IntPtr combo, int index) {
+                  var value = new StringBuilder(1024);
+                  SendMessageString(combo, 0x0148, new IntPtr(index), value);
+                  return value.ToString();
+              }
           }
           "@
           $arguments = @(
@@ -157,12 +208,15 @@ jobs:
             (Join-Path $env:GITHUB_WORKSPACE "scripts/reaper-clap-parameter-smoke.lua")
           )
           $process = Start-Process -FilePath $reaper -ArgumentList $arguments -PassThru
+          $promptAccepted = $false
+          $preferencesConfigured = $false
+          $windowEvidence = [System.Collections.Generic.List[string]]::new()
           try {
             $deadline = (Get-Date).AddSeconds(30)
             do {
               Start-Sleep -Milliseconds 500
               $dialog = [ReaperDialog]::FindWindow("#32770", "REAPER")
-              if ($dialog -ne [IntPtr]::Zero) {
+              if (-not $promptAccepted -and $dialog -ne [IntPtr]::Zero) {
                 $yesButton = [ReaperDialog]::GetDlgItem($dialog, 6)
                 if ($yesButton -ne [IntPtr]::Zero) {
                   [void][ReaperDialog]::SendMessage(
@@ -171,18 +225,73 @@ jobs:
                     [IntPtr]::Zero,
                     [IntPtr]::Zero
                   )
+                  $promptAccepted = $true
+                  $windowEvidence.Add("accepted audio setup prompt")
                 }
               }
               $preferences = [ReaperDialog]::FindWindow("#32770", "REAPER Preferences")
-              if ($preferences -ne [IntPtr]::Zero) {
-                $okButton = [ReaperDialog]::GetDlgItem($preferences, 1)
-                if ($okButton -ne [IntPtr]::Zero) {
+              if (-not $preferencesConfigured -and $preferences -ne [IntPtr]::Zero) {
+                $dummyAudioSelected = $false
+                foreach ($child in [ReaperDialog]::Descendants($preferences)) {
+                  $className = [ReaperDialog]::ClassName($child)
+                  $controlId = [ReaperDialog]::GetDlgCtrlID($child)
+                  $text = [ReaperDialog]::WindowText($child)
+                  $visible = [ReaperDialog]::IsWindowVisible($child)
+                  $windowEvidence.Add(
+                    "$child`t$className`t$controlId`t$visible`t$text"
+                  )
+                  if ($className -ne "ComboBox" -or $controlId -ne 1000) {
+                    continue
+                  }
+                  $count = [int][ReaperDialog]::SendMessage(
+                    $child,
+                    0x0146,
+                    [IntPtr]::Zero,
+                    [IntPtr]::Zero
+                  )
+                  for ($index = 0; $index -lt $count; $index++) {
+                    $item = [ReaperDialog]::ComboItem($child, $index)
+                    $windowEvidence.Add("combo 1000 item $index`t$item")
+                    if ($item -eq "Dummy Audio") {
+                      [void][ReaperDialog]::SendMessage(
+                        $child,
+                        0x014E,
+                        [IntPtr]$index,
+                        [IntPtr]::Zero
+                      )
+                      $parent = [ReaperDialog]::GetParent($child)
+                      [void][ReaperDialog]::SendMessage(
+                        $parent,
+                        0x0111,
+                        [IntPtr](1000 -bor (1 -shl 16)),
+                        $child
+                      )
+                      $dummyAudioSelected = $true
+                      $windowEvidence.Add("selected Dummy Audio at combo index $index")
+                      break
+                    }
+                  }
+                }
+                if ($dummyAudioSelected) {
+                  Start-Sleep -Milliseconds 500
+                  $applyButton = [ReaperDialog]::GetDlgItem($preferences, 1144)
+                  if ($applyButton -ne [IntPtr]::Zero) {
+                    [void][ReaperDialog]::SendMessage(
+                      $applyButton,
+                      0x00F5,
+                      [IntPtr]::Zero,
+                      [IntPtr]::Zero
+                    )
+                  }
+                  Start-Sleep -Milliseconds 500
+                  $okButton = [ReaperDialog]::GetDlgItem($preferences, 1)
                   [void][ReaperDialog]::SendMessage(
                     $okButton,
                     0x00F5,
                     [IntPtr]::Zero,
                     [IntPtr]::Zero
                   )
+                  $preferencesConfigured = $true
                 }
               }
               if (Test-Path $result) {
@@ -196,6 +305,10 @@ jobs:
               }
             } while ((Get-Date) -lt $deadline)
           } finally {
+            $windowEvidence |
+              Set-Content -LiteralPath (Join-Path $diagnosticDir "windows.tsv")
+            Copy-Item -LiteralPath (Join-Path $resourceDir "reaper.ini") `
+              -Destination (Join-Path $diagnosticDir "reaper.ini") -Force
             if (-not (Test-Path $result)) {
               Get-Process reaper -ErrorAction SilentlyContinue |
                 Format-List Id, ProcessName, MainWindowHandle, MainWindowTitle, Responding |
