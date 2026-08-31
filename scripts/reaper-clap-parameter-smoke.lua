@@ -148,6 +148,12 @@ local function verify_after_host_flush()
 end
 
 local function set_parameters()
+  write_line(
+    "host",
+    reaper.GetPlayState(),
+    reaper.TrackFX_GetEnabled(track, fx),
+    reaper.TrackFX_GetOffline(track, fx)
+  )
   local normalized = os.getenv("DENOIZE_REAPER_NORMALIZED") == "1"
   local plugin_parameter_count = tonumber(
     os.getenv("DENOIZE_REAPER_PLUGIN_PARAMETER_COUNT") or ""
