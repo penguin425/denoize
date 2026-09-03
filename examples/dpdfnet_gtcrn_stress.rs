@@ -445,7 +445,15 @@ fn run_dpdfnet_daw_threads(
         // window so its workgroup and performance controller are established
         // before the direct timing samples begin.
         let mut priority_guard = denoize::neural_daw::NeuralDawWorkerPriorityGuard::acquire()?;
-        for _ in 0..WARMUP_CALLS {
+        let warmup_started = Instant::now();
+        for index in 0..WARMUP_CALLS {
+            if realtime_paced {
+                let due =
+                    warmup_started + Duration::from_micros((index as u64).saturating_mul(10_000));
+                while let Some(delay) = due.checked_duration_since(Instant::now()) {
+                    std::thread::park_timeout(delay.min(DAW_WORKER_POLL));
+                }
+            }
             priority_guard.run_inference_cycle(|| stream.process_block(&input))?;
         }
         stream.reset()?;
