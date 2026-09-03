@@ -104,10 +104,11 @@ its own specification warns that synchronization may violate hard real-time
 rules and `request_exec` waits for completion.
 
 On Windows, the named worker joins the `Pro Audio` Multimedia Class Scheduler
-Service task after model preparation and warm-up, and before activation reports
-it ready. If registration fails, neural inference stays unavailable and the
-fixed-latency fallback remains active. The worker leaves the task when it exits;
-other platforms retain their native scheduler behavior.
+Service task at its critical relative priority after model preparation and
+warm-up, and before activation reports it ready. If either scheduling step
+fails, neural inference stays unavailable and the fixed-latency fallback
+remains active. The worker leaves the task when it exits; other platforms
+retain their native scheduler behavior.
 
 Automated REAPER evidence separates device priming from sustained processing.
 REAPER's Dummy Audio device can request about one output-buffer horizon faster
@@ -137,6 +138,12 @@ The callback never waits for a late result and never changes the reported
 latency. Bypass is also delayed, so host plug-in-delay compensation and A/B
 switching stay aligned. Neural output that arrives after its block deadline is
 discarded rather than leaking into a later time position.
+
+The named `Bypass` control is a persistent, automatable DSP parameter and is
+kept separate from the CLAP host-level bypass flag. REAPER merges a parameter
+carrying that flag with its own FX bypass state and can overwrite a repeated
+keyboard/OSARA change; keeping the two controls separate preserves the named
+latency-aligned state while the host's ordinary FX bypass remains available.
 
 ## Ports, automation, and state
 

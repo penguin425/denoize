@@ -70,10 +70,12 @@ Copy-Item -LiteralPath $PluginBinary -Destination $plugin
 $sampleRate = 48000
 $evidenceWarmupFrames = 46080
 $measurementDelaySeconds = $DurationSeconds + 1
-# Keep the media item longer than the measured interval. A repeated short item
-# introduces transport discontinuities and recurrent-state resets into what is
-# intended to be a sustained real-time scheduling measurement.
-$sampleCount = $sampleRate * ($DurationSeconds + 10)
+# Keep the media item well beyond the measured interval. REAPER's Dummy Audio
+# device can advance the project timeline faster than wall time on hosted
+# runners; the repeated Bypass probe must still run while transport is active.
+# A repeated short item would introduce discontinuities and recurrent-state
+# resets into the sustained scheduling measurement.
+$sampleCount = $sampleRate * ($DurationSeconds + 120)
 $dataSize = $sampleCount * 2
 $writer = [System.IO.BinaryWriter]::new([System.IO.File]::Create($tone))
 try {
@@ -143,6 +145,8 @@ $env:DENOIZE_REAPER_REPEAT = "0"
 $env:DENOIZE_REAPER_OPEN_AUDIO_DEVICE = "1"
 $env:DENOIZE_REAPER_REMOVE_FX = "1"
 $env:DENOIZE_REAPER_PLUGIN_PARAMETER_COUNT = "4"
+$env:DENOIZE_REAPER_BYPASS_LATCH = "1"
+$env:DENOIZE_REAPER_REQUIRE_PLAYING = "1"
 
 $arguments = @(
   "-newinst", "-cfgfile", (Join-Path $resourceDir "reaper.ini"),
@@ -192,7 +196,7 @@ try {
     }
     if (Test-Path -LiteralPath $result) {
       $lines = Get-Content -LiteralPath $result
-      if ($lines -contains "complete`t0") { break }
+      if (@($lines | Where-Object { $_ -match '^complete\t' }).Count -gt 0) { break }
     }
     if ($process.HasExited) { throw "REAPER exited before completing the DPDFNet run" }
   } while ((Get-Date) -lt $deadline)
@@ -227,23 +231,56 @@ try {
 $lines = Get-Content -LiteralPath $result
 $parameters = @($lines | Where-Object { $_ -match '^parameter\t' })
 $osara = @($lines | Where-Object { $_ -match '^osara\t' })
+$bypassLatch = @($lines | Where-Object { $_ -match '^bypass-latch\t' })
 $names = @($parameters | ForEach-Object { ($_ -split "`t")[2] })
 $expectedNames = @("Bypass", "Mix", "Output Gain", "Overload Fallback")
 if ($parameters.Count -ne 4 -or $osara.Count -ne 4 -or
+  $bypassLatch.Count -ne 4 -or
   @(Compare-Object $expectedNames $names).Count -ne 0 -or
   $lines -notcontains "performance`tno-anticipative-fx`ttrue" -or
   $lines -notcontains "transport`trepeat`tfalse" -or
+  $lines -notcontains "bypass-latch-summary`t0" -or
   $lines -notcontains "removed`ttrue" -or $lines -notcontains "complete`t0") {
   throw "REAPER/OSARA-style parameter evidence did not pass"
 }
+$expectedBypassStages = @(
+  @{ Name = "on-1"; Target = 1.0; Applied = "true" },
+  @{ Name = "off"; Target = 0.0; Applied = "true" },
+  @{ Name = "on-2"; Target = 1.0; Applied = "true" },
+  @{ Name = "on-2-held"; Target = 1.0; Applied = "false" }
+)
+for ($index = 0; $index -lt $expectedBypassStages.Count; $index++) {
+  $fields = $bypassLatch[$index] -split "`t"
+  $expected = $expectedBypassStages[$index]
+  if ($fields.Count -ne 10 -or $fields[1] -ne $expected.Name -or
+    [Math]::Abs([double]$fields[2] - $expected.Target) -gt 1e-9 -or
+    $fields[3] -ne $expected.Applied -or $fields[4] -ne "true" -or
+    [Math]::Abs([double]$fields[5] - $expected.Target) -gt 1e-9 -or
+    $fields[6] -ne "true" -or $fields[7] -ne "true" -or
+    $fields[8] -ne "false" -or
+    (([int]$fields[9] -band 1) -ne 1)) {
+    throw "REAPER did not retain the repeated Bypass sequence"
+  }
+}
 $hostEvidence = Get-Content -LiteralPath $hostRun -Raw | ConvertFrom-Json
-if ($hostEvidence.model_id -ne "dpdfnet2-48khz-hr" -or
+if ($hostEvidence.schema -ne "denoize-dpdfnet-clap-host-run-v2" -or
+  $hostEvidence.schema_version -ne 2 -or
+  $hostEvidence.model_id -ne "dpdfnet2-48khz-hr" -or
   $hostEvidence.source_commit -ne $SourceCommit -or
   -not $hostEvidence.worker_started -or -not $hostEvidence.finished_gracefully -or
   $hostEvidence.active_seconds -lt $measurementDelaySeconds -or
   $hostEvidence.measurement.warmup_frames -ne $evidenceWarmupFrames -or
   $hostEvidence.measurement.measured_frames -lt ($DurationSeconds * $sampleRate) -or
   $hostEvidence.measurement.measured_frames -ne ($hostEvidence.processed_frames - $hostEvidence.measurement.warmup_frames) -or
+  $hostEvidence.host_audio_configuration.min_frames_count -lt 1 -or
+  $hostEvidence.host_audio_configuration.max_frames_count -lt
+    $hostEvidence.host_audio_configuration.min_frames_count -or
+  $hostEvidence.callback_frames.calls -lt 1 -or
+  $hostEvidence.callback_frames.minimum -lt
+    $hostEvidence.host_audio_configuration.min_frames_count -or
+  $hostEvidence.callback_frames.maximum -lt $hostEvidence.callback_frames.minimum -or
+  $hostEvidence.callback_frames.maximum -gt
+    $hostEvidence.host_audio_configuration.max_frames_count -or
   $hostEvidence.metrics.overload_blocks -ne 0 -or $hostEvidence.metrics.late_blocks -ne 0 -or
   $hostEvidence.metrics.invalid_blocks -ne 0 -or $hostEvidence.metrics.worker_errors -ne 0 -or
   $hostEvidence.lifetime_metrics.worker_errors -ne 0) {
