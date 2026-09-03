@@ -545,17 +545,31 @@ impl StreamingProcessor {
             .model_input_frames
             .checked_add(frames)
             .ok_or_else(|| "DPDFNet model input length overflow".to_string())?;
+        let remaining = self
+            .model_input_frames
+            .checked_sub(self.model_output_frames)
+            .ok_or_else(|| "DPDFNet model output exceeded its input clock".to_string())?;
+        if frames == HOP_SIZE && self.pending_model_rate.iter().all(VecDeque::is_empty) {
+            for (channel, hop) in input.iter().zip(&mut self.hop_scratch) {
+                for (&source, destination) in channel.iter().zip(hop) {
+                    *destination = crate::audio::sanitize_sample(source) as f32;
+                }
+            }
+            let mut output = empty_output(self.channels, remaining.min(HOP_SIZE))?;
+            self.process_scratch_hop(&mut output)?;
+            return Ok(output);
+        }
         for (pending, channel) in self.pending_model_rate.iter_mut().zip(input) {
             pending
                 .try_reserve(channel.len())
                 .map_err(|_| "unable to grow DPDFNet pending input".to_string())?;
             pending.extend(channel.iter().copied());
         }
-        let reserve = self
-            .model_input_frames
-            .checked_sub(self.model_output_frames)
-            .ok_or_else(|| "DPDFNet model output exceeded its input clock".to_string())?;
-        let mut output = empty_output(self.channels, reserve)?;
+        let ready_frames = self
+            .pending_model_rate
+            .first()
+            .map_or(0, |pending| pending.len() / HOP_SIZE * HOP_SIZE);
+        let mut output = empty_output(self.channels, remaining.min(ready_frames))?;
         while self
             .pending_model_rate
             .first()
@@ -1149,8 +1163,26 @@ mod tests {
         let mut output = stream.process_block(&[input.clone()]).unwrap().remove(0);
         output.extend(stream.finish().unwrap().remove(0));
 
+        stream.reset();
+        let mut exact_hops = Vec::new();
+        for block in input.chunks(HOP_SIZE) {
+            exact_hops.extend(stream.process_block(&[block.to_vec()]).unwrap().remove(0));
+            if block.len() == HOP_SIZE {
+                assert!(stream.pending_model_rate.iter().all(VecDeque::is_empty));
+            }
+        }
+        exact_hops.extend(stream.finish().unwrap().remove(0));
+
         assert_eq!(output.len(), input.len());
+        assert_eq!(exact_hops.len(), input.len());
         assert!(output.iter().all(|sample| sample.is_finite()));
+        assert!(exact_hops.iter().all(|sample| sample.is_finite()));
+        let maximum = output
+            .iter()
+            .zip(&exact_hops)
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0f64, f64::max);
+        assert!(maximum < 1e-6, "exact-hop maximum difference was {maximum}");
     }
 
     fn write_identity_model() -> (tempfile::TempDir, std::path::PathBuf) {
