@@ -150,6 +150,7 @@ end
 
 local probes = {}
 local bypass_latch_failures = 0
+local require_playing = os.getenv("DENOIZE_REAPER_REQUIRE_PLAYING") == "1"
 local verify_started = nil
 local function verify_after_host_flush()
   if reaper.time_precise() - verify_started < 0.75 then
@@ -213,7 +214,9 @@ local function exercise_repeated_bypass(probe)
 
       local observed = reaper.TrackFX_GetParam(track, fx, probe.parameter)
       local matched = math.abs(observed - stage.target) <= 1e-9
-      if not set_accepted or not matched then
+      local play_state = reaper.GetPlayState()
+      local playing = (play_state & 1) == 1
+      if not set_accepted or not matched or (require_playing and not playing) then
         bypass_latch_failures = bypass_latch_failures + 1
       end
       write_line(
@@ -226,7 +229,7 @@ local function exercise_repeated_bypass(probe)
         tostring(matched),
         tostring(reaper.TrackFX_GetEnabled(track, fx)),
         tostring(reaper.TrackFX_GetOffline(track, fx)),
-        reaper.GetPlayState()
+        play_state
       )
     end
 
@@ -392,13 +395,50 @@ if os.getenv("DENOIZE_REAPER_PLAY") == "1" then
 end
 
 if set_delay > 0 then
+  local function set_parameters_while_playing()
+    local play_state = reaper.GetPlayState()
+    write_line(
+      "transport-before-parameters",
+      play_state,
+      string.format("%.17g", reaper.GetPlayPosition()),
+      string.format("%.17g", reaper.GetProjectLength(0))
+    )
+    if not require_playing or (play_state & 1) == 1 then
+      set_parameters()
+      return
+    end
+
+    -- Selecting or restarting an audio device can stop a fresh REAPER
+    -- transport independently of the plug-in. Rewind and resume before the
+    -- latch sequence so every observation is made during live processing.
+    reaper.SetEditCurPos(0, false, false)
+    reaper.Main_OnCommand(1007, 0)
+    local resume_started = reaper.time_precise()
+    local function wait_for_resume()
+      local resumed_state = reaper.GetPlayState()
+      if (resumed_state & 1) == 1 then
+        write_line("transport-resumed", resumed_state)
+        set_parameters()
+        return
+      end
+      if reaper.time_precise() - resume_started >= 5.0 then
+        bypass_latch_failures = bypass_latch_failures + 1
+        write_line("transport-resume-failed", resumed_state)
+        set_parameters()
+        return
+      end
+      reaper.defer(wait_for_resume)
+    end
+    reaper.defer(wait_for_resume)
+  end
+
   local function set_after_delay()
     if playback_started == nil or
       reaper.time_precise() - playback_started < set_delay then
       reaper.defer(set_after_delay)
       return
     end
-    set_parameters()
+    set_parameters_while_playing()
   end
   reaper.defer(set_after_delay)
 end

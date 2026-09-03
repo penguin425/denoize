@@ -146,6 +146,7 @@ $env:DENOIZE_REAPER_OPEN_AUDIO_DEVICE = "1"
 $env:DENOIZE_REAPER_REMOVE_FX = "1"
 $env:DENOIZE_REAPER_PLUGIN_PARAMETER_COUNT = "4"
 $env:DENOIZE_REAPER_BYPASS_LATCH = "1"
+$env:DENOIZE_REAPER_REQUIRE_PLAYING = "1"
 
 $arguments = @(
   "-newinst", "-cfgfile", (Join-Path $resourceDir "reaper.ini"),
@@ -195,7 +196,7 @@ try {
     }
     if (Test-Path -LiteralPath $result) {
       $lines = Get-Content -LiteralPath $result
-      if ($lines -contains "complete`t0") { break }
+      if (@($lines | Where-Object { $_ -match '^complete\t' }).Count -gt 0) { break }
     }
     if ($process.HasExited) { throw "REAPER exited before completing the DPDFNet run" }
   } while ((Get-Date) -lt $deadline)
