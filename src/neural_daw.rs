@@ -23,14 +23,20 @@ pub const NEURAL_DAW_LATENCY_CHUNKS: u32 = 24;
 pub const NEURAL_DAW_LATENCY_POLICY: &str = "fixed-24x10ms-worker-v1";
 pub const NEURAL_DAW_MAX_SAMPLE_RATE: u32 = crate::daw::DAW_MAX_SAMPLE_RATE;
 
+#[cfg(target_os = "macos")]
+const MACOS_NEURAL_PERIOD_NANOS: u64 = NEURAL_DAW_CHUNK_MILLIS as u64 * 1_000_000;
+#[cfg(target_os = "macos")]
+const MACOS_NEURAL_COMPUTATION_NANOS: u64 = MACOS_NEURAL_PERIOD_NANOS * 4 / 5;
+
 /// Keeps the neural inference worker in the platform's interactive audio class.
 ///
 /// The CLAP audio callback only exchanges bounded queue entries with the
 /// worker, but Windows DAWs can run that callback in the `Pro Audio` class.
 /// Keeping the dependent inference worker at ordinary priority can therefore
 /// starve it even when the model's measured compute time is below its buffered
-/// deadline. Windows uses the `Pro Audio` MMCSS task and macOS uses interactive
-/// QoS; other platforms deliberately keep their existing scheduling.
+/// deadline. Windows uses the `Pro Audio` MMCSS task. macOS combines
+/// interactive QoS with a 10 ms Mach time constraint; other platforms
+/// deliberately keep their existing scheduling.
 #[doc(hidden)]
 #[must_use = "dropping the guard releases the neural worker scheduling class"]
 pub struct NeuralDawWorkerPriorityGuard {
@@ -40,6 +46,10 @@ pub struct NeuralDawWorkerPriorityGuard {
     previous_qos_class: libc::qos_class_t,
     #[cfg(target_os = "macos")]
     previous_relative_priority: libc::c_int,
+    #[cfg(target_os = "macos")]
+    mach_thread: mach2::port::mach_port_t,
+    #[cfg(target_os = "macos")]
+    previous_time_constraint: mach2::thread_policy::thread_time_constraint_policy_data_t,
     // Both platform APIs must be reverted on the thread that acquired them.
     // Make that invariant a type property instead of relying on callers.
     #[cfg(any(windows, target_os = "macos"))]
@@ -109,9 +119,30 @@ impl NeuralDawWorkerPriorityGuard {
                     std::io::Error::from_raw_os_error(result)
                 ));
             }
+            let (mach_thread, previous_time_constraint) =
+                acquire_macos_time_constraint().map_err(|error| {
+                    // The QoS change already succeeded. Restore it before
+                    // returning so failed activation cannot leak priority.
+                    let restore = unsafe {
+                        libc::pthread_set_qos_class_self_np(
+                            previous_qos_class,
+                            previous_relative_priority,
+                        )
+                    };
+                    if restore == 0 {
+                        error
+                    } else {
+                        format!(
+                            "{error}; restore macOS QoS after failure: {}",
+                            std::io::Error::from_raw_os_error(restore)
+                        )
+                    }
+                })?;
             Ok(Self {
                 previous_qos_class,
                 previous_relative_priority,
+                mach_thread,
+                previous_time_constraint,
                 _not_send: std::marker::PhantomData,
             })
         }
@@ -142,6 +173,28 @@ impl Drop for NeuralDawWorkerPriorityGuard {
 
         #[cfg(target_os = "macos")]
         {
+            use libc::thread_policy_t;
+            use mach2::kern_return::KERN_SUCCESS;
+            use mach2::thread_policy::{
+                thread_policy_set, THREAD_TIME_CONSTRAINT_POLICY,
+                THREAD_TIME_CONSTRAINT_POLICY_COUNT,
+            };
+
+            // Restore the exact Mach scheduling policy captured on this
+            // pthread before returning it to its previous QoS class.
+            let result = unsafe {
+                thread_policy_set(
+                    self.mach_thread,
+                    THREAD_TIME_CONSTRAINT_POLICY,
+                    (&mut self.previous_time_constraint as *mut _) as thread_policy_t,
+                    THREAD_TIME_CONSTRAINT_POLICY_COUNT,
+                )
+            };
+            if result != KERN_SUCCESS {
+                eprintln!(
+                    "denoize Neural worker could not restore macOS time constraint: Mach error {result}"
+                );
+            }
             // SAFETY: the guard is !Send, so it is dropped on the acquiring
             // pthread. Both values were returned by pthread_get_qos_class_np.
             let result = unsafe {
@@ -158,6 +211,101 @@ impl Drop for NeuralDawWorkerPriorityGuard {
             }
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn acquire_macos_time_constraint() -> Result<
+    (
+        mach2::port::mach_port_t,
+        mach2::thread_policy::thread_time_constraint_policy_data_t,
+    ),
+    String,
+> {
+    use libc::thread_policy_t;
+    use mach2::boolean::boolean_t;
+    use mach2::kern_return::KERN_SUCCESS;
+    use mach2::mach_time::{mach_timebase_info, mach_timebase_info_data_t};
+    use mach2::message::mach_msg_type_number_t;
+    use mach2::thread_policy::{
+        thread_policy_get, thread_policy_set, thread_time_constraint_policy_data_t,
+        THREAD_TIME_CONSTRAINT_POLICY, THREAD_TIME_CONSTRAINT_POLICY_COUNT,
+    };
+
+    // pthread_mach_thread_np returns the non-owning Mach port for this exact
+    // pthread, so the guard does not allocate a send right that needs separate
+    // deallocation.
+    let thread = unsafe { libc::pthread_mach_thread_np(libc::pthread_self()) };
+    if thread == 0 {
+        return Err("resolve neural inference worker Mach thread".into());
+    }
+
+    let mut previous = thread_time_constraint_policy_data_t {
+        period: 0,
+        computation: 0,
+        constraint: 0,
+        preemptible: 0,
+    };
+    let mut count: mach_msg_type_number_t = THREAD_TIME_CONSTRAINT_POLICY_COUNT;
+    let mut get_default: boolean_t = 0;
+    // SAFETY: the port represents the calling pthread and both output buffers
+    // are valid for the declared Mach policy size.
+    let result = unsafe {
+        thread_policy_get(
+            thread,
+            THREAD_TIME_CONSTRAINT_POLICY,
+            (&mut previous as *mut _) as thread_policy_t,
+            &mut count,
+            &mut get_default,
+        )
+    };
+    if result != KERN_SUCCESS || count != THREAD_TIME_CONSTRAINT_POLICY_COUNT {
+        return Err(format!(
+            "read neural inference worker macOS time constraint: Mach error {result}"
+        ));
+    }
+
+    let mut timebase = mach_timebase_info_data_t { numer: 0, denom: 0 };
+    // SAFETY: timebase is a valid writable structure.
+    let result = unsafe { mach_timebase_info(&mut timebase) };
+    if result != KERN_SUCCESS || timebase.numer == 0 || timebase.denom == 0 {
+        return Err(format!(
+            "read macOS Mach timebase for neural worker: Mach error {result}"
+        ));
+    }
+    let absolute_ticks = |nanoseconds: u64| -> Result<u32, String> {
+        let ticks = nanoseconds
+            .checked_mul(u64::from(timebase.denom))
+            .and_then(|value| value.checked_div(u64::from(timebase.numer)))
+            .ok_or_else(|| "convert neural worker period to Mach absolute time".to_string())?;
+        u32::try_from(ticks)
+            .map_err(|_| "neural worker Mach time constraint exceeds u32".to_string())
+    };
+
+    // XNU defines these values as the periodic arrival interval, nominal CPU
+    // demand, and completion deadline. Reserving 8 ms of each 10 ms audio
+    // period covers the measured model tail without changing the 10 ms gate.
+    let mut active = thread_time_constraint_policy_data_t {
+        period: absolute_ticks(MACOS_NEURAL_PERIOD_NANOS)?,
+        computation: absolute_ticks(MACOS_NEURAL_COMPUTATION_NANOS)?,
+        constraint: absolute_ticks(MACOS_NEURAL_PERIOD_NANOS)?,
+        preemptible: 1,
+    };
+    // SAFETY: this changes only the calling pthread. The !Send guard retains
+    // its prior policy and restores it on this same thread.
+    let result = unsafe {
+        thread_policy_set(
+            thread,
+            THREAD_TIME_CONSTRAINT_POLICY,
+            (&mut active as *mut _) as thread_policy_t,
+            THREAD_TIME_CONSTRAINT_POLICY_COUNT,
+        )
+    };
+    if result != KERN_SUCCESS {
+        return Err(format!(
+            "register neural inference worker with macOS time constraint: Mach error {result}"
+        ));
+    }
+    Ok((thread, previous))
 }
 
 /// Closed model identities exposed by the off-callback neural plug-ins.
