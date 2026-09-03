@@ -184,6 +184,7 @@ jobs:
       - name: Measure production DPDFNet DAW path
         shell: bash
         env:
+          DENOIZE_MACOS_SCHEDULING_EVIDENCE: "1"
           RAYON_NUM_THREADS: "1"
           OMP_NUM_THREADS: "1"
         run: |
@@ -193,7 +194,14 @@ jobs:
             --model dpdfnet-daw --model-path "$DPDFNET_MODEL" \
             --seconds "$seconds" --parallel 1 \
             --realtime-paced \
-            --json "$DENOIZE_EVIDENCE_DIR/stress.json"
+            --json "$DENOIZE_EVIDENCE_DIR/stress.json" \
+            2>&1 | tee "$DENOIZE_EVIDENCE_DIR/stress-run.log"
+          if [[ "$RUNNER_OS" == macOS ]]; then
+            expected_cycles=$((seconds * 100))
+            grep -Fx \
+              "DENOIZE_MACOS_AUDIO_WORK_INTERVAL started_cycles=$expected_cycles finished_cycles=$expected_cycles start_failures=0 finish_failures=0" \
+              "$DENOIZE_EVIDENCE_DIR/stress-run.log"
+          fi
 
       - name: Exercise paced experimental CLAP worker
         shell: bash

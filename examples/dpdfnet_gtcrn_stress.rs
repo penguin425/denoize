@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 const DAW_SAMPLE_RATE: u32 = 48_000;
 const DAW_BLOCK_FRAMES: usize = 480;
+const DAW_WORKER_POLL: Duration = Duration::from_micros(100);
 const WARMUP_CALLS: usize = 100;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -455,8 +456,12 @@ fn run_dpdfnet_daw_threads(
             if realtime_paced {
                 let due =
                     wall_started + Duration::from_micros((index as u64).saturating_mul(10_000));
-                if let Some(delay) = due.checked_duration_since(Instant::now()) {
-                    std::thread::sleep(delay);
+                // Match the released worker's bounded idle polling. A single
+                // full-period sleep adds scheduler wake-up latency that the
+                // production worker does not incur because it checks its
+                // input queue every 100 microseconds.
+                while let Some(delay) = due.checked_duration_since(Instant::now()) {
+                    std::thread::park_timeout(delay.min(DAW_WORKER_POLL));
                 }
             }
             let started = Instant::now();
