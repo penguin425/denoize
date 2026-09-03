@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-dpdfnet-blind-answer-key-v2.schema.json",
+  "title": "denoize recovered private DPDFNet blinded-listening answer key v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "schema_version", "bundle_id", "protocol_sha256", "source_matrix_sha256", "recovery", "trials"],
+  "properties": {
+    "schema": { "const": "denoize-dpdfnet-blind-answer-key-v2" },
+    "schema_version": { "const": 2 },
+    "bundle_id": { "$ref": "#/$defs/id" },
+    "protocol_sha256": { "$ref": "#/$defs/sha256" },
+    "source_matrix_sha256": { "$ref": "#/$defs/sha256" },
+    "recovery": { "$ref": "#/$defs/recovery" },
+    "trials": {
+      "type": "array",
+      "minItems": 16,
+      "maxItems": 16,
+      "items": { "$ref": "#/$defs/trial" }
+    }
+  },
+  "$defs": {
+    "id": { "type": "string", "pattern": "^[0-9a-f]{24}$" },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "model": { "enum": ["dpdfnet2-48khz-hr", "gtcrn-dns3"] },
+    "recovery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["method", "core_selection", "candidate_audio_manifest_sha256", "source_case_count"],
+      "properties": {
+        "method": { "const": "named-output-sha256-v1" },
+        "core_selection": { "const": "lexicographically-smallest-trial-id-v1" },
+        "candidate_audio_manifest_sha256": { "$ref": "#/$defs/sha256" },
+        "source_case_count": { "const": 12 }
+      }
+    },
+    "trial": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["trial_id", "source_case_id", "stratum", "role", "duplicate_of", "a_model", "b_model", "a_sha256", "b_sha256"],
+      "properties": {
+        "trial_id": { "$ref": "#/$defs/id" },
+        "source_case_id": { "type": "string", "pattern": "^[A-Za-z0-9._+-]{1,128}$" },
+        "stratum": { "enum": ["recorded-noise", "babble", "source-preservation", "synthetic-noise"] },
+        "role": { "enum": ["core", "repeat"] },
+        "duplicate_of": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/id" }] },
+        "a_model": { "$ref": "#/$defs/model" },
+        "b_model": { "$ref": "#/$defs/model" },
+        "a_sha256": { "$ref": "#/$defs/sha256" },
+        "b_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    }
+  }
+}

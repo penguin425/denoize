@@ -16,6 +16,7 @@ from typing import Any
 
 MODEL_DPDFNET = "dpdfnet2-48khz-hr"
 MODEL_GTCRN = "gtcrn-dns3"
+RECOVERED_CORE_SELECTION = "lexicographically-smallest-trial-id-v1"
 LISTENER_RE = re.compile(r"^[A-Za-z0-9._-]{3,64}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 STRATA = ("recorded-noise", "babble", "source-preservation", "synthetic-noise")
@@ -60,6 +61,10 @@ def exact_keys(document: dict, expected: set[str], label: str) -> None:
 
 def sha256(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
+
+
+def is_sha256(value: Any) -> bool:
+    return isinstance(value, str) and SHA256_RE.fullmatch(value) is not None
 
 
 def finite_number(value: Any, label: str) -> float:
@@ -154,16 +159,72 @@ def validate_protocol(protocol: dict, payload: bytes, path: Path) -> dict[str, d
     return by_id
 
 
-def validate_answer_key(answer: dict, protocol: dict, protocol_payload: bytes, protocol_trials: dict[str, dict]) -> dict[str, dict]:
-    exact_keys(answer, {"schema", "schema_version", "bundle_id", "protocol_sha256", "source_matrix_sha256", "randomization_key_sha256", "trials"}, "answer key")
-    if answer["schema"] != "denoize-dpdfnet-blind-answer-key-v1" or answer["schema_version"] != 1:
+def validate_answer_key(
+    answer: dict,
+    protocol: dict,
+    protocol_payload: bytes,
+    protocol_trials: dict[str, dict],
+) -> dict[str, dict]:
+    schema = answer.get("schema")
+    version = answer.get("schema_version")
+    recovered = schema == "denoize-dpdfnet-blind-answer-key-v2" and version == 2
+    if schema == "denoize-dpdfnet-blind-answer-key-v1" and version == 1:
+        exact_keys(
+            answer,
+            {
+                "schema",
+                "schema_version",
+                "bundle_id",
+                "protocol_sha256",
+                "source_matrix_sha256",
+                "randomization_key_sha256",
+                "trials",
+            },
+            "answer key",
+        )
+        if not is_sha256(answer["randomization_key_sha256"]):
+            raise ScoreError("invalid randomization-key digest")
+    elif recovered:
+        exact_keys(
+            answer,
+            {
+                "schema",
+                "schema_version",
+                "bundle_id",
+                "protocol_sha256",
+                "source_matrix_sha256",
+                "recovery",
+                "trials",
+            },
+            "answer key",
+        )
+        recovery = answer["recovery"]
+        if not isinstance(recovery, dict):
+            raise ScoreError("answer-key recovery must be an object")
+        exact_keys(
+            recovery,
+            {
+                "method",
+                "core_selection",
+                "candidate_audio_manifest_sha256",
+                "source_case_count",
+            },
+            "answer-key recovery",
+        )
+        if recovery["method"] != "named-output-sha256-v1":
+            raise ScoreError("unsupported answer-key recovery method")
+        if recovery["core_selection"] != RECOVERED_CORE_SELECTION:
+            raise ScoreError("unsupported recovered core-selection rule")
+        if not is_sha256(recovery["candidate_audio_manifest_sha256"]):
+            raise ScoreError("invalid candidate-audio manifest digest")
+        if recovery["source_case_count"] != 12:
+            raise ScoreError("recovered answer key must bind exactly 12 source cases")
+    else:
         raise ScoreError("unsupported blinded-listening answer key")
     if answer["bundle_id"] != protocol["bundle_id"] or answer["source_matrix_sha256"] != protocol["source_matrix_sha256"]:
         raise ScoreError("answer key does not bind the protocol source")
     if answer["protocol_sha256"] != sha256(protocol_payload):
         raise ScoreError("answer key protocol digest mismatch")
-    if not SHA256_RE.fullmatch(answer["randomization_key_sha256"]):
-        raise ScoreError("invalid randomization-key digest")
     trials = answer["trials"]
     if not isinstance(trials, list) or len(trials) != len(protocol_trials):
         raise ScoreError("answer key trial count mismatch")
@@ -174,14 +235,47 @@ def validate_answer_key(answer: dict, protocol: dict, protocol_payload: bytes, p
     for index, trial in enumerate(trials):
         if not isinstance(trial, dict):
             raise ScoreError(f"answer trial {index} must be an object")
-        exact_keys(trial, {"trial_id", "source_case_id", "stratum", "role", "duplicate_of", "a_model", "b_model"}, f"answer trial {index}")
+        trial_keys = {
+            "trial_id",
+            "source_case_id",
+            "stratum",
+            "role",
+            "duplicate_of",
+            "a_model",
+            "b_model",
+        }
+        if recovered:
+            trial_keys |= {"a_sha256", "b_sha256"}
+        exact_keys(trial, trial_keys, f"answer trial {index}")
         trial_id = trial["trial_id"]
-        if trial_id not in protocol_trials or trial_id in by_id:
+        if (
+            not isinstance(trial_id, str)
+            or trial_id not in protocol_trials
+            or trial_id in by_id
+        ):
             raise ScoreError(f"answer key has unknown or duplicate trial: {trial_id}")
         if trial["stratum"] != protocol_trials[trial_id]["stratum"]:
             raise ScoreError(f"answer stratum mismatch: {trial_id}")
-        if {trial["a_model"], trial["b_model"]} != {MODEL_DPDFNET, MODEL_GTCRN}:
+        source_case_id = trial["source_case_id"]
+        if (
+            not isinstance(source_case_id, str)
+            or not re.fullmatch(r"[A-Za-z0-9._+-]{1,128}", source_case_id)
+        ):
+            raise ScoreError(f"invalid answer source case ID: {trial_id}")
+        a_model = trial["a_model"]
+        b_model = trial["b_model"]
+        if (
+            not isinstance(a_model, str)
+            or not isinstance(b_model, str)
+            or {a_model, b_model} != {MODEL_DPDFNET, MODEL_GTCRN}
+        ):
             raise ScoreError(f"answer sides do not contain both models: {trial_id}")
+        if recovered:
+            public_audio = protocol_trials[trial_id]["audio"]
+            if trial["a_sha256"] != public_audio["a"]["sha256"]:
+                raise ScoreError(f"answer side A digest mismatch: {trial_id}")
+            if trial["b_sha256"] != public_audio["b"]["sha256"]:
+                raise ScoreError(f"answer side B digest mismatch: {trial_id}")
         if trial["role"] == "core":
             if trial["duplicate_of"] is not None:
                 raise ScoreError(f"core trial has duplicate_of: {trial_id}")
@@ -209,6 +303,25 @@ def validate_answer_key(answer: dict, protocol: dict, protocol_payload: bytes, p
         duplicate_targets.add(trial["duplicate_of"])
     if len(duplicate_targets) != 4:
         raise ScoreError("answer key must repeat four distinct core trials")
+    if recovered:
+        by_case: dict[str, list[dict]] = {}
+        for trial in by_id.values():
+            by_case.setdefault(trial["source_case_id"], []).append(trial)
+        single_count = sum(len(records) == 1 for records in by_case.values())
+        pair_count = sum(len(records) == 2 for records in by_case.values())
+        if len(by_case) != 12 or single_count != 8 or pair_count != 4:
+            raise ScoreError("recovered answer key has invalid source-case geometry")
+        for records in by_case.values():
+            if len(records) not in {1, 2}:
+                raise ScoreError("recovered source case appears outside one or two trials")
+            ordered = sorted(records, key=lambda record: record["trial_id"])
+            if ordered[0]["role"] != "core" or ordered[0]["duplicate_of"] is not None:
+                raise ScoreError("recovered core selection differs from the public rule")
+            if len(ordered) == 2 and (
+                ordered[1]["role"] != "repeat"
+                or ordered[1]["duplicate_of"] != ordered[0]["trial_id"]
+            ):
+                raise ScoreError("recovered repeat mapping differs from the public rule")
     return by_id
 
 

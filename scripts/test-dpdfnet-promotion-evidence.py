@@ -8,6 +8,7 @@ import importlib.util
 import json
 from pathlib import Path
 import shutil
+import stat
 import struct
 import subprocess
 import sys
@@ -20,6 +21,7 @@ from jsonschema import Draft202012Validator
 
 ROOT = Path(__file__).resolve().parent.parent
 PREPARE = ROOT / "scripts/prepare-dpdfnet-blind-listening.py"
+RECOVER = ROOT / "scripts/recover-dpdfnet-blind-answer-key.py"
 SCORE = ROOT / "scripts/score-dpdfnet-blind-listening.py"
 PLATFORM = ROOT / "scripts/generate-dpdfnet-platform-evidence.py"
 PROMOTION = ROOT / "scripts/generate-dpdfnet-promotion-evidence.py"
@@ -28,6 +30,7 @@ EQUIVALENCE = ROOT / "scripts/verify-dpdfnet-objective-equivalence.py"
 SCHEMAS = {
     "protocol": ROOT / "schemas/denoize-dpdfnet-blind-protocol-v1.schema.json",
     "answer": ROOT / "schemas/denoize-dpdfnet-blind-answer-key-v1.schema.json",
+    "answer_v2": ROOT / "schemas/denoize-dpdfnet-blind-answer-key-v2.schema.json",
     "response": ROOT / "schemas/denoize-dpdfnet-blind-listener-response-v1.schema.json",
     "result": ROOT / "schemas/denoize-dpdfnet-blind-listening-result-v1.schema.json",
     "worker": ROOT / "schemas/denoize-dpdfnet-worker-run-v1.schema.json",
@@ -949,6 +952,83 @@ def main() -> int:
         assert sum(trial["role"] == "core" for trial in answer["trials"]) == 12
         assert sum(trial["role"] == "repeat" for trial in answer["trials"]) == 4
 
+        recovered_answer_path = root / "private-recovered-answer-key.json"
+        recovery_command = [
+            sys.executable,
+            str(RECOVER),
+            "--protocol",
+            str(protocol_path),
+            "--matrix-result",
+            str(matrix),
+            "--audio-dir",
+            str(audio),
+            "--output",
+            str(recovered_answer_path),
+        ]
+        run(recovery_command)
+        recovered_answer = json.loads(
+            recovered_answer_path.read_text(encoding="utf-8")
+        )
+        validators["answer_v2"].validate(recovered_answer)
+        assert stat.S_IMODE(recovered_answer_path.stat().st_mode) == 0o600
+        assert recovered_answer["protocol_sha256"] == answer["protocol_sha256"]
+        assert recovered_answer["source_matrix_sha256"] == answer[
+            "source_matrix_sha256"
+        ]
+        original_by_id = {trial["trial_id"]: trial for trial in answer["trials"]}
+        for trial in recovered_answer["trials"]:
+            original = original_by_id[trial["trial_id"]]
+            assert trial["source_case_id"] == original["source_case_id"]
+            assert trial["a_model"] == original["a_model"]
+            assert trial["b_model"] == original["b_model"]
+            public_audio = next(
+                candidate["audio"]
+                for candidate in protocol["trials"]
+                if candidate["trial_id"] == trial["trial_id"]
+            )
+            assert trial["a_sha256"] == public_audio["a"]["sha256"]
+            assert trial["b_sha256"] == public_audio["b"]["sha256"]
+        recovered_by_case: dict[str, list[dict]] = {}
+        for trial in recovered_answer["trials"]:
+            recovered_by_case.setdefault(trial["source_case_id"], []).append(trial)
+        assert sorted(len(trials) for trials in recovered_by_case.values()) == [
+            *([1] * 8),
+            *([2] * 4),
+        ]
+        for trials in recovered_by_case.values():
+            ordered = sorted(trials, key=lambda trial: trial["trial_id"])
+            assert ordered[0]["role"] == "core"
+            if len(ordered) == 2:
+                assert ordered[1]["role"] == "repeat"
+                assert ordered[1]["duplicate_of"] == ordered[0]["trial_id"]
+
+        duplicate_recovery = run(recovery_command, success=False)
+        assert "refusing to replace existing answer key" in duplicate_recovery.stderr
+
+        public_answer = run(
+            [
+                *recovery_command[:-1],
+                str(bundle / "private-answer-key.json"),
+            ],
+            success=False,
+        )
+        assert "inside the public bundle" in public_answer.stderr
+
+        tampered_audio = root / "tampered-candidates"
+        shutil.copytree(audio, tampered_audio)
+        tampered_case = sorted(tampered_audio.iterdir())[0]
+        write_wav(tampered_case / "dpdfnet2.wav", 99_999)
+        tampered_recovery = run(
+            [
+                *recovery_command[:-3],
+                str(tampered_audio),
+                "--output",
+                str(root / "tampered-recovered-answer-key.json"),
+            ],
+            success=False,
+        )
+        assert "do not match both named outputs" in tampered_recovery.stderr
+
         passing_responses = responses(root, protocol, answer, candidate=True)
         for path in passing_responses.glob("*.json"):
             validators["response"].validate(json.loads(path.read_text(encoding="utf-8")))
@@ -973,6 +1053,114 @@ def main() -> int:
         assert passing["listeners"]["retained"] == 20
         assert passing["overall"]["dpdfnet_preference_score"] == 1.0
         assert passing["duplicate_consistency"]["inconsistencies"] == 0
+
+        recovered_passing_result = root / "recovered-passing-result.json"
+        run(
+            [
+                sys.executable,
+                str(SCORE),
+                "--protocol",
+                str(protocol_path),
+                "--answer-key",
+                str(recovered_answer_path),
+                "--responses",
+                str(passing_responses),
+                "--output",
+                str(recovered_passing_result),
+            ]
+        )
+        recovered_passing = json.loads(
+            recovered_passing_result.read_text(encoding="utf-8")
+        )
+        validators["result"].validate(recovered_passing)
+        assert recovered_passing["accepted"] is True
+        assert recovered_passing["overall"] == passing["overall"]
+        assert recovered_passing["strata"] == passing["strata"]
+
+        tampered_recovered_hash = json.loads(json.dumps(recovered_answer))
+        tampered_recovered_hash["trials"][0]["a_sha256"] = "0" * 64
+        tampered_recovered_hash_path = root / "tampered-recovered-hash.json"
+        tampered_recovered_hash_path.write_text(
+            json.dumps(tampered_recovered_hash, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        invalid_recovered_hash = run(
+            [
+                sys.executable,
+                str(SCORE),
+                "--protocol",
+                str(protocol_path),
+                "--answer-key",
+                str(tampered_recovered_hash_path),
+                "--responses",
+                str(passing_responses),
+                "--output",
+                str(root / "tampered-recovered-hash-result.json"),
+            ],
+            success=False,
+        )
+        assert "answer side A digest mismatch" in invalid_recovered_hash.stderr
+
+        tampered_recovered_core = json.loads(json.dumps(recovered_answer))
+        paired_case = next(
+            trials for trials in recovered_by_case.values() if len(trials) == 2
+        )
+        paired_ids = sorted(trial["trial_id"] for trial in paired_case)
+        recovered_trials_by_id = {
+            trial["trial_id"]: trial for trial in tampered_recovered_core["trials"]
+        }
+        recovered_trials_by_id[paired_ids[0]]["role"] = "repeat"
+        recovered_trials_by_id[paired_ids[0]]["duplicate_of"] = paired_ids[1]
+        recovered_trials_by_id[paired_ids[1]]["role"] = "core"
+        recovered_trials_by_id[paired_ids[1]]["duplicate_of"] = None
+        tampered_recovered_core_path = root / "tampered-recovered-core.json"
+        tampered_recovered_core_path.write_text(
+            json.dumps(tampered_recovered_core, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        invalid_recovered_core = run(
+            [
+                sys.executable,
+                str(SCORE),
+                "--protocol",
+                str(protocol_path),
+                "--answer-key",
+                str(tampered_recovered_core_path),
+                "--responses",
+                str(passing_responses),
+                "--output",
+                str(root / "tampered-recovered-core-result.json"),
+            ],
+            success=False,
+        )
+        assert "core selection differs" in invalid_recovered_core.stderr
+
+        malformed_recovery = json.loads(json.dumps(recovered_answer))
+        malformed_recovery["recovery"]["candidate_audio_manifest_sha256"] = 7
+        malformed_recovery_path = root / "malformed-recovery.json"
+        malformed_recovery_path.write_text(
+            json.dumps(malformed_recovery, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        malformed_recovery_result = run(
+            [
+                sys.executable,
+                str(SCORE),
+                "--protocol",
+                str(protocol_path),
+                "--answer-key",
+                str(malformed_recovery_path),
+                "--responses",
+                str(passing_responses),
+                "--output",
+                str(root / "malformed-recovery-result.json"),
+            ],
+            success=False,
+        )
+        assert (
+            "invalid candidate-audio manifest digest"
+            in malformed_recovery_result.stderr
+        )
 
         rejected_responses = responses(root, protocol, answer, candidate=False)
         rejected_result = root / "rejected-result.json"

@@ -175,6 +175,7 @@ jobs:
           python3 -c 'compile(open("scripts/test-universal-restoration-schemas.py", encoding="utf-8").read(), "scripts/test-universal-restoration-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-neural-daw-schemas.py", encoding="utf-8").read(), "scripts/test-neural-daw-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/prepare-dpdfnet-blind-listening.py", encoding="utf-8").read(), "scripts/prepare-dpdfnet-blind-listening.py", "exec")'
+          python3 -c 'compile(open("scripts/recover-dpdfnet-blind-answer-key.py", encoding="utf-8").read(), "scripts/recover-dpdfnet-blind-answer-key.py", "exec")'
           python3 -c 'compile(open("scripts/score-dpdfnet-blind-listening.py", encoding="utf-8").read(), "scripts/score-dpdfnet-blind-listening.py", "exec")'
           python3 -c 'compile(open("scripts/generate-dpdfnet-platform-evidence.py", encoding="utf-8").read(), "scripts/generate-dpdfnet-platform-evidence.py", "exec")'
           python3 -c 'compile(open("scripts/generate-dpdfnet-promotion-evidence.py", encoding="utf-8").read(), "scripts/generate-dpdfnet-promotion-evidence.py", "exec")'
