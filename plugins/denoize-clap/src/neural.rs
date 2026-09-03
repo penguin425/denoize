@@ -788,7 +788,11 @@ fn parameter_info(index: u32) -> Option<ParamInfo<'static>> {
     let (id, flags, name, module, minimum, maximum, default) = match index {
         0 => (
             PARAM_BYPASS,
-            stepped | ParamInfoFlags::IS_BYPASS,
+            // This is denoize's persistent, latency-aligned DSP control, not
+            // the host's process-level bypass button. Advertising IS_BYPASS
+            // lets some hosts merge their host-managed bypass state back into
+            // this parameter and overwrite repeated user changes.
+            stepped,
             b"Bypass".as_slice(),
             b"Neural".as_slice(),
             0.0,
@@ -2430,6 +2434,10 @@ mod tests {
             assert!(info.min_value <= info.default_value);
             assert!(info.default_value <= info.max_value);
         }
+        let bypass = parameter_info(PARAM_BYPASS.get()).unwrap();
+        assert!(bypass.flags.contains(ParamInfoFlags::IS_STEPPED));
+        assert!(bypass.flags.contains(ParamInfoFlags::IS_AUTOMATABLE));
+        assert!(!bypass.flags.contains(ParamInfoFlags::IS_BYPASS));
         assert!(parameter_info(PARAMETER_COUNT).is_none());
         assert_eq!(
             port_configuration_from_id(MONO_CONFIG_ID),

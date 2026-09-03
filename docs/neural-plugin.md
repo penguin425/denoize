@@ -140,6 +140,12 @@ latency. Bypass is also delayed, so host plug-in-delay compensation and A/B
 switching stay aligned. Neural output that arrives after its block deadline is
 discarded rather than leaking into a later time position.
 
+The named `Bypass` control is a persistent, automatable DSP parameter and is
+kept separate from the CLAP host-level bypass flag. REAPER merges a parameter
+carrying that flag with its own FX bypass state and can overwrite a repeated
+keyboard/OSARA change; keeping the two controls separate preserves the named
+latency-aligned state while the host's ordinary FX bypass remains available.
+
 ## Ports, automation, and state
 
 Both mono and stereo configurations expose one main input/output pair and one
