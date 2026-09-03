@@ -24,6 +24,7 @@ pub const STATE_SIZE: usize = DPDFNET2_STATE_SIZE;
 pub const ERB_NORM_STATE_SIZE: usize = 481;
 pub const SPEC_NORM_STATE_SIZE: usize = 96;
 const COMPILED_MODEL_ALLOWANCE_BYTES: u64 = 128 * 1024 * 1024;
+const FFT_SCRATCH_COMPLEX_ALLOWANCE: usize = FFT_SIZE;
 
 /// The official 48 kHz exporter defaults to two convolution-lookahead and two
 /// deep-filter-lookahead frames. Its offline path advances the reconstruction
@@ -155,6 +156,7 @@ pub struct DpdfnetStream {
     window: [f32; FFT_SIZE],
     spectrum: Vec<Complex32>,
     model_input: Vec<f32>,
+    fft_scratch: Vec<Complex32>,
     fft: Arc<dyn Fft<f32>>,
     ifft: Arc<dyn Fft<f32>>,
     primed: bool,
@@ -173,6 +175,16 @@ impl DpdfnetStream {
         let mut planner = FftPlanner::new();
         let state = initial_state.as_ref().clone().into_arc_tensor();
         let reuse_runtime_state = super::tract_runtime::supports_state_reuse(&model);
+        let fft = planner.plan_fft_forward(FFT_SIZE);
+        let ifft = planner.plan_fft_inverse(FFT_SIZE);
+        let fft_scratch_len = fft
+            .get_inplace_scratch_len()
+            .max(ifft.get_inplace_scratch_len());
+        if fft_scratch_len > FFT_SCRATCH_COMPLEX_ALLOWANCE {
+            return Err(format!(
+                "DPDFNet FFT requires {fft_scratch_len} scratch values, exceeding the {FFT_SCRATCH_COMPLEX_ALLOWANCE}-value resource allowance"
+            ));
+        }
         Ok(Self {
             model,
             reuse_runtime_state,
@@ -183,8 +195,9 @@ impl DpdfnetStream {
             window: vorbis_window(),
             spectrum: vec![Complex32::new(0.0, 0.0); FFT_SIZE],
             model_input: vec![0.0; BINS * 2],
-            fft: planner.plan_fft_forward(FFT_SIZE),
-            ifft: planner.plan_fft_inverse(FFT_SIZE),
+            fft_scratch: vec![Complex32::new(0.0, 0.0); fft_scratch_len],
+            fft,
+            ifft,
             primed: false,
         })
     }
@@ -226,7 +239,8 @@ impl DpdfnetStream {
         for (index, (sample, window)) in self.analysis.iter().zip(&self.window).enumerate() {
             self.spectrum[index] = Complex32::new(sample * window, 0.0);
         }
-        self.fft.process(&mut self.spectrum);
+        self.fft
+            .process_with_scratch(&mut self.spectrum, &mut self.fft_scratch);
 
         for (bin, value) in self.spectrum.iter().take(BINS).enumerate() {
             self.model_input[bin * 2] = value.re;
@@ -251,7 +265,8 @@ impl DpdfnetStream {
         self.spectrum[0].im = 0.0;
         self.spectrum[BINS - 1].im = 0.0;
 
-        self.ifft.process(&mut self.spectrum);
+        self.ifft
+            .process_with_scratch(&mut self.spectrum, &mut self.fft_scratch);
         for (index, value) in self.spectrum.iter().enumerate() {
             self.overlap[index] += value.re * self.window[index] / FFT_SIZE as f32;
         }
@@ -730,7 +745,7 @@ fn append_limited(
 
 pub(crate) fn streaming_state_bytes(channels: usize) -> Result<u64, crate::ConfigError> {
     let per_channel_scalars = DPDFNET2_STATE_SIZE
-        .checked_add(FFT_SIZE * 5)
+        .checked_add(FFT_SIZE * 5 + FFT_SCRATCH_COMPLEX_ALLOWANCE * 2)
         .and_then(|value| value.checked_add(BINS * 2))
         .and_then(|value| value.checked_add(HOP_SIZE * 2 + 1))
         .ok_or(crate::ConfigError::ResourceOverflow {
@@ -739,7 +754,7 @@ pub(crate) fn streaming_state_bytes(channels: usize) -> Result<u64, crate::Confi
     let per_channel_bytes = u64::try_from(per_channel_scalars)
         .ok()
         .and_then(|value| value.checked_mul(std::mem::size_of::<f32>() as u64))
-        .and_then(|value| value.checked_add((std::mem::size_of::<Vec<f32>>() * 7) as u64))
+        .and_then(|value| value.checked_add((std::mem::size_of::<Vec<f32>>() * 8) as u64))
         .ok_or(crate::ConfigError::ResourceOverflow {
             resource: "DPDFNet stream state",
         })?;
