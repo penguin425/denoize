@@ -119,6 +119,7 @@ cp "$repo_dir/models/licenses/dpdfnet2-48khz-hr-Apache-2.0.txt" \
 cp "$repo_dir/models/provenance/dpdfnet2-48khz-hr.json" \
   "$package_dir/models/dpdfnet2-48khz-hr/"
 cp "$repo_dir/docs/dpdfnet-experimental-clap.md" "$package_dir/EXPERIMENTAL.md"
+cp "$repo_dir/docs/dpdfnet-reporter-template.md" "$package_dir/REPORTER.md"
 cp "$repo_dir/README.md" "$repo_dir/LICENSE" "$repo_dir/THIRD_PARTY.md" "$package_dir/"
 cp -R "$repo_dir/LICENSES" "$package_dir/"
 

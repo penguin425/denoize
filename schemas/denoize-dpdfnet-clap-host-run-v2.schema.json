@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-dpdfnet-clap-host-run-v2.schema.json",
+  "title": "denoize DPDFNet real CLAP-host worker run v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "schema_version", "source_commit", "model_id", "model_sha256", "plugin_id",
+    "sample_rate_hz", "channels", "chunk_frames", "latency_frames", "processed_frames",
+    "active_seconds", "measurement", "host_audio_configuration", "callback_frames",
+    "worker_started", "finished_gracefully", "metrics", "lifetime_metrics", "environment"
+  ],
+  "properties": {
+    "schema": { "const": "denoize-dpdfnet-clap-host-run-v2" },
+    "schema_version": { "const": 2 },
+    "source_commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "model_id": { "const": "dpdfnet2-48khz-hr" },
+    "model_sha256": { "const": "7f0575a5cec0ba4ffd8f8bd657e06d007e4ccdd955d76faab922b9d3291dc14b" },
+    "plugin_id": { "const": "org.penguin425.denoize.neural-hq" },
+    "sample_rate_hz": { "type": "integer", "minimum": 8000, "maximum": 192000 },
+    "channels": { "type": "integer", "minimum": 1, "maximum": 2 },
+    "chunk_frames": { "type": "integer", "minimum": 80, "maximum": 1920 },
+    "latency_frames": { "type": "integer", "minimum": 1920, "maximum": 46080 },
+    "processed_frames": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "active_seconds": { "type": "number", "exclusiveMinimum": 0, "maximum": 1000000 },
+    "measurement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["warmup_frames", "measured_frames"],
+      "properties": {
+        "warmup_frames": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "measured_frames": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 }
+      }
+    },
+    "host_audio_configuration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["min_frames_count", "max_frames_count"],
+      "properties": {
+        "min_frames_count": { "type": "integer", "minimum": 1, "maximum": 1048576 },
+        "max_frames_count": { "type": "integer", "minimum": 1, "maximum": 1048576 }
+      }
+    },
+    "callback_frames": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["calls", "minimum", "maximum"],
+      "properties": {
+        "calls": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "minimum": { "type": "integer", "minimum": 1, "maximum": 1048576 },
+        "maximum": { "type": "integer", "minimum": 1, "maximum": 1048576 }
+      }
+    },
+    "worker_started": { "type": "boolean" },
+    "finished_gracefully": { "type": "boolean" },
+    "metrics": { "$ref": "#/$defs/metrics" },
+    "lifetime_metrics": { "$ref": "#/$defs/metrics" },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["os", "arch"],
+      "properties": {
+        "os": { "enum": ["linux", "macos", "windows"] },
+        "arch": { "enum": ["x86_64", "aarch64"] }
+      }
+    }
+  },
+  "$defs": {
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["overload_blocks", "late_blocks", "invalid_blocks", "worker_errors"],
+      "properties": {
+        "overload_blocks": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "late_blocks": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "invalid_blocks": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "worker_errors": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+      }
+    }
+  }
+}

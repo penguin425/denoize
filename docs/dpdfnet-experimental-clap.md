@@ -17,10 +17,10 @@ experiment, and `denoize Neural` continues to use GTCRN.
    path at the extracted directory.
 5. In REAPER, insert **CLAP: denoize Neural HQ** on a 48 kHz session.
 
-Use a 480-frame buffer first, then repeat at the smallest and largest host
-buffers you normally use. Record the CPU model, REAPER/audio-driver versions,
-sample rate, buffer size, test duration, overload/late behavior, and whether
-all four parameters can be read and adjusted through NVDA with OSARA.
+Follow `REPORTER.md` from the package for the three five-minute runs and the
+exact host-evidence capture procedure. It distinguishes REAPER's requested
+buffer from the activation bounds and callback sizes observed by the plug-in,
+and preserves failed measurements without changing their counters.
 
 Do not publish the private answer key from a blinded listening test until all
 responses have been collected and frozen.
