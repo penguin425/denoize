@@ -231,8 +231,15 @@ def validate_payload_v2(payload: dict[str, Any]) -> None:
             raise ReporterError(f"run {index} has an invalid host evidence URL")
         if not isinstance(run["host_evidence_sha256"], str) or not SHA256_RE.fullmatch(run["host_evidence_sha256"]):
             raise ReporterError(f"run {index} has an invalid host evidence digest")
-        integer(run["audible_xruns"], f"run {index} audible_xruns")
-        boolean(run["continuous_audio"], f"run {index} continuous_audio")
+        audible_xruns = run["audible_xruns"]
+        continuous_audio = boolean(run["continuous_audio"], f"run {index} continuous_audio")
+        if audible_xruns is None:
+            if continuous_audio:
+                raise ReporterError(
+                    f"run {index} audible_xruns may be null only when continuous_audio is false"
+                )
+        else:
+            integer(audible_xruns, f"run {index} audible_xruns")
 
     accessibility = payload["accessibility"]
     if not isinstance(accessibility, dict):

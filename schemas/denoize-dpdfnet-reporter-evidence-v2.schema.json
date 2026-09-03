@@ -27,6 +27,13 @@
   "$defs": {
     "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
     "bounded": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "audibleXruns": {
+      "description": "Exact observed audible XRUN count, or null when audible discontinuities were observed but not counted exactly.",
+      "oneOf": [
+        { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        { "type": "null" }
+      ]
+    },
     "github": {
       "type": "object",
       "additionalProperties": false,
@@ -102,9 +109,15 @@
         "requested_buffer_frames": { "type": "integer", "minimum": 16, "maximum": 8192 },
         "host_evidence_url": { "type": "string", "pattern": "^https://github\\.com/user-attachments/files/[1-9][0-9]*/[A-Za-z0-9._-]{1,160}\\.json$" },
         "host_evidence_sha256": { "$ref": "#/$defs/sha256" },
-        "audible_xruns": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "audible_xruns": { "$ref": "#/$defs/audibleXruns" },
         "continuous_audio": { "type": "boolean" }
-      }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "audible_xruns": { "type": "null" } } },
+          "then": { "properties": { "continuous_audio": { "const": false } } }
+        }
+      ]
     },
     "normalizedRun": {
       "type": "object",
@@ -126,7 +139,7 @@
         "late_blocks": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
         "invalid_blocks": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
         "worker_errors": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
-        "audible_xruns": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "audible_xruns": { "$ref": "#/$defs/audibleXruns" },
         "continuous_audio": { "type": "boolean" },
         "host_evidence": {
           "type": "object",
@@ -140,7 +153,13 @@
             "schema": { "enum": ["denoize-dpdfnet-clap-host-run-v1", "denoize-dpdfnet-clap-host-run-v2"] }
           }
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "audible_xruns": { "type": "null" } } },
+          "then": { "properties": { "continuous_audio": { "const": false } } }
+        }
+      ]
     },
     "effectiveBuffer": {
       "type": "object",

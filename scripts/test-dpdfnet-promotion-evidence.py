@@ -471,6 +471,65 @@ def composite_fixtures(
         check for check in failed_reporter["checks"] if check["id"] == "realtime-worker"
     )["passed"] is False
 
+    unknown_xruns_payload = json.loads(json.dumps(reporter_payload))
+    unknown_xruns_payload["runs"][0]["audible_xruns"] = None
+    unknown_xruns_payload["runs"][0]["continuous_audio"] = False
+    unknown_xruns_reporter = reporter_module.build_v2_document(
+        unknown_xruns_payload,
+        reporter["github"],
+        loader=lambda url: host_payloads[url],
+    )
+    validators["reporter_v2"].validate(unknown_xruns_reporter)
+    assert unknown_xruns_reporter["accepted"] is False
+    assert unknown_xruns_reporter["runs"][0]["audible_xruns"] is None
+    assert next(
+        check
+        for check in unknown_xruns_reporter["checks"]
+        if check["id"] == "audible-continuity"
+    )["passed"] is False
+
+    inconsistent_unknown_xruns = json.loads(json.dumps(unknown_xruns_payload))
+    inconsistent_unknown_xruns["runs"][0]["continuous_audio"] = True
+    try:
+        reporter_module.build_v2_document(
+            inconsistent_unknown_xruns,
+            reporter["github"],
+            loader=lambda url: host_payloads[url],
+        )
+    except reporter_module.ReporterError as error:
+        assert "may be null only when continuous_audio is false" in str(error)
+    else:
+        raise AssertionError("unknown audible XRUNs with continuous audio unexpectedly passed")
+
+    for invalid_audible_xruns in ("unknown", -1, True):
+        invalid_xruns_payload = json.loads(json.dumps(reporter_payload))
+        invalid_xruns_payload["runs"][0]["audible_xruns"] = invalid_audible_xruns
+        try:
+            reporter_module.build_v2_document(
+                invalid_xruns_payload,
+                reporter["github"],
+                loader=lambda url: host_payloads[url],
+            )
+        except reporter_module.ReporterError:
+            pass
+        else:
+            raise AssertionError(
+                f"invalid audible XRUN value unexpectedly passed: {invalid_audible_xruns!r}"
+            )
+
+    missing_xruns_payload = json.loads(json.dumps(reporter_payload))
+    del missing_xruns_payload["runs"][0]["audible_xruns"]
+    try:
+        reporter_module.build_v2_document(
+            missing_xruns_payload,
+            reporter["github"],
+            loader=lambda url: host_payloads[url],
+        )
+    except reporter_module.ReporterError:
+        pass
+    else:
+        raise AssertionError("missing audible XRUN field unexpectedly passed")
+
     failed_body = "```json\n" + json.dumps(failed_payload) + "\n```"
     failed_comment_url = (
         "https://github.com/penguin425/denoize/issues/221#issuecomment-2"
