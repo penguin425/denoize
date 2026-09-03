@@ -105,7 +105,7 @@ rules and `request_exec` waits for completion.
 
 On Windows, the named worker joins the `Pro Audio` Multimedia Class Scheduler
 Service task at its critical relative priority. On macOS it combines
-a Mach time constraint that advertises 8 ms of nominal computation in each 10
+a Mach time constraint that advertises 9 ms of nominal computation in each 10
 ms period with an Audio Work Interval around each inference cycle. The Mach
 policy is established before joining the workgroup; XNU treats it as the
 thread's real-time scheduling mode rather than combining it with pthread QoS.
@@ -113,9 +113,11 @@ These changes happen after model preparation and before activation reports the
 worker ready. Failure to enter the primary platform scheduling class leaves
 neural inference unavailable and the fixed-latency fallback active. On macOS
 10 or in a restricted host where Audio Work Intervals are unavailable, the
-worker retains the Mach time constraint. Explicit prior scheduling classes are
+worker retains the Mach time constraint. The prior Mach scheduling mode is
 restored where supported, and the dedicated worker thread then exits; other
-platforms retain their native scheduler behavior.
+platforms retain their native scheduler behavior. The worker does not combine
+or attempt to restore pthread QoS: Apple's pthread contract makes that opt-out
+permanent once an incompatible Mach scheduling policy is selected.
 
 Automated REAPER evidence separates device priming from sustained processing.
 REAPER's Dummy Audio device can request about one output-buffer horizon faster

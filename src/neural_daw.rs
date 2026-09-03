@@ -28,7 +28,7 @@ pub const NEURAL_DAW_MAX_SAMPLE_RATE: u32 = crate::daw::DAW_MAX_SAMPLE_RATE;
 #[cfg(target_os = "macos")]
 const MACOS_NEURAL_PERIOD_NANOS: u64 = NEURAL_DAW_CHUNK_MILLIS as u64 * 1_000_000;
 #[cfg(target_os = "macos")]
-const MACOS_NEURAL_COMPUTATION_NANOS: u64 = 8_000_000;
+const MACOS_NEURAL_COMPUTATION_NANOS: u64 = 9_000_000;
 
 #[cfg(target_os = "macos")]
 enum MacOsPreviousMachPolicy {
@@ -55,10 +55,6 @@ pub struct NeuralDawWorkerPriorityGuard {
     mach_thread: mach2::port::mach_port_t,
     #[cfg(target_os = "macos")]
     previous_mach_policy: MacOsPreviousMachPolicy,
-    #[cfg(target_os = "macos")]
-    previous_qos_class: libc::qos_class_t,
-    #[cfg(target_os = "macos")]
-    previous_relative_priority: libc::c_int,
     #[cfg(target_os = "macos")]
     audio_work_interval: Option<MacOsAudioWorkInterval>,
     // Platform scheduling state must be released on the thread that acquired
@@ -123,28 +119,12 @@ impl NeuralDawWorkerPriorityGuard {
 
         #[cfg(target_os = "macos")]
         {
-            let mut previous_qos_class = libc::qos_class_t::QOS_CLASS_UNSPECIFIED;
-            let mut previous_relative_priority = 0;
-            // A Mach time constraint removes any explicit pthread QoS. Capture
-            // it first for restoration, but do not install a second active
-            // priority policy alongside the real-time one.
-            let result = unsafe {
-                libc::pthread_get_qos_class_np(
-                    libc::pthread_self(),
-                    &mut previous_qos_class,
-                    &mut previous_relative_priority,
-                )
-            };
-            if result != 0 {
-                return Err(format!(
-                    "read neural inference worker macOS QoS: {}",
-                    std::io::Error::from_raw_os_error(result)
-                ));
-            }
             // XNU removes an explicit pthread QoS when a Mach scheduling
-            // policy is applied. Establish one coherent real-time policy
-            // before joining the Audio Work Interval instead of mixing the
-            // two mutually exclusive priority mechanisms.
+            // policy is applied, and libpthread does not allow that pthread to
+            // opt back into QoS later. This is a dedicated worker that exits
+            // with the guard, so establish one coherent real-time policy
+            // before joining the Audio Work Interval and never mix the two
+            // priority mechanisms.
             let (mach_thread, previous_mach_policy) = acquire_macos_time_constraint()?;
             let audio_work_interval = match MacOsAudioWorkInterval::acquire() {
                 Ok(interval) => interval,
@@ -164,8 +144,6 @@ impl NeuralDawWorkerPriorityGuard {
             Ok(Self {
                 mach_thread,
                 previous_mach_policy,
-                previous_qos_class,
-                previous_relative_priority,
                 audio_work_interval,
                 _not_send: std::marker::PhantomData,
             })
@@ -261,22 +239,6 @@ impl Drop for NeuralDawWorkerPriorityGuard {
                 eprintln!(
                     "denoize Neural worker could not restore macOS scheduling policy: Mach error {result}"
                 );
-            }
-            if self.previous_qos_class as u32 != libc::qos_class_t::QOS_CLASS_UNSPECIFIED as u32 {
-                // Restore an explicit prior QoS only after leaving the active
-                // Mach real-time policy, keeping the two mechanisms separate.
-                let result = unsafe {
-                    libc::pthread_set_qos_class_self_np(
-                        self.previous_qos_class,
-                        self.previous_relative_priority,
-                    )
-                };
-                if result != 0 {
-                    eprintln!(
-                        "denoize Neural worker could not restore macOS QoS: {}",
-                        std::io::Error::from_raw_os_error(result)
-                    );
-                }
             }
         }
     }
@@ -673,10 +635,10 @@ fn acquire_macos_time_constraint(
         u32::try_from(macos_absolute_ticks(nanoseconds)?)
             .map_err(|_| "neural worker Mach time constraint exceeds u32".to_owned())
     };
-    // Direct production-path measurements put ordinary inference below 7 ms
-    // at p99. Advertise 8 ms of nominal computation in each 10 ms arrival
-    // period, leaving a real deadline margin rather than claiming the complete
-    // period as uninterrupted CPU demand.
+    // Direct production-path measurements put ordinary inference near 7 ms at
+    // p99. An 8 ms nominal budget left a small number of calls preempted across
+    // the 10 ms boundary, so retain 2 ms of measured compute headroom while
+    // still leaving a real margin below the 10 ms constraint.
     let mut active = thread_time_constraint_policy_data_t {
         period: absolute_ticks(MACOS_NEURAL_PERIOD_NANOS)?,
         computation: absolute_ticks(MACOS_NEURAL_COMPUTATION_NANOS)?,
