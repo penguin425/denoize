@@ -1018,6 +1018,7 @@ dependencies = [
  "kaldi-native-fbank",
  "libc",
  "lofty",
+ "mach2",
  "metal",
  "minisign-verify",
  "mp4",
