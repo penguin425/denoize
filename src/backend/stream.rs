@@ -746,26 +746,22 @@ impl StreamingBackendSession {
                 if processed.len() != 1 {
                     return Err("linked streaming backend must return one channel".into());
                 }
-                let enhanced = processed.pop().unwrap_or_default();
-                if enhanced.len() > self.linked_original.len() {
+                let mut left = processed.pop().unwrap_or_default();
+                if left.len() > self.linked_original.len() {
                     return Err("linked streaming backend returned unaligned frames".into());
                 }
-                let mut left = Vec::new();
                 let mut right = Vec::new();
-                left.try_reserve_exact(enhanced.len()).map_err(|_| {
+                right.try_reserve_exact(left.len()).map_err(|_| {
                     ConfigError::allocation_failed("linked stream output").to_string()
                 })?;
-                right.try_reserve_exact(enhanced.len()).map_err(|_| {
-                    ConfigError::allocation_failed("linked stream output").to_string()
-                })?;
-                for clean in enhanced {
+                for clean in &mut left {
                     let (original_left, original_right) = self
                         .linked_original
                         .pop_front()
                         .ok_or_else(|| "linked streaming alignment queue underflow".to_string())?;
                     let original_mid = (original_left + original_right) * 0.5;
-                    let correction = clean - original_mid;
-                    left.push(crate::audio::sanitize_sample(original_left + correction));
+                    let correction = *clean - original_mid;
+                    *clean = crate::audio::sanitize_sample(original_left + correction);
                     right.push(crate::audio::sanitize_sample(original_right + correction));
                 }
                 Ok(vec![left, right])
@@ -894,6 +890,40 @@ mod tests {
         }
         assert_eq!(output.len(), input.len());
         assert!(output.iter().all(|channel| channel.len() == 2048));
+    }
+
+    #[test]
+    fn stereo_linked_restore_reuses_enhanced_output_and_preserves_side() {
+        let mut config = DenoiserConfig::default(48_000);
+        config.profile_ms = -1.0;
+        let options = BackendOptions {
+            channel_mode: ChannelMode::StereoLinked,
+            ..BackendOptions::default()
+        };
+        let mut session =
+            StreamingBackendSession::new(Backend::Classical, 48_000, 2, config, options).unwrap();
+        let original = [(0.25, -0.15), (-0.4, 0.2), (0.8, 0.3)];
+        session.linked_original.extend(original);
+
+        let enhanced = vec![0.2, -0.05, 0.4];
+        let enhanced_ptr = enhanced.as_ptr();
+        let output = session.restore_channel_mode(vec![enhanced]).unwrap();
+
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[0].as_ptr(), enhanced_ptr);
+        assert!(session.linked_original.is_empty());
+        let expected = [[0.4, -0.35, 0.65], [0.0, 0.25, 0.15]];
+        for (actual, expected) in output.iter().zip(expected) {
+            assert_eq!(actual.len(), expected.len());
+            for (&actual, expected) in actual.iter().zip(expected) {
+                assert!((actual - expected).abs() < 1e-12);
+            }
+        }
+        for frame in 0..original.len() {
+            let original_side = original[frame].0 - original[frame].1;
+            let restored_side = output[0][frame] - output[1][frame];
+            assert!((restored_side - original_side).abs() < 1e-12);
+        }
     }
 
     #[test]
