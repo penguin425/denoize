@@ -46,7 +46,7 @@ pub struct DpdfnetMetadata {
 #[derive(Clone)]
 pub struct DpdfnetModel {
     model: SharedRunnable,
-    initial_state: Arc<[f32]>,
+    initial_state: Arc<Tensor>,
     metadata: DpdfnetMetadata,
     runtime: AcceleratorRuntime,
 }
@@ -63,9 +63,12 @@ impl DpdfnetModel {
         validate_config(config)?;
         let (metadata, initial_state) = read_metadata(&config.path)?;
         let model = load_model(&config.path, runtime, metadata.state_size)?;
+        let initial_state = Tensor::from_shape(&[initial_state.len()], &initial_state)
+            .map_err(tract_error)?
+            .into_arc_tensor();
         Ok(Self {
             model,
-            initial_state: initial_state.into(),
+            initial_state,
             metadata,
             runtime,
         })
@@ -144,11 +147,14 @@ impl DpdfnetModel {
 /// emits the final overlap-add hop once.
 pub struct DpdfnetStream {
     model: SharedRunnable,
-    initial_state: Arc<[f32]>,
-    state: Vec<f32>,
+    reuse_runtime_state: bool,
+    initial_state: Arc<Tensor>,
+    state: Arc<Tensor>,
     analysis: [f32; FFT_SIZE],
     overlap: [f32; FFT_SIZE],
     window: [f32; FFT_SIZE],
+    spectrum: Vec<Complex32>,
+    model_input: Vec<f32>,
     fft: Arc<dyn Fft<f32>>,
     ifft: Arc<dyn Fft<f32>>,
     primed: bool,
@@ -163,16 +169,20 @@ impl DpdfnetStream {
         model.stream()
     }
 
-    fn from_model(model: SharedRunnable, initial_state: Arc<[f32]>) -> Result<Self, String> {
+    fn from_model(model: SharedRunnable, initial_state: Arc<Tensor>) -> Result<Self, String> {
         let mut planner = FftPlanner::new();
-        let state = initial_state.to_vec();
+        let state = initial_state.as_ref().clone().into_arc_tensor();
+        let reuse_runtime_state = super::tract_runtime::supports_state_reuse(&model);
         Ok(Self {
             model,
+            reuse_runtime_state,
             initial_state,
             state,
             analysis: [0.0; FFT_SIZE],
             overlap: [0.0; FFT_SIZE],
             window: vorbis_window(),
+            spectrum: vec![Complex32::new(0.0, 0.0); FFT_SIZE],
+            model_input: vec![0.0; BINS * 2],
             fft: planner.plan_fft_forward(FFT_SIZE),
             ifft: planner.plan_fft_inverse(FFT_SIZE),
             primed: false,
@@ -180,7 +190,7 @@ impl DpdfnetStream {
     }
 
     pub fn reset(&mut self) {
-        self.state.copy_from_slice(&self.initial_state);
+        self.state = self.initial_state.as_ref().clone().into_arc_tensor();
         self.analysis.fill(0.0);
         self.overlap.fill(0.0);
         self.primed = false;
@@ -213,19 +223,18 @@ impl DpdfnetStream {
     }
 
     fn process_frame(&mut self) -> Result<[f32; HOP_SIZE], String> {
-        let mut spectrum: Vec<Complex32> = self
-            .analysis
-            .iter()
-            .zip(self.window)
-            .map(|(sample, window)| Complex32::new(sample * window, 0.0))
-            .collect();
-        self.fft.process(&mut spectrum);
-
-        let mut model_input = Vec::with_capacity(BINS * 2);
-        for value in spectrum.iter().take(BINS) {
-            model_input.extend([value.re, value.im]);
+        for (index, (sample, window)) in self.analysis.iter().zip(&self.window).enumerate() {
+            self.spectrum[index] = Complex32::new(sample * window, 0.0);
         }
-        let enhanced = self.infer(&model_input)?;
+        self.fft.process(&mut self.spectrum);
+
+        for (bin, value) in self.spectrum.iter().take(BINS).enumerate() {
+            self.model_input[bin * 2] = value.re;
+            self.model_input[bin * 2 + 1] = value.im;
+        }
+        let enhanced = self.infer()?;
+        let enhanced_plain = enhanced.try_as_plain().map_err(tract_error)?;
+        let enhanced = enhanced_plain.as_slice::<f32>().map_err(tract_error)?;
         if enhanced.len() != BINS * 2 {
             return Err(format!(
                 "DPDFNet returned {} spectrum scalars, expected {}",
@@ -234,16 +243,16 @@ impl DpdfnetStream {
             ));
         }
         for bin in 0..BINS {
-            spectrum[bin] = Complex32::new(enhanced[bin * 2], enhanced[bin * 2 + 1]);
+            self.spectrum[bin] = Complex32::new(enhanced[bin * 2], enhanced[bin * 2 + 1]);
         }
         for bin in BINS..FFT_SIZE {
-            spectrum[bin] = spectrum[FFT_SIZE - bin].conj();
+            self.spectrum[bin] = self.spectrum[FFT_SIZE - bin].conj();
         }
-        spectrum[0].im = 0.0;
-        spectrum[BINS - 1].im = 0.0;
+        self.spectrum[0].im = 0.0;
+        self.spectrum[BINS - 1].im = 0.0;
 
-        self.ifft.process(&mut spectrum);
-        for (index, value) in spectrum.iter().enumerate() {
+        self.ifft.process(&mut self.spectrum);
+        for (index, value) in self.spectrum.iter().enumerate() {
             self.overlap[index] += value.re * self.window[index] / FFT_SIZE as f32;
         }
         let output = std::array::from_fn(|index| self.overlap[index]);
@@ -252,41 +261,42 @@ impl DpdfnetStream {
         Ok(output)
     }
 
-    fn infer(&mut self, spectrum: &[f32]) -> Result<Vec<f32>, String> {
+    fn infer(&mut self) -> Result<TValue, String> {
+        let state = std::mem::replace(&mut self.state, Arc::clone(&self.initial_state));
         let inputs = tvec!(
-            Tensor::from_shape(&[1, 1, BINS, 2], spectrum)
+            Tensor::from_shape(&[1, 1, BINS, 2], &self.model_input)
                 .map_err(tract_error)?
                 .into_tvalue(),
-            Tensor::from_shape(&[self.state.len()], &self.state)
-                .map_err(tract_error)?
-                .into_tvalue(),
+            state.into_tvalue(),
         );
-        let outputs = self.model.run(inputs).map_err(tract_error)?;
+        let mut outputs = if self.reuse_runtime_state {
+            super::tract_runtime::run_reusing_state(&self.model, inputs)
+        } else {
+            self.model.run(inputs)
+        }
+        .map_err(tract_error)?;
         if outputs.len() != 2 {
             return Err(format!(
                 "DPDFNet returned {} outputs, expected 2",
                 outputs.len()
             ));
         }
-        let copy = |tensor: &TValue| -> Result<Vec<f32>, String> {
-            Ok(tensor
-                .to_plain_array_view::<f32>()
-                .map_err(tract_error)?
-                .iter()
-                .copied()
-                .collect())
-        };
-        let enhanced = copy(&outputs[0])?;
-        let next_state = copy(&outputs[1])?;
-        if next_state.len() != self.state.len() {
-            return Err(format!(
-                "DPDFNet returned {} state scalars, expected {}",
-                next_state.len(),
-                self.state.len()
-            ));
+        let next_state = outputs
+            .pop()
+            .expect("DPDFNet output count was validated above");
+        {
+            let next_state_plain = next_state.try_as_plain().map_err(tract_error)?;
+            let next_state = next_state_plain.as_slice::<f32>().map_err(tract_error)?;
+            if next_state.len() != self.state.len() {
+                return Err(format!(
+                    "DPDFNet returned {} state scalars, expected {}",
+                    next_state.len(),
+                    self.state.len()
+                ));
+            }
         }
-        self.state = next_state;
-        Ok(enhanced)
+        self.state = next_state.into_arc_tensor();
+        Ok(outputs.remove(0))
     }
 }
 
@@ -330,10 +340,13 @@ fn process_channel(
 /// returns the exact remaining number of input-rate frames.
 pub(crate) struct StreamingProcessor {
     channels: usize,
+    native_rate: bool,
     to_model_rate: crate::resample::StreamingResampler,
     from_model_rate: crate::resample::StreamingResampler,
     streams: Vec<DpdfnetStream>,
     pending_model_rate: Vec<VecDeque<f64>>,
+    hop_scratch: Vec<[f32; HOP_SIZE]>,
+    enhanced_scratch: Vec<Option<[f32; HOP_SIZE]>>,
     discard_model_frames: usize,
     model_input_frames: usize,
     model_output_frames: usize,
@@ -395,12 +408,25 @@ impl StreamingProcessor {
                 .map_err(|_| "unable to reserve DPDFNet pending samples".to_string())?;
             pending_model_rate.push(pending);
         }
+        let mut hop_scratch = Vec::new();
+        hop_scratch
+            .try_reserve_exact(channels)
+            .map_err(|_| "unable to reserve DPDFNet input-hop scratch".to_string())?;
+        hop_scratch.resize(channels, [0.0; HOP_SIZE]);
+        let mut enhanced_scratch = Vec::new();
+        enhanced_scratch
+            .try_reserve_exact(channels)
+            .map_err(|_| "unable to reserve DPDFNet output-hop scratch".to_string())?;
+        enhanced_scratch.resize(channels, None);
         Ok(Self {
             channels,
+            native_rate: sample_rate == SAMPLE_RATE,
             to_model_rate,
             from_model_rate,
             streams,
             pending_model_rate,
+            hop_scratch,
+            enhanced_scratch,
             discard_model_frames: MODEL_LOOKAHEAD_SAMPLES,
             model_input_frames: 0,
             model_output_frames: 0,
@@ -419,9 +445,19 @@ impl StreamingProcessor {
             .input_frames
             .checked_add(frames)
             .ok_or_else(|| "DPDFNet streaming input length overflow".to_string())?;
-        let at_model_rate = self.to_model_rate.process(input)?;
-        let enhanced_model_rate = self.process_model_rate(&at_model_rate)?;
-        let output = self.from_model_rate.process(&enhanced_model_rate)?;
+        let converted;
+        let at_model_rate = if self.native_rate {
+            input
+        } else {
+            converted = self.to_model_rate.process(input)?;
+            &converted
+        };
+        let enhanced_model_rate = self.process_model_rate(at_model_rate)?;
+        let output = if self.native_rate {
+            enhanced_model_rate
+        } else {
+            self.from_model_rate.process(&enhanced_model_rate)?
+        };
         let produced = validate_stream_block(&output, self.channels)?;
         let output_frames = self
             .output_frames
@@ -445,17 +481,22 @@ impl StreamingProcessor {
             return Ok(output);
         }
 
-        let model_input_tail = self.to_model_rate.finish()?;
-        let enhanced = self.process_model_rate(&model_input_tail)?;
-        let converted = self.from_model_rate.process(&enhanced)?;
-        append_limited(&mut output, &converted, remaining)?;
+        if self.native_rate {
+            let enhanced = self.finish_model_rate()?;
+            append_limited(&mut output, &enhanced, remaining)?;
+        } else {
+            let model_input_tail = self.to_model_rate.finish()?;
+            let enhanced = self.process_model_rate(&model_input_tail)?;
+            let converted = self.from_model_rate.process(&enhanced)?;
+            append_limited(&mut output, &converted, remaining)?;
 
-        let enhanced = self.finish_model_rate()?;
-        let converted = self.from_model_rate.process(&enhanced)?;
-        append_limited(&mut output, &converted, remaining)?;
+            let enhanced = self.finish_model_rate()?;
+            let converted = self.from_model_rate.process(&enhanced)?;
+            append_limited(&mut output, &converted, remaining)?;
 
-        let converted = self.from_model_rate.finish()?;
-        append_limited(&mut output, &converted, remaining)?;
+            let converted = self.from_model_rate.finish()?;
+            append_limited(&mut output, &converted, remaining)?;
+        }
         if output.first().map_or(0, Vec::len) < remaining {
             for channel in &mut output {
                 channel.resize(remaining, 0.0);
@@ -505,8 +546,8 @@ impl StreamingProcessor {
             .first()
             .is_some_and(|pending| pending.len() >= HOP_SIZE)
         {
-            let hops = self.take_pending_hop()?;
-            self.process_hop(&hops, &mut output)?;
+            self.take_pending_hop()?;
+            self.process_scratch_hop(&mut output)?;
         }
         Ok(output)
     }
@@ -529,12 +570,12 @@ impl StreamingProcessor {
             for channel in &mut self.pending_model_rate {
                 channel.resize(HOP_SIZE, 0.0);
             }
-            let hops = self.take_pending_hop()?;
-            self.process_hop(&hops, &mut output)?;
+            self.take_pending_hop()?;
+            self.process_scratch_hop(&mut output)?;
         }
-        let zeros = vec![[0.0f32; HOP_SIZE]; self.channels];
+        self.hop_scratch.fill([0.0; HOP_SIZE]);
         for _ in 0..MODEL_LOOKAHEAD_HOPS {
-            self.process_hop(&zeros, &mut output)?;
+            self.process_scratch_hop(&mut output)?;
         }
         self.flush_streams(&mut output)?;
         if output.first().map_or(0, Vec::len) < remaining {
@@ -546,74 +587,60 @@ impl StreamingProcessor {
         Ok(output)
     }
 
-    fn take_pending_hop(&mut self) -> Result<Vec<[f32; HOP_SIZE]>, String> {
-        let mut hops = Vec::new();
-        hops.try_reserve_exact(self.channels)
-            .map_err(|_| "unable to reserve DPDFNet model hops".to_string())?;
-        for pending in &mut self.pending_model_rate {
+    fn take_pending_hop(&mut self) -> Result<(), String> {
+        for (pending, hop) in self
+            .pending_model_rate
+            .iter_mut()
+            .zip(&mut self.hop_scratch)
+        {
             if pending.len() < HOP_SIZE {
                 return Err("DPDFNet pending input underflow".into());
             }
-            let mut hop = [0.0f32; HOP_SIZE];
-            for destination in &mut hop {
+            for destination in hop {
                 let source = pending
                     .pop_front()
                     .ok_or_else(|| "DPDFNet pending input underflow".to_string())?;
                 *destination = crate::audio::sanitize_sample(source) as f32;
             }
-            hops.push(hop);
-        }
-        Ok(hops)
-    }
-
-    fn process_hop(
-        &mut self,
-        input: &[[f32; HOP_SIZE]],
-        output: &mut [Vec<f64>],
-    ) -> Result<(), String> {
-        if input.len() != self.channels {
-            return Err("DPDFNet model hop channel count changed".into());
-        }
-        let mut enhanced = Vec::new();
-        enhanced
-            .try_reserve_exact(self.channels)
-            .map_err(|_| "unable to reserve DPDFNet enhanced hops".to_string())?;
-        for (stream, hop) in self.streams.iter_mut().zip(input) {
-            enhanced.push(stream.process_hop(hop)?);
-        }
-        let produced = enhanced.first().is_some_and(Option::is_some);
-        if enhanced.iter().any(|channel| channel.is_some() != produced) {
-            return Err("DPDFNet channel streams became misaligned".into());
-        }
-        if produced {
-            self.append_model_hop(enhanced, output)?;
         }
         Ok(())
+    }
+
+    fn process_scratch_hop(&mut self, output: &mut [Vec<f64>]) -> Result<(), String> {
+        for ((stream, hop), enhanced) in self
+            .streams
+            .iter_mut()
+            .zip(&self.hop_scratch)
+            .zip(&mut self.enhanced_scratch)
+        {
+            *enhanced = stream.process_hop(hop)?;
+        }
+        self.append_scratch_hop(output)
     }
 
     fn flush_streams(&mut self, output: &mut [Vec<f64>]) -> Result<(), String> {
-        let mut enhanced = Vec::new();
-        enhanced
-            .try_reserve_exact(self.channels)
-            .map_err(|_| "unable to reserve DPDFNet flush hops".to_string())?;
-        for stream in &mut self.streams {
-            enhanced.push(stream.flush()?);
+        for (stream, enhanced) in self.streams.iter_mut().zip(&mut self.enhanced_scratch) {
+            *enhanced = stream.flush()?;
         }
-        let produced = enhanced.first().is_some_and(Option::is_some);
-        if enhanced.iter().any(|channel| channel.is_some() != produced) {
-            return Err("DPDFNet channel flushes became misaligned".into());
+        self.append_scratch_hop(output)
+    }
+
+    fn append_scratch_hop(&mut self, output: &mut [Vec<f64>]) -> Result<(), String> {
+        let produced = self.enhanced_scratch.first().is_some_and(Option::is_some);
+        if self
+            .enhanced_scratch
+            .iter()
+            .any(|channel| channel.is_some() != produced)
+        {
+            return Err("DPDFNet channel streams became misaligned".into());
         }
         if produced {
-            self.append_model_hop(enhanced, output)?;
+            self.append_model_hop(output)?;
         }
         Ok(())
     }
 
-    fn append_model_hop(
-        &mut self,
-        enhanced: Vec<Option<[f32; HOP_SIZE]>>,
-        output: &mut [Vec<f64>],
-    ) -> Result<(), String> {
+    fn append_model_hop(&mut self, output: &mut [Vec<f64>]) -> Result<(), String> {
         let skip = self.discard_model_frames.min(HOP_SIZE);
         let available = HOP_SIZE - skip;
         let remaining = self
@@ -621,8 +648,10 @@ impl StreamingProcessor {
             .checked_sub(self.model_output_frames)
             .ok_or_else(|| "DPDFNet model output exceeded its input clock".to_string())?;
         let retained = available.min(remaining);
-        for (destination, channel) in output.iter_mut().zip(enhanced) {
-            let channel = channel.ok_or_else(|| "DPDFNet enhanced hop is missing".to_string())?;
+        for (destination, channel) in output.iter_mut().zip(&self.enhanced_scratch) {
+            let channel = channel
+                .as_ref()
+                .ok_or_else(|| "DPDFNet enhanced hop is missing".to_string())?;
             destination.extend(
                 channel[skip..skip + retained]
                     .iter()
@@ -701,16 +730,16 @@ fn append_limited(
 
 pub(crate) fn streaming_state_bytes(channels: usize) -> Result<u64, crate::ConfigError> {
     let per_channel_scalars = DPDFNET2_STATE_SIZE
-        .checked_add(FFT_SIZE * 3)
-        .and_then(|value| value.checked_add(BINS * 4))
-        .and_then(|value| value.checked_add(HOP_SIZE))
+        .checked_add(FFT_SIZE * 5)
+        .and_then(|value| value.checked_add(BINS * 2))
+        .and_then(|value| value.checked_add(HOP_SIZE * 2 + 1))
         .ok_or(crate::ConfigError::ResourceOverflow {
             resource: "DPDFNet stream state",
         })?;
     let per_channel_bytes = u64::try_from(per_channel_scalars)
         .ok()
         .and_then(|value| value.checked_mul(std::mem::size_of::<f32>() as u64))
-        .and_then(|value| value.checked_add((std::mem::size_of::<Vec<f32>>() * 5) as u64))
+        .and_then(|value| value.checked_add((std::mem::size_of::<Vec<f32>>() * 7) as u64))
         .ok_or(crate::ConfigError::ResourceOverflow {
             resource: "DPDFNet stream state",
         })?;
@@ -1045,6 +1074,10 @@ mod tests {
             })
             .collect();
         let mut stream = StreamingProcessor::new(&config, 44_100, 1).unwrap();
+        assert!(stream
+            .streams
+            .iter()
+            .all(|stream| stream.reuse_runtime_state));
         let mut expected = stream.process_block(&[input.clone()]).unwrap();
         expected[0].extend(stream.finish().unwrap().remove(0));
 
@@ -1078,6 +1111,31 @@ mod tests {
             .fold(0.0f64, f64::max);
         assert!(maximum < 1e-6, "partition maximum difference was {maximum}");
         assert!(stream.process_block(&[vec![0.0]]).is_err());
+    }
+
+    #[test]
+    fn native_rate_stream_sanitizes_and_finishes_exactly() {
+        let (_directory, path) = write_identity_model();
+        let config = OnnxModelConfig {
+            path,
+            sample_rate: SAMPLE_RATE,
+        };
+        let input: Vec<f64> = (0..5_123)
+            .map(|index| match index {
+                31 => f64::NAN,
+                2_777 => f64::NEG_INFINITY,
+                _ => {
+                    (std::f64::consts::TAU * 613.0 * index as f64 / SAMPLE_RATE as f64).sin() * 0.2
+                }
+            })
+            .collect();
+        let mut stream = StreamingProcessor::new(&config, SAMPLE_RATE, 1).unwrap();
+        assert!(stream.native_rate);
+        let mut output = stream.process_block(&[input.clone()]).unwrap().remove(0);
+        output.extend(stream.finish().unwrap().remove(0));
+
+        assert_eq!(output.len(), input.len());
+        assert!(output.iter().all(|sample| sample.is_finite()));
     }
 
     fn write_identity_model() -> (tempfile::TempDir, std::path::PathBuf) {

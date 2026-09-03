@@ -939,6 +939,13 @@ mod tests {
         assert_send::<StreamingBackendSession>();
     }
 
+    #[cfg(feature = "dpdfnet")]
+    #[test]
+    fn dpdfnet_build_keeps_public_streaming_sessions_sendable() {
+        fn assert_send<T: Send>() {}
+        assert_send::<StreamingBackendSession>();
+    }
+
     #[test]
     fn unsupported_compiled_backend_is_rejected() {
         #[cfg(feature = "onnx")]
