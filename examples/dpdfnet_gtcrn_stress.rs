@@ -446,7 +446,7 @@ fn run_dpdfnet_daw_threads(
         // Exercise direct production calls under the same platform scheduling
         // class as the released inference worker. The guard is thread-bound
         // and remains live for the complete measurement.
-        let _priority_guard = denoize::neural_daw::NeuralDawWorkerPriorityGuard::acquire()?;
+        let mut priority_guard = denoize::neural_daw::NeuralDawWorkerPriorityGuard::acquire()?;
         barrier.wait();
         let wall_started = Instant::now();
         let mut durations_ms = Vec::with_capacity(calls);
@@ -460,7 +460,7 @@ fn run_dpdfnet_daw_threads(
                 }
             }
             let started = Instant::now();
-            let output = stream.process_block(&input)?;
+            let output = priority_guard.run_inference_cycle(|| stream.process_block(&input))?;
             durations_ms.push(milliseconds(started.elapsed()));
             checksum += output
                 .first()

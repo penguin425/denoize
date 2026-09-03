@@ -7,6 +7,8 @@ use crate::daw::{
 use crate::CommitMode;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+#[cfg(target_os = "macos")]
+use std::sync::OnceLock;
 
 pub const NEURAL_DAW_PLUGIN_ID: &str = "org.penguin425.denoize.neural";
 pub const NEURAL_DAW_SESSION_SCHEMA: &str = "denoize-neural-daw-session-v1";
@@ -35,8 +37,9 @@ const MACOS_NEURAL_COMPUTATION_NANOS: u64 = MACOS_NEURAL_PERIOD_NANOS;
 /// Keeping the dependent inference worker at ordinary priority can therefore
 /// starve it even when the model's measured compute time is below its buffered
 /// deadline. Windows uses the `Pro Audio` MMCSS task at its critical relative
-/// priority. macOS combines interactive QoS with a 10 ms Mach time constraint;
-/// other platforms deliberately keep their existing scheduling.
+/// priority. macOS combines interactive QoS and a 10 ms Mach time constraint
+/// with an Audio Work Interval that describes each inference cycle; other
+/// platforms deliberately keep their existing scheduling.
 #[doc(hidden)]
 #[must_use = "dropping the guard releases the neural worker scheduling class"]
 pub struct NeuralDawWorkerPriorityGuard {
@@ -50,6 +53,8 @@ pub struct NeuralDawWorkerPriorityGuard {
     mach_thread: mach2::port::mach_port_t,
     #[cfg(target_os = "macos")]
     previous_time_constraint: mach2::thread_policy::thread_time_constraint_policy_data_t,
+    #[cfg(target_os = "macos")]
+    audio_work_interval: Option<MacOsAudioWorkInterval>,
     // Both platform APIs must be reverted on the thread that acquired them.
     // Make that invariant a type property instead of relying on callers.
     #[cfg(any(windows, target_os = "macos"))]
@@ -147,11 +152,17 @@ impl NeuralDawWorkerPriorityGuard {
                 acquire_macos_time_constraint().map_err(|error| {
                     // The QoS change already succeeded. Restore it before
                     // returning so failed activation cannot leak priority.
-                    let restore = unsafe {
-                        libc::pthread_set_qos_class_self_np(
-                            previous_qos_class,
-                            previous_relative_priority,
-                        )
+                    let restore = if previous_qos_class as u32
+                        == libc::qos_class_t::QOS_CLASS_UNSPECIFIED as u32
+                    {
+                        0
+                    } else {
+                        unsafe {
+                            libc::pthread_set_qos_class_self_np(
+                                previous_qos_class,
+                                previous_relative_priority,
+                            )
+                        }
                     };
                     if restore == 0 {
                         error
@@ -162,11 +173,25 @@ impl NeuralDawWorkerPriorityGuard {
                         )
                     }
                 })?;
+            let audio_work_interval = match MacOsAudioWorkInterval::acquire() {
+                Ok(interval) => interval,
+                Err(error) => {
+                    // Audio Work Intervals refine the existing real-time
+                    // scheduling policy, but they are not present before
+                    // macOS 11 and may be unavailable in restricted hosts.
+                    // Preserve the established time-constraint fallback.
+                    eprintln!(
+                        "denoize Neural worker could not enter a macOS Audio Work Interval: {error}"
+                    );
+                    None
+                }
+            };
             Ok(Self {
                 previous_qos_class,
                 previous_relative_priority,
                 mach_thread,
                 previous_time_constraint,
+                audio_work_interval,
                 _not_send: std::marker::PhantomData,
             })
         }
@@ -175,6 +200,23 @@ impl NeuralDawWorkerPriorityGuard {
         {
             Ok(Self {})
         }
+    }
+
+    /// Runs one bounded inference cycle under the platform's periodic audio
+    /// scheduling contract.
+    ///
+    /// Audio Work Interval bookkeeping is real-time safe. A scheduling API
+    /// failure disables the optional interval for the rest of this worker but
+    /// never converts otherwise valid audio into a processing failure.
+    #[doc(hidden)]
+    pub fn run_inference_cycle<T>(&mut self, process: impl FnOnce() -> T) -> T {
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(interval) = self.audio_work_interval.as_mut() {
+                return interval.run_cycle(process);
+            }
+        }
+        process()
     }
 }
 
@@ -204,6 +246,10 @@ impl Drop for NeuralDawWorkerPriorityGuard {
                 THREAD_TIME_CONSTRAINT_POLICY_COUNT,
             };
 
+            // Leave and release the workgroup on the same pthread that joined
+            // it, before restoring that thread's prior scheduling policy.
+            drop(self.audio_work_interval.take());
+
             // Restore the exact Mach scheduling policy captured on this
             // pthread before returning it to its previous QoS class.
             let result = unsafe {
@@ -219,22 +265,309 @@ impl Drop for NeuralDawWorkerPriorityGuard {
                     "denoize Neural worker could not restore macOS time constraint: Mach error {result}"
                 );
             }
-            // SAFETY: the guard is !Send, so it is dropped on the acquiring
-            // pthread. Both values were returned by pthread_get_qos_class_np.
-            let result = unsafe {
-                libc::pthread_set_qos_class_self_np(
-                    self.previous_qos_class,
-                    self.previous_relative_priority,
-                )
-            };
-            if result != 0 {
-                eprintln!(
-                    "denoize Neural worker could not restore macOS QoS: {}",
-                    std::io::Error::from_raw_os_error(result)
-                );
+            // `pthread_get_qos_class_np` reports UNSPECIFIED for a thread with
+            // no explicit override, but the setter rejects UNSPECIFIED. Such a
+            // thread naturally returns to its inherited class when it exits.
+            if self.previous_qos_class as u32 != libc::qos_class_t::QOS_CLASS_UNSPECIFIED as u32 {
+                // SAFETY: the guard is !Send, so it is dropped on the
+                // acquiring pthread. Both values were returned by
+                // pthread_get_qos_class_np.
+                let result = unsafe {
+                    libc::pthread_set_qos_class_self_np(
+                        self.previous_qos_class,
+                        self.previous_relative_priority,
+                    )
+                };
+                if result != 0 {
+                    eprintln!(
+                        "denoize Neural worker could not restore macOS QoS: {}",
+                        std::io::Error::from_raw_os_error(result)
+                    );
+                }
             }
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+type AudioWorkIntervalCreateFn =
+    unsafe extern "C" fn(*const libc::c_char, u32, *mut libc::c_void) -> *mut libc::c_void;
+#[cfg(target_os = "macos")]
+type OsWorkgroupJoinFn =
+    unsafe extern "C" fn(*mut libc::c_void, *mut MacOsWorkgroupJoinToken) -> libc::c_int;
+#[cfg(target_os = "macos")]
+type OsWorkgroupLeaveFn = unsafe extern "C" fn(*mut libc::c_void, *mut MacOsWorkgroupJoinToken);
+#[cfg(target_os = "macos")]
+type OsWorkgroupIntervalStartFn =
+    unsafe extern "C" fn(*mut libc::c_void, u64, u64, *mut libc::c_void) -> libc::c_int;
+#[cfg(target_os = "macos")]
+type OsWorkgroupIntervalFinishFn =
+    unsafe extern "C" fn(*mut libc::c_void, *mut libc::c_void) -> libc::c_int;
+#[cfg(target_os = "macos")]
+type OsReleaseFn = unsafe extern "C" fn(*mut libc::c_void);
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+struct MacOsAudioWorkIntervalApi {
+    create: AudioWorkIntervalCreateFn,
+    join: OsWorkgroupJoinFn,
+    leave: OsWorkgroupLeaveFn,
+    start: OsWorkgroupIntervalStartFn,
+    finish: OsWorkgroupIntervalFinishFn,
+    release: OsReleaseFn,
+}
+
+#[cfg(target_os = "macos")]
+impl MacOsAudioWorkIntervalApi {
+    fn get() -> Option<&'static Self> {
+        static API: OnceLock<Option<MacOsAudioWorkIntervalApi>> = OnceLock::new();
+        API.get_or_init(|| {
+            // Load the framework at worker startup instead of hard-linking a
+            // macOS 11 symbol into binaries that retain an older deployment
+            // target. The successful handle intentionally remains open for
+            // the process lifetime because the cached function pointers do.
+            let framework = unsafe {
+                libc::dlopen(
+                    c"/System/Library/Frameworks/AudioToolbox.framework/AudioToolbox".as_ptr(),
+                    libc::RTLD_LAZY | libc::RTLD_LOCAL,
+                )
+            };
+            if framework.is_null() {
+                return None;
+            }
+            let create = unsafe { libc::dlsym(framework, c"AudioWorkIntervalCreate".as_ptr()) };
+            let join = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"os_workgroup_join".as_ptr()) };
+            let leave = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"os_workgroup_leave".as_ptr()) };
+            let start =
+                unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"os_workgroup_interval_start".as_ptr()) };
+            let finish = unsafe {
+                libc::dlsym(libc::RTLD_DEFAULT, c"os_workgroup_interval_finish".as_ptr())
+            };
+            let release = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"os_release".as_ptr()) };
+            if [create, join, leave, start, finish, release]
+                .iter()
+                .any(|symbol| symbol.is_null())
+            {
+                unsafe { libc::dlclose(framework) };
+                return None;
+            }
+            Some(Self {
+                // SAFETY: each non-null address above was resolved by its
+                // exported C symbol name from the owning Apple framework.
+                create: unsafe {
+                    std::mem::transmute::<*mut libc::c_void, AudioWorkIntervalCreateFn>(create)
+                },
+                join: unsafe { std::mem::transmute::<*mut libc::c_void, OsWorkgroupJoinFn>(join) },
+                leave: unsafe {
+                    std::mem::transmute::<*mut libc::c_void, OsWorkgroupLeaveFn>(leave)
+                },
+                start: unsafe {
+                    std::mem::transmute::<*mut libc::c_void, OsWorkgroupIntervalStartFn>(start)
+                },
+                finish: unsafe {
+                    std::mem::transmute::<*mut libc::c_void, OsWorkgroupIntervalFinishFn>(finish)
+                },
+                release: unsafe { std::mem::transmute::<*mut libc::c_void, OsReleaseFn>(release) },
+            })
+        })
+        .as_ref()
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C, align(8))]
+struct MacOsWorkgroupJoinToken {
+    sig: u32,
+    opaque: [u8; 36],
+}
+
+#[cfg(target_os = "macos")]
+const _: [(); 40] = [(); std::mem::size_of::<MacOsWorkgroupJoinToken>()];
+#[cfg(target_os = "macos")]
+const _: [(); 8] = [(); std::mem::align_of::<MacOsWorkgroupJoinToken>()];
+
+#[cfg(target_os = "macos")]
+struct MacOsAudioWorkInterval {
+    api: &'static MacOsAudioWorkIntervalApi,
+    workgroup: *mut libc::c_void,
+    join_token: MacOsWorkgroupJoinToken,
+    period_ticks: u64,
+    disabled: bool,
+    joined: bool,
+    poisoned: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl MacOsAudioWorkInterval {
+    fn acquire() -> Result<Option<Self>, String> {
+        const OS_CLOCK_MACH_ABSOLUTE_TIME: u32 = 32;
+
+        let Some(api) = MacOsAudioWorkIntervalApi::get() else {
+            return Ok(None);
+        };
+        let period_ticks = macos_absolute_ticks(MACOS_NEURAL_PERIOD_NANOS)?;
+        let workgroup = unsafe {
+            (api.create)(
+                c"denoize Neural".as_ptr(),
+                OS_CLOCK_MACH_ABSOLUTE_TIME,
+                std::ptr::null_mut(),
+            )
+        };
+        if workgroup.is_null() {
+            return Err("create macOS audio work interval".to_owned());
+        }
+        let mut join_token = MacOsWorkgroupJoinToken {
+            sig: 0,
+            opaque: [0; 36],
+        };
+        let result = unsafe { (api.join)(workgroup, &mut join_token) };
+        if result != 0 {
+            unsafe { (api.release)(workgroup) };
+            return Err(format!(
+                "join macOS audio work interval: {}",
+                std::io::Error::from_raw_os_error(result)
+            ));
+        }
+        Ok(Some(Self {
+            api,
+            workgroup,
+            join_token,
+            period_ticks,
+            disabled: false,
+            joined: true,
+            poisoned: false,
+        }))
+    }
+
+    fn run_cycle<T>(&mut self, process: impl FnOnce() -> T) -> T {
+        // An unwind may have prevented `run_cycle` from observing a failed
+        // finish. Detach before doing any more work if the cycle guard marked
+        // this interval as poisoned while unwinding.
+        if self.poisoned {
+            self.disable_poisoned();
+        }
+        if self.disabled {
+            return process();
+        }
+        let start = unsafe { mach2::mach_time::mach_absolute_time() };
+        let deadline = start.saturating_add(self.period_ticks);
+        let result =
+            unsafe { (self.api.start)(self.workgroup, start, deadline, std::ptr::null_mut()) };
+        if result != 0 {
+            // libdispatch clears its STARTED state on every start failure, so
+            // this object remains safe to leave and release before falling
+            // back to the existing Mach time-constraint policy.
+            self.disable_cleanly();
+            return process();
+        }
+        let cycle = MacOsAudioWorkIntervalCycle {
+            api: self.api,
+            workgroup: self.workgroup,
+            active: true,
+            poisoned: &mut self.poisoned,
+        };
+        let processed = process();
+        if !cycle.finish() {
+            // A failed finish leaves libdispatch's STARTED bit set. Leaving
+            // clears the thread membership, but releasing the final reference
+            // would deliberately abort the host. Detach immediately and leak
+            // only this unusable reference in that exceptional state.
+            self.disable_poisoned();
+        }
+        processed
+    }
+
+    fn leave(&mut self) {
+        if self.joined {
+            unsafe { (self.api.leave)(self.workgroup, &mut self.join_token) };
+            self.joined = false;
+        }
+    }
+
+    fn disable_cleanly(&mut self) {
+        self.leave();
+        unsafe { (self.api.release)(self.workgroup) };
+        self.workgroup = std::ptr::null_mut();
+        self.disabled = true;
+    }
+
+    fn disable_poisoned(&mut self) {
+        self.poisoned = true;
+        self.leave();
+        // Releasing a workgroup whose interval is still STARTED is a
+        // documented client-programming crash in libdispatch. Forget this
+        // single reference instead; process teardown reclaims it.
+        self.workgroup = std::ptr::null_mut();
+        self.disabled = true;
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for MacOsAudioWorkInterval {
+    fn drop(&mut self) {
+        if self.workgroup.is_null() {
+            return;
+        }
+        self.leave();
+        if !self.poisoned {
+            unsafe { (self.api.release)(self.workgroup) };
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct MacOsAudioWorkIntervalCycle<'a> {
+    api: &'static MacOsAudioWorkIntervalApi,
+    workgroup: *mut libc::c_void,
+    active: bool,
+    poisoned: &'a mut bool,
+}
+
+#[cfg(target_os = "macos")]
+impl MacOsAudioWorkIntervalCycle<'_> {
+    fn finish(mut self) -> bool {
+        let result = unsafe { (self.api.finish)(self.workgroup, std::ptr::null_mut()) };
+        self.active = false;
+        if result == 0 {
+            true
+        } else {
+            // libdispatch only clears STARTED after a successful finish.
+            *self.poisoned = true;
+            false
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for MacOsAudioWorkIntervalCycle<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            let result = unsafe { (self.api.finish)(self.workgroup, std::ptr::null_mut()) };
+            if result != 0 {
+                // Mark poison before unwinding continues. Logging here could
+                // itself panic while another panic is already in flight.
+                *self.poisoned = true;
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_absolute_ticks(nanoseconds: u64) -> Result<u64, String> {
+    use mach2::kern_return::KERN_SUCCESS;
+    use mach2::mach_time::{mach_timebase_info, mach_timebase_info_data_t};
+
+    let mut timebase = mach_timebase_info_data_t { numer: 0, denom: 0 };
+    let result = unsafe { mach_timebase_info(&mut timebase) };
+    if result != KERN_SUCCESS || timebase.numer == 0 || timebase.denom == 0 {
+        return Err(format!(
+            "read macOS Mach timebase for neural worker: Mach error {result}"
+        ));
+    }
+    nanoseconds
+        .checked_mul(u64::from(timebase.denom))
+        .and_then(|value| value.checked_div(u64::from(timebase.numer)))
+        .ok_or_else(|| "convert neural worker period to Mach absolute time".to_owned())
 }
 
 #[cfg(target_os = "macos")]

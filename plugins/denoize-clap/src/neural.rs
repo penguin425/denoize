@@ -1409,23 +1409,25 @@ impl<'a> NeuralEngine<'a> {
         let worker = thread::Builder::new()
             .name("denoize-neural".to_owned())
             .spawn(move || {
-                let (mut processor, priority_guard) = match factory().and_then(|mut processor| {
-                    warm_up_block_processor(&mut *processor, channels, warmup_frames)?;
-                    let priority_guard =
-                        denoize::neural_daw::NeuralDawWorkerPriorityGuard::acquire()?;
-                    Ok((processor, priority_guard))
-                }) {
-                    Ok(initialized) => {
-                        let _ = ready_tx.send(Ok(()));
-                        initialized
-                    }
-                    Err(error) => {
-                        let _ = ready_tx.send(Err(error));
-                        return;
-                    }
-                };
+                let (mut processor, mut priority_guard) =
+                    match factory().and_then(|mut processor| {
+                        warm_up_block_processor(&mut *processor, channels, warmup_frames)?;
+                        let priority_guard =
+                            denoize::neural_daw::NeuralDawWorkerPriorityGuard::acquire()?;
+                        Ok((processor, priority_guard))
+                    }) {
+                        Ok(initialized) => {
+                            let _ = ready_tx.send(Ok(()));
+                            initialized
+                        }
+                        Err(error) => {
+                            let _ = ready_tx.send(Err(error));
+                            return;
+                        }
+                    };
                 worker_loop(
                     &mut *processor,
+                    &mut priority_guard,
                     channels,
                     worker_input,
                     worker_output,
@@ -1812,6 +1814,7 @@ impl NeuralEngine<'_> {
 
 fn worker_loop(
     processor: &mut dyn BlockProcessor,
+    priority_guard: &mut denoize::neural_daw::NeuralDawWorkerPriorityGuard,
     channels: usize,
     input: Arc<ArrayQueue<AudioBlock>>,
     output: Arc<ArrayQueue<ProcessedBlock>>,
@@ -1839,59 +1842,69 @@ fn worker_loop(
             thread::park_timeout(WORKER_POLL);
             continue;
         };
-        let discontinuity = block.generation != generation || block.start_frame != next_start;
-        if discontinuity {
-            generation = block.generation;
-            ready.iter_mut().for_each(VecDeque::clear);
-            while let Some(pending_block) = pending.pop_front() {
-                completed.push_back(ProcessedBlock {
-                    block: pending_block,
-                    valid: false,
-                });
-            }
-            failed = if let Err(error) = processor.reset() {
-                eprintln!("denoize Neural worker reset error: {error}");
-                worker_errors.fetch_add(1, Ordering::Relaxed);
-                true
-            } else {
-                false
-            };
-        }
-        next_start = block.start_frame.saturating_add(block.frames as u64);
-        if failed {
-            completed.push_back(ProcessedBlock {
-                block,
-                valid: false,
-            });
-            continue;
-        }
-
-        let planar = block_to_planar(&block, channels);
-        let processed = processor.process(&planar).and_then(|processed| {
-            append_ready(&mut ready, &processed, channels)
-                .map_err(|()| "neural worker returned invalid channel geometry".to_owned())
-        });
-        match processed {
-            Ok(()) => {
-                pending.push_back(block);
-                complete_ready_blocks(&mut pending, &mut completed, &mut ready, channels);
-            }
-            Err(error) => {
-                eprintln!("denoize Neural worker processing error: {error}");
-                failed = true;
-                worker_errors.fetch_add(1, Ordering::Relaxed);
-                completed.push_back(ProcessedBlock {
-                    block,
-                    valid: false,
-                });
+        // Once a block has been dequeued, all deadline-bound preparation,
+        // inference, and output assembly belongs to the same Audio Work
+        // Interval. Queue exchange and diagnostics stay outside the interval.
+        let cycle_failure = priority_guard.run_inference_cycle(|| {
+            let mut cycle_failure = None;
+            let discontinuity = block.generation != generation || block.start_frame != next_start;
+            if discontinuity {
+                generation = block.generation;
+                ready.iter_mut().for_each(VecDeque::clear);
                 while let Some(pending_block) = pending.pop_front() {
                     completed.push_back(ProcessedBlock {
                         block: pending_block,
                         valid: false,
                     });
                 }
-                ready.iter_mut().for_each(VecDeque::clear);
+                failed = if let Err(error) = processor.reset() {
+                    worker_errors.fetch_add(1, Ordering::Relaxed);
+                    cycle_failure = Some(("reset", error));
+                    true
+                } else {
+                    false
+                };
             }
+            next_start = block.start_frame.saturating_add(block.frames as u64);
+            if failed {
+                completed.push_back(ProcessedBlock {
+                    block,
+                    valid: false,
+                });
+                return cycle_failure;
+            }
+
+            let planar = block_to_planar(&block, channels);
+            let processed = processor.process(&planar).and_then(|processed| {
+                append_ready(&mut ready, &processed, channels)
+                    .map_err(|()| "neural worker returned invalid channel geometry".to_owned())
+            });
+            match processed {
+                Ok(()) => {
+                    pending.push_back(block);
+                    complete_ready_blocks(&mut pending, &mut completed, &mut ready, channels);
+                }
+                Err(error) => {
+                    failed = true;
+                    worker_errors.fetch_add(1, Ordering::Relaxed);
+                    cycle_failure = Some(("processing", error));
+                    completed.push_back(ProcessedBlock {
+                        block,
+                        valid: false,
+                    });
+                    while let Some(pending_block) = pending.pop_front() {
+                        completed.push_back(ProcessedBlock {
+                            block: pending_block,
+                            valid: false,
+                        });
+                    }
+                    ready.iter_mut().for_each(VecDeque::clear);
+                }
+            }
+            cycle_failure
+        });
+        if let Some((operation, error)) = cycle_failure {
+            eprintln!("denoize Neural worker {operation} error: {error}");
         }
     }
 }
