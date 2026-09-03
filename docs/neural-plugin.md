@@ -104,10 +104,11 @@ its own specification warns that synchronization may violate hard real-time
 rules and `request_exec` waits for completion.
 
 On Windows, the named worker joins the `Pro Audio` Multimedia Class Scheduler
-Service task after model preparation and warm-up, and before activation reports
-it ready. If registration fails, neural inference stays unavailable and the
-fixed-latency fallback remains active. The worker leaves the task when it exits;
-other platforms retain their native scheduler behavior.
+Service task at its critical relative priority after model preparation and
+warm-up, and before activation reports it ready. If either scheduling step
+fails, neural inference stays unavailable and the fixed-latency fallback
+remains active. The worker leaves the task when it exits; other platforms
+retain their native scheduler behavior.
 
 Automated REAPER evidence separates device priming from sustained processing.
 REAPER's Dummy Audio device can request about one output-buffer horizon faster
