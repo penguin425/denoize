@@ -10,7 +10,7 @@ use sha2::{Digest as _, Sha256};
 use std::env;
 use std::path::PathBuf;
 use std::sync::{Arc, Barrier};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const DAW_SAMPLE_RATE: u32 = 48_000;
 const DAW_BLOCK_FRAMES: usize = 480;
@@ -54,6 +54,7 @@ struct Args {
     model_path: PathBuf,
     seconds: usize,
     parallel: usize,
+    realtime_paced: bool,
     json: PathBuf,
 }
 
@@ -111,10 +112,18 @@ fn run() -> Result<(), String> {
                         args.model_path.clone(),
                         args.seconds,
                         args.parallel,
+                        args.realtime_paced,
                     )?,
-                    "one 48-kHz stereo-linked 480-frame host block through the production arbitrary-block adapter",
+                    if args.realtime_paced {
+                        "one real-time-paced 48-kHz stereo-linked 480-frame host block through the production arbitrary-block adapter"
+                    } else {
+                        "one unpaced 48-kHz stereo-linked 480-frame host block through the production arbitrary-block adapter"
+                    },
                 )
             } else {
+                if args.realtime_paced {
+                    return Err("--realtime-paced requires --model dpdfnet-daw".into());
+                }
                 (
                     run_dpdfnet_threads(model, args.seconds, args.parallel)?,
                     "one native 480-sample/10-ms inference hop",
@@ -215,6 +224,7 @@ fn finish(
         "state_size": state_size,
         "parallel_streams": args.parallel,
         "requested_seconds_per_stream": args.seconds,
+        "realtime_paced": args.realtime_paced,
         "measured_audio_seconds": total_audio_seconds,
         "calls": durations.len(),
         "load_ms": load_ms,
@@ -404,6 +414,7 @@ fn run_dpdfnet_daw_threads(
     model_path: PathBuf,
     seconds: usize,
     parallel: usize,
+    realtime_paced: bool,
 ) -> Result<Vec<ThreadResult>, String> {
     let calls = seconds
         .checked_mul(100)
@@ -437,6 +448,13 @@ fn run_dpdfnet_daw_threads(
         let mut durations_ms = Vec::with_capacity(calls);
         let mut checksum = 0.0;
         for index in 0..calls {
+            if realtime_paced {
+                let due =
+                    wall_started + Duration::from_micros((index as u64).saturating_mul(10_000));
+                if let Some(delay) = due.checked_duration_since(Instant::now()) {
+                    std::thread::sleep(delay);
+                }
+            }
             let started = Instant::now();
             let output = stream.process_block(&input)?;
             durations_ms.push(milliseconds(started.elapsed()));
@@ -731,6 +749,7 @@ fn parse_args() -> Result<Args, String> {
     let mut model_path = None;
     let mut seconds = 60usize;
     let mut parallel = 1usize;
+    let mut realtime_paced = false;
     let mut json = None;
     while let Some(argument) = arguments.next() {
         let value = |arguments: &mut std::iter::Skip<std::env::Args>| {
@@ -751,6 +770,7 @@ fn parse_args() -> Result<Args, String> {
                     .parse()
                     .map_err(|_| "--parallel must be an integer".to_string())?;
             }
+            "--realtime-paced" => realtime_paced = true,
             "--json" => json = Some(PathBuf::from(value(&mut arguments)?)),
             _ => return Err(format!("unknown argument `{argument}`\n{}", usage())),
         }
@@ -766,10 +786,11 @@ fn parse_args() -> Result<Args, String> {
         model_path: model_path.ok_or_else(|| format!("missing --model-path\n{}", usage()))?,
         seconds,
         parallel,
+        realtime_paced,
         json: json.ok_or_else(|| format!("missing --json\n{}", usage()))?,
     })
 }
 
 fn usage() -> &'static str {
-    "usage: dpdfnet_gtcrn_stress --model dpdfnet2|dpdfnet8|dpdfnet-daw|gtcrn|gtcrn-daw \\\n  --model-path MODEL.onnx [--seconds 60] [--parallel 1] --json RESULT.json"
+    "usage: dpdfnet_gtcrn_stress --model dpdfnet2|dpdfnet8|dpdfnet-daw|gtcrn|gtcrn-daw \\\n  --model-path MODEL.onnx [--seconds 60] [--parallel 1] [--realtime-paced] --json RESULT.json"
 }

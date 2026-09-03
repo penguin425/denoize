@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-dpdfnet-platform-evidence-v2.schema.json",
+  "title": "denoize DPDFNet cross-platform performance evidence v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "schema_version", "source_commit", "model_id", "model_sha256", "platform", "inputs", "measurement", "checks", "accepted"],
+  "properties": {
+    "schema": { "const": "denoize-dpdfnet-platform-evidence-v2" },
+    "schema_version": { "const": 2 },
+    "source_commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "model_id": { "const": "dpdfnet2-48khz-hr" },
+    "model_sha256": { "const": "7f0575a5cec0ba4ffd8f8bd657e06d007e4ccdd955d76faab922b9d3291dc14b" },
+    "platform": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["os", "os_version", "target", "arch", "cpu_model", "logical_cpus", "hardware_tier", "runner_label"],
+      "properties": {
+        "os": { "enum": ["linux", "macos", "windows"] },
+        "os_version": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "target": { "type": "string", "pattern": "^[A-Za-z0-9_.-]{3,128}$" },
+        "arch": { "enum": ["x86_64", "aarch64"] },
+        "cpu_model": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "logical_cpus": { "type": "integer", "minimum": 1, "maximum": 1024 },
+        "hardware_tier": { "enum": ["portable-ci", "lowest-supported"] },
+        "runner_label": { "enum": ["ubuntu-24.04", "macos-14", "windows-2025", "ubuntu-slim"] }
+      }
+    },
+    "inputs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stress", "paced_worker"],
+      "properties": {
+        "stress": { "$ref": "#/$defs/file" },
+        "paced_worker": { "$ref": "#/$defs/file" }
+      }
+    },
+    "measurement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stress_seconds", "stress_calls", "stress_realtime_paced", "p99_9_ms", "maximum_ms", "deadline_misses", "summed_compute_rtf", "peak_rss_bytes", "paced_worker_blocks", "worker_neural_frames", "worker_error_counter_total"],
+      "properties": {
+        "stress_seconds": { "type": "integer", "minimum": 1, "maximum": 3600 },
+        "stress_calls": { "type": "integer", "minimum": 100, "maximum": 360000 },
+        "stress_realtime_paced": { "const": true },
+        "p99_9_ms": { "type": "number", "minimum": 0, "maximum": 10000 },
+        "maximum_ms": { "type": "number", "minimum": 0, "maximum": 10000 },
+        "deadline_misses": { "type": "integer", "minimum": 0, "maximum": 360000 },
+        "summed_compute_rtf": { "type": "number", "minimum": 0, "maximum": 1000 },
+        "peak_rss_bytes": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "paced_worker_blocks": { "type": "integer", "minimum": 1, "maximum": 10000000 },
+        "worker_neural_frames": { "type": "integer", "minimum": 0, "maximum": 4800000000 },
+        "worker_error_counter_total": { "type": "integer", "minimum": 0, "maximum": 40000000 }
+      }
+    },
+    "checks": { "type": "array", "minItems": 11, "maxItems": 11, "items": { "$ref": "#/$defs/check" } },
+    "accepted": { "type": "boolean" }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "file": {
+      "type": "object", "additionalProperties": false,
+      "required": ["name", "size_bytes", "sha256"],
+      "properties": {
+        "name": { "type": "string", "pattern": "^[A-Za-z0-9._+-]{1,255}$" },
+        "size_bytes": { "type": "integer", "minimum": 1, "maximum": 16777216 },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "check": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "observed", "operator", "limit", "passed"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z0-9-]{1,64}$" },
+        "observed": { "type": "number" },
+        "operator": { "enum": ["greater-or-equal", "less-or-equal"] },
+        "limit": { "type": "number" },
+        "passed": { "type": "boolean" }
+      }
+    }
+  }
+}

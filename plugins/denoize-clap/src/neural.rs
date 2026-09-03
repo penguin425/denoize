@@ -2471,8 +2471,20 @@ mod tests {
         assert_eq!(shared.late_blocks.load(Ordering::Relaxed), 0);
         assert_eq!(shared.invalid_blocks.load(Ordering::Relaxed), 0);
 
+        let paced_seconds = std::env::var("DENOIZE_NEURAL_WORKER_SECONDS")
+            .map(|value| {
+                value
+                    .parse::<usize>()
+                    .expect("DENOIZE_NEURAL_WORKER_SECONDS must be an integer")
+            })
+            .unwrap_or(1);
+        assert!(
+            (1..=3_600).contains(&paced_seconds),
+            "DENOIZE_NEURAL_WORKER_SECONDS must be between 1 and 3600"
+        );
+        let paced_blocks = paced_seconds * 100;
         let latency = engine.latency_frames as usize;
-        let frames = latency + engine.chunk_frames * 100;
+        let frames = latency + engine.chunk_frames * paced_blocks;
         let mut finite = 0usize;
         let mut neural_frames = 0usize;
         let mut inputs = Vec::with_capacity(frames);
@@ -2520,6 +2532,7 @@ mod tests {
             frames,
             finite,
             neural_frames,
+            paced_blocks,
             measurement_wall_seconds,
             shared,
         );
@@ -2531,6 +2544,7 @@ mod tests {
         measured_frames: usize,
         finite_frames: usize,
         neural_frames: usize,
+        paced_blocks: usize,
         measurement_wall_seconds: f64,
         shared: &NeuralShared,
     ) {
@@ -2548,7 +2562,7 @@ mod tests {
             "channels": 1,
             "chunk_frames": engine.chunk_frames,
             "latency_frames": engine.latency_frames,
-            "paced_blocks": 100,
+            "paced_blocks": paced_blocks,
             "measured_frames": measured_frames,
             "finite_frames": finite_frames,
             "neural_frames": neural_frames,

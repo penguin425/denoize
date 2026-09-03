@@ -85,6 +85,9 @@ def generate(args: argparse.Namespace) -> bool:
         raise EvidenceError("stress run did not bind the pinned DPDFNet-2 model")
     if stress.get("parallel_streams") != 1:
         raise EvidenceError("promotion stress run must measure one DAW stream")
+    realtime_paced = stress.get("realtime_paced")
+    if not isinstance(realtime_paced, bool):
+        raise EvidenceError("stress run must declare whether it was real-time paced")
     environment = stress.get("environment")
     if not isinstance(environment, dict):
         raise EvidenceError("stress run lacks an environment object")
@@ -131,6 +134,8 @@ def generate(args: argparse.Namespace) -> bool:
             "lowest-supported evidence must run on one logical CPU under "
             "x86_64 ubuntu-slim"
         )
+    if not realtime_paced:
+        raise EvidenceError("promotion stress evidence must be real-time paced")
 
     timing = stress.get("timing")
     memory = stress.get("memory")
@@ -184,6 +189,16 @@ def generate(args: argparse.Namespace) -> bool:
     measured_frames = integer(worker.get("measured_frames"), "measured_frames")
     finite_frames = integer(worker.get("finite_frames"), "finite_frames")
     neural_frames = integer(worker.get("neural_frames"), "neural_frames")
+    chunk_frames = integer(worker.get("chunk_frames"), "worker chunk_frames")
+    latency_frames = integer(worker.get("latency_frames"), "worker latency_frames")
+    worker_wall_seconds = number(
+        worker.get("measurement_wall_seconds"), "worker measurement_wall_seconds"
+    )
+    expected_worker_frames = latency_frames + paced_blocks * chunk_frames
+    if measured_frames != expected_worker_frames:
+        raise EvidenceError("paced worker frame accounting is inconsistent")
+    if worker_wall_seconds < paced_blocks / 100 * 0.95:
+        raise EvidenceError("paced worker completed too quickly to represent real time")
     deadline_miss_limit = math.floor(calls * MAX_DEADLINE_MISS_FRACTION)
 
     checks = [
@@ -203,15 +218,20 @@ def generate(args: argparse.Namespace) -> bool:
         ),
         check("stress-summed-rtf", summed_rtf, "less-or-equal", 1.0),
         check("stress-peak-rss-bytes", peak_rss, "less-or-equal", MAX_PEAK_RSS_BYTES),
-        check("minimum-paced-worker-blocks", paced_blocks, "greater-or-equal", 100),
+        check(
+            "minimum-paced-worker-blocks",
+            paced_blocks,
+            "greater-or-equal",
+            seconds * 100,
+        ),
         check("worker-error-counters", metric_total, "less-or-equal", 0),
         check("worker-finite-frames", finite_frames, "greater-or-equal", measured_frames),
         check("worker-neural-frames", neural_frames, "greater-or-equal", 480),
     ]
     accepted = all(item["passed"] for item in checks)
     document = {
-        "schema": "denoize-dpdfnet-platform-evidence-v1",
-        "schema_version": 1,
+        "schema": "denoize-dpdfnet-platform-evidence-v2",
+        "schema_version": 2,
         "source_commit": source_commit,
         "model_id": "dpdfnet2-48khz-hr",
         "model_sha256": MODEL_SHA256,
@@ -232,6 +252,7 @@ def generate(args: argparse.Namespace) -> bool:
         "measurement": {
             "stress_seconds": seconds,
             "stress_calls": calls,
+            "stress_realtime_paced": realtime_paced,
             "p99_9_ms": p99_9_ms,
             "maximum_ms": maximum_ms,
             "deadline_misses": calls_over_budget,

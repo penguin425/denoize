@@ -264,10 +264,33 @@ def generate(args: argparse.Namespace) -> bool:
     lowest_tier = 0
     for path, bundle in zip(args.platform_evidence, args.platform_attestation, strict=True):
         document, payload = load(path, "platform evidence")
-        if document.get("schema") != "denoize-dpdfnet-platform-evidence-v1" or document.get("source_commit") != source_commit:
+        platform_schema = document.get("schema")
+        platform_versions = {
+            "denoize-dpdfnet-platform-evidence-v1": 1,
+            "denoize-dpdfnet-platform-evidence-v2": 2,
+        }
+        if (
+            platform_schema not in platform_versions
+            or document.get("schema_version") != platform_versions[platform_schema]
+            or document.get("source_commit") != source_commit
+        ):
             raise PromotionError(f"platform evidence binds the wrong schema or source: {path}")
         operating_system = nested(document, "platform.os")
         hardware_tier = nested(document, "platform.hardware_tier")
+        if (
+            platform_schema == "denoize-dpdfnet-platform-evidence-v2"
+            and nested(document, "measurement.stress_realtime_paced") is not True
+        ):
+            raise PromotionError(
+                "v2 platform promotion evidence must record real-time pacing"
+            )
+        if (
+            hardware_tier == "lowest-supported"
+            and platform_schema != "denoize-dpdfnet-platform-evidence-v2"
+        ):
+            raise PromotionError(
+                "lowest-supported promotion evidence must use the real-time-paced v2 schema"
+            )
         slot = (operating_system, hardware_tier)
         if slot in platform_slots:
             raise PromotionError(

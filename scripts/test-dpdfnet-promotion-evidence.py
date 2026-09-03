@@ -32,7 +32,8 @@ SCHEMAS = {
     "worker": ROOT / "schemas/denoize-dpdfnet-worker-run-v1.schema.json",
     "clap_host": ROOT / "schemas/denoize-dpdfnet-clap-host-run-v1.schema.json",
     "clap_host_v2": ROOT / "schemas/denoize-dpdfnet-clap-host-run-v2.schema.json",
-    "platform": ROOT / "schemas/denoize-dpdfnet-platform-evidence-v1.schema.json",
+    "platform_v1": ROOT / "schemas/denoize-dpdfnet-platform-evidence-v1.schema.json",
+    "platform": ROOT / "schemas/denoize-dpdfnet-platform-evidence-v2.schema.json",
     "reaper": ROOT / "schemas/denoize-dpdfnet-reaper-automated-evidence-v1.schema.json",
     "reporter_v1": ROOT / "schemas/denoize-dpdfnet-reporter-evidence-v1.schema.json",
     "reporter_v2": ROOT / "schemas/denoize-dpdfnet-reporter-evidence-v2.schema.json",
@@ -138,6 +139,7 @@ def platform_fixture(root: Path) -> tuple[Path, Path]:
         "state_size": 56_436,
         "parallel_streams": 1,
         "requested_seconds_per_stream": 60,
+        "realtime_paced": True,
         "calls": 6_000,
         "timing": {
             "p99_9_ms": 8.0,
@@ -178,11 +180,11 @@ def platform_fixture(root: Path) -> tuple[Path, Path]:
         "channels": 1,
         "chunk_frames": 480,
         "latency_frames": 11_520,
-        "paced_blocks": 100,
-        "measured_frames": 59_520,
-        "finite_frames": 59_520,
-        "neural_frames": 48_000,
-        "measurement_wall_seconds": 1.25,
+        "paced_blocks": 6_000,
+        "measured_frames": 2_891_520,
+        "finite_frames": 2_891_520,
+        "neural_frames": 2_880_000,
+        "measurement_wall_seconds": 60.25,
         "metrics": {
             "overload_blocks": 0,
             "late_blocks": 0,
@@ -582,6 +584,7 @@ def composite_fixtures(
                 "logical_cpus": logical_cpus,
             }
         )
+        document["measurement"]["stress_realtime_paced"] = True
         validators["platform"].validate(document)
         path = root / f"platform-{index}.json"
         path.write_text(json.dumps(document) + "\n", encoding="utf-8")
@@ -838,6 +841,69 @@ def main() -> int:
         assert platform["accepted"] is True
         assert len(platform["checks"]) == 11
 
+        unpaced_stress = json.loads(stress_path.read_text(encoding="utf-8"))
+        unpaced_stress["realtime_paced"] = False
+        unpaced_stress_path = platform_root / "unpaced-stress.json"
+        unpaced_stress_path.write_text(
+            json.dumps(unpaced_stress) + "\n", encoding="utf-8"
+        )
+        unpaced_result = run(
+            [
+                sys.executable,
+                str(PLATFORM),
+                "--stress",
+                str(unpaced_stress_path),
+                "--worker",
+                str(worker_path),
+                "--output",
+                str(platform_root / "unpaced-platform.json"),
+            ],
+            success=False,
+        )
+        assert "promotion stress evidence must be real-time paced" in unpaced_result.stderr
+
+        short_worker = json.loads(worker_path.read_text(encoding="utf-8"))
+        short_worker["paced_blocks"] = 100
+        short_worker["measured_frames"] = 59_520
+        short_worker["finite_frames"] = 59_520
+        short_worker["neural_frames"] = 48_000
+        short_worker["measurement_wall_seconds"] = 1.25
+        short_worker_path = platform_root / "short-worker.json"
+        short_worker_path.write_text(
+            json.dumps(short_worker) + "\n", encoding="utf-8"
+        )
+        short_worker_platform_path = platform_root / "short-worker-platform.json"
+        run(
+            [
+                sys.executable,
+                str(PLATFORM),
+                "--stress",
+                str(stress_path),
+                "--worker",
+                str(short_worker_path),
+                "--output",
+                str(short_worker_platform_path),
+                "--allow-rejected",
+            ]
+        )
+        short_worker_platform = json.loads(
+            short_worker_platform_path.read_text(encoding="utf-8")
+        )
+        validators["platform"].validate(short_worker_platform)
+        assert short_worker_platform["accepted"] is False
+        short_worker_check = next(
+            check
+            for check in short_worker_platform["checks"]
+            if check["id"] == "minimum-paced-worker-blocks"
+        )
+        assert short_worker_check == {
+            "id": "minimum-paced-worker-blocks",
+            "observed": 100,
+            "operator": "greater-or-equal",
+            "limit": 6_000,
+            "passed": False,
+        }
+
         preempted_stress = json.loads(stress_path.read_text(encoding="utf-8"))
         preempted_stress["timing"].update(
             {
@@ -881,6 +947,7 @@ def main() -> int:
                 "runner_label": "ubuntu-slim",
             }
         )
+        lowest_stress["realtime_paced"] = True
         lowest_worker = json.loads(worker_path.read_text(encoding="utf-8"))
         lowest_worker["environment"].update(
             {
@@ -917,6 +984,28 @@ def main() -> int:
         assert lowest_platform["accepted"] is True
         assert lowest_platform["platform"]["logical_cpus"] == 1
         assert lowest_platform["platform"]["runner_label"] == "ubuntu-slim"
+        assert lowest_platform["measurement"]["stress_realtime_paced"] is True
+
+        unpaced_lowest = json.loads(json.dumps(lowest_stress))
+        unpaced_lowest["realtime_paced"] = False
+        unpaced_lowest_path = platform_root / "unpaced-lowest-stress.json"
+        unpaced_lowest_path.write_text(
+            json.dumps(unpaced_lowest) + "\n", encoding="utf-8"
+        )
+        unpaced_lowest_result = run(
+            [
+                sys.executable,
+                str(PLATFORM),
+                "--stress",
+                str(unpaced_lowest_path),
+                "--worker",
+                str(lowest_worker_path),
+                "--output",
+                str(platform_root / "unpaced-lowest-platform.json"),
+            ],
+            success=False,
+        )
+        assert "must be real-time paced" in unpaced_lowest_result.stderr
 
         false_lowest = json.loads(json.dumps(lowest_stress))
         false_lowest["environment"]["logical_parallelism"] = 2
@@ -980,6 +1069,74 @@ def main() -> int:
             entry["hardware_tier"] == "lowest-supported"
             for entry in promotion["platforms"]
         ) == 1
+
+        legacy_portable = json.loads(
+            arguments.platform_evidence[0].read_text(encoding="utf-8")
+        )
+        legacy_portable["schema"] = "denoize-dpdfnet-platform-evidence-v1"
+        legacy_portable["schema_version"] = 1
+        del legacy_portable["measurement"]["stress_realtime_paced"]
+        validators["platform_v1"].validate(legacy_portable)
+        legacy_portable_path = promotion_root / "platform-portable-v1.json"
+        legacy_portable_path.write_text(
+            json.dumps(legacy_portable) + "\n", encoding="utf-8"
+        )
+        mixed_versions = SimpleNamespace(**vars(arguments))
+        mixed_versions.platform_evidence = [
+            legacy_portable_path,
+            *arguments.platform_evidence[1:],
+        ]
+        mixed_versions.output = promotion_root / "promotion-mixed-platform-versions.json"
+        assert module.generate(mixed_versions) is True
+        validators["promotion"].validate(
+            json.loads(mixed_versions.output.read_text(encoding="utf-8"))
+        )
+
+        legacy_lowest = json.loads(
+            arguments.platform_evidence[3].read_text(encoding="utf-8")
+        )
+        legacy_lowest["schema"] = "denoize-dpdfnet-platform-evidence-v1"
+        legacy_lowest["schema_version"] = 1
+        del legacy_lowest["measurement"]["stress_realtime_paced"]
+        validators["platform_v1"].validate(legacy_lowest)
+        legacy_lowest_path = promotion_root / "platform-lowest-v1.json"
+        legacy_lowest_path.write_text(
+            json.dumps(legacy_lowest) + "\n", encoding="utf-8"
+        )
+        v1_lowest = SimpleNamespace(**vars(arguments))
+        v1_lowest.platform_evidence = [
+            *arguments.platform_evidence[:3],
+            legacy_lowest_path,
+        ]
+        v1_lowest.output = promotion_root / "promotion-v1-lowest.json"
+        try:
+            module.generate(v1_lowest)
+        except module.PromotionError as error:
+            assert "real-time-paced v2 schema" in str(error)
+        else:
+            raise AssertionError("v1 lowest-supported evidence unexpectedly passed")
+
+        falsely_paced_lowest = json.loads(
+            arguments.platform_evidence[3].read_text(encoding="utf-8")
+        )
+        falsely_paced_lowest["measurement"]["stress_realtime_paced"] = False
+        assert validators["platform"].is_valid(falsely_paced_lowest) is False
+        falsely_paced_lowest_path = promotion_root / "platform-lowest-unpaced-v2.json"
+        falsely_paced_lowest_path.write_text(
+            json.dumps(falsely_paced_lowest) + "\n", encoding="utf-8"
+        )
+        unpaced_v2_lowest = SimpleNamespace(**vars(arguments))
+        unpaced_v2_lowest.platform_evidence = [
+            *arguments.platform_evidence[:3],
+            falsely_paced_lowest_path,
+        ]
+        unpaced_v2_lowest.output = promotion_root / "promotion-unpaced-v2-lowest.json"
+        try:
+            module.generate(unpaced_v2_lowest)
+        except module.PromotionError as error:
+            assert "must record real-time pacing" in str(error)
+        else:
+            raise AssertionError("unpaced v2 lowest-supported evidence unexpectedly passed")
 
         no_lowest = SimpleNamespace(**vars(arguments))
         no_lowest.platform_evidence = arguments.platform_evidence[:3]

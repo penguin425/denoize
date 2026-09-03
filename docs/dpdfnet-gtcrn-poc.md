@@ -293,12 +293,19 @@ the normal Linux runner, attests them, verifies those attestations offline on
 stay inside its 15-minute job limit. See the
 [GitHub-hosted runner specification](https://docs.github.com/en/actions/reference/runners/github-hosted-runners#supported-runners-and-hardware-resources).
 
-Hosted runners are not real-time schedulers. Their direct-hop gate therefore
-requires p99.9 at or below 10 ms, at most 0.1% of calls above 10 ms, and no
-single call above 20 ms. The paced production CLAP worker remains stricter:
-overload, late, invalid, and worker-error counters must all be zero. This keeps
-an isolated VM preemption from being misclassified as a model failure without
-hiding a sustained deadline problem.
+Hosted runners are not real-time schedulers. Every promotion direct-call probe
+therefore presents one 480-frame block every 10 ms instead of saturating its
+runner continuously. Sleep time is excluded from each call measurement, and an
+overrun is carried into the next scheduled call rather than resetting the
+clock. The gate still requires p99.9 at or below 10 ms, at most 0.1% of calls
+above 10 ms, and no single call above 20 ms.
+
+The production CLAP worker is independently paced for the full requested
+measurement (6,000 blocks for the 60-second gate) and remains stricter:
+overload, late, invalid, and worker-error counters must all be zero. This tests
+the actual 240 ms bounded-queue contract while preserving the direct-call tail
+diagnostics and avoids mistaking continuous container CPU-quota throttling for
+a DAW callback workload.
 
 ## Sources
 
