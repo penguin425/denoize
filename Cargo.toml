@@ -49,6 +49,11 @@ name = "dpdfnet_gtcrn_stress"
 path = "examples/dpdfnet_gtcrn_stress.rs"
 required-features = ["dpdfnet", "gtcrn"]
 
+[[example]]
+name = "dpdfnet_production_reference"
+path = "examples/dpdfnet_production_reference.rs"
+required-features = ["dpdfnet"]
+
 [dependencies]
 hound = "3.5"
 nnnoiseless = { version = "0.5.2", optional = true, default-features = false }

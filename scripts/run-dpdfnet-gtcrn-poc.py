@@ -214,16 +214,28 @@ def main() -> None:
         runs=args.runs,
     )
     if args.validate_onnxruntime:
+        validator = str(REPOSITORY_ROOT / "scripts/validate-dpdfnet-poc.py")
+        common = [
+            "python3",
+            validator,
+            "--model",
+            str(paths["dpdfnet2_48khz_hr.onnx"]),
+            "--input",
+            str(paths["noisy_snr0.wav"]),
+        ]
         subprocess.run(
-            [
-                "python3",
-                str(REPOSITORY_ROOT / "scripts/validate-dpdfnet-poc.py"),
-                "--model",
-                str(paths["dpdfnet2_48khz_hr.onnx"]),
-                "--input",
-                str(paths["noisy_snr0.wav"]),
+            common
+            + ["--actual", str(fullband_output / "dpdfnet-causal.wav")],
+            check=True,
+            cwd=REPOSITORY_ROOT,
+        )
+        subprocess.run(
+            common
+            + [
                 "--actual",
-                str(fullband_output / "dpdfnet-causal.wav"),
+                str(fullband_output / "dpdfnet-aligned.wav"),
+                "--alignment-samples",
+                "1920",
             ],
             check=True,
             cwd=REPOSITORY_ROOT,
