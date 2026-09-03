@@ -64,6 +64,37 @@ if audio_path ~= nil and audio_path ~= "" then
     reaper.CountMediaItems(0),
     reaper.CountTrackMediaItems(track)
   )
+  local item_length_seconds = tonumber(
+    os.getenv("DENOIZE_REAPER_MEDIA_ITEM_SECONDS") or ""
+  )
+  if item_length_seconds ~= nil and item_length_seconds > 0 then
+    local item = reaper.GetTrackMediaItem(track, 0)
+    if item == nil then
+      write_line("error", "unable to extend the test media item")
+      result:close()
+      reaper.Main_OnCommand(40004, 0)
+      return
+    end
+    local loop_disabled = reaper.SetMediaItemInfo_Value(
+      item,
+      "B_LOOPSRC",
+      0
+    )
+    local length_set = reaper.SetMediaItemLength(
+      item,
+      item_length_seconds,
+      false
+    )
+    reaper.UpdateArrange()
+    write_line(
+      "media-span",
+      string.format("%.17g", item_length_seconds),
+      string.format("%.17g", reaper.GetMediaItemInfo_Value(item, "D_LENGTH")),
+      tostring(loop_disabled),
+      tostring(length_set),
+      string.format("%.17g", reaper.GetMediaItemInfo_Value(item, "B_LOOPSRC"))
+    )
+  end
 end
 
 local plugin_name = os.getenv("DENOIZE_REAPER_PLUGIN") or "denoize Neural"

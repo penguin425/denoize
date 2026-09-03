@@ -70,12 +70,11 @@ Copy-Item -LiteralPath $PluginBinary -Destination $plugin
 $sampleRate = 48000
 $evidenceWarmupFrames = 46080
 $measurementDelaySeconds = $DurationSeconds + 1
-# Keep the media item well beyond the measured interval. REAPER's Dummy Audio
-# device can advance the project timeline faster than wall time on hosted
-# runners; the repeated Bypass probe must still run while transport is active.
-# A repeated short item would introduce discontinuities and recurrent-state
-# resets into the sustained scheduling measurement.
+# The source covers the wall-clock measurement. The Lua harness extends its
+# media item without looping so Dummy Audio timeline acceleration cannot stop
+# or restart transport during the sustained worker and Bypass checks.
 $sampleCount = $sampleRate * ($DurationSeconds + 120)
+$mediaItemSeconds = ($DurationSeconds * 10) + 600
 $dataSize = $sampleCount * 2
 $writer = [System.IO.BinaryWriter]::new([System.IO.File]::Create($tone))
 try {
@@ -140,6 +139,9 @@ $env:DENOIZE_REAPER_NORMALIZED = "0"
 $env:DENOIZE_REAPER_PLAY_DELAY = "3"
 $env:DENOIZE_REAPER_SET_DELAY = [string]$measurementDelaySeconds
 $env:DENOIZE_REAPER_AUDIO = $tone
+$env:DENOIZE_REAPER_MEDIA_ITEM_SECONDS = $mediaItemSeconds.ToString(
+  [Globalization.CultureInfo]::InvariantCulture
+)
 $env:DENOIZE_REAPER_PLAY = "1"
 $env:DENOIZE_REAPER_REPEAT = "0"
 $env:DENOIZE_REAPER_OPEN_AUDIO_DEVICE = "1"
@@ -232,16 +234,34 @@ $lines = Get-Content -LiteralPath $result
 $parameters = @($lines | Where-Object { $_ -match '^parameter\t' })
 $osara = @($lines | Where-Object { $_ -match '^osara\t' })
 $bypassLatch = @($lines | Where-Object { $_ -match '^bypass-latch\t' })
+$mediaSpan = @($lines | Where-Object { $_ -match '^media-span\t' })
+$transportBeforeParameters = @(
+  $lines | Where-Object { $_ -match '^transport-before-parameters\t' }
+)
 $names = @($parameters | ForEach-Object { ($_ -split "`t")[2] })
 $expectedNames = @("Bypass", "Mix", "Output Gain", "Overload Fallback")
 if ($parameters.Count -ne 4 -or $osara.Count -ne 4 -or
-  $bypassLatch.Count -ne 4 -or
+  $bypassLatch.Count -ne 4 -or $mediaSpan.Count -ne 1 -or
+  $transportBeforeParameters.Count -ne 1 -or
   @(Compare-Object $expectedNames $names).Count -ne 0 -or
   $lines -notcontains "performance`tno-anticipative-fx`ttrue" -or
   $lines -notcontains "transport`trepeat`tfalse" -or
   $lines -notcontains "bypass-latch-summary`t0" -or
   $lines -notcontains "removed`ttrue" -or $lines -notcontains "complete`t0") {
   throw "REAPER/OSARA-style parameter evidence did not pass"
+}
+$mediaFields = $mediaSpan[0] -split "`t"
+$transportFields = $transportBeforeParameters[0] -split "`t"
+$invariant = [Globalization.CultureInfo]::InvariantCulture
+if ($mediaFields.Count -ne 6 -or
+  [Math]::Abs([double]::Parse($mediaFields[1], $invariant) - $mediaItemSeconds) -gt 1e-9 -or
+  [Math]::Abs([double]::Parse($mediaFields[2], $invariant) - $mediaItemSeconds) -gt 1e-9 -or
+  $mediaFields[3] -ne "true" -or $mediaFields[4] -ne "true" -or
+  [Math]::Abs([double]::Parse($mediaFields[5], $invariant)) -gt 1e-9 -or
+  $transportFields.Count -ne 4 -or
+  (([int]$transportFields[1] -band 1) -ne 1) -or
+  [double]::Parse($transportFields[3], $invariant) -lt $mediaItemSeconds) {
+  throw "REAPER media did not preserve one continuous non-looping transport"
 }
 $expectedBypassStages = @(
   @{ Name = "on-1"; Target = 1.0; Applied = "true" },
