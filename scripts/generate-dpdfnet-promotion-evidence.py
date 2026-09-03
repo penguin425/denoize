@@ -23,6 +23,16 @@ COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 MAX_JSON_BYTES = 32 * 1024 * 1024
 MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
 SIGNER_WORKFLOW = "penguin425/denoize/.github/workflows/dpdfnet-promotion.yml"
+REPORTER_V2_CHECKS = {
+    "reaper-version",
+    "run-duration-rate",
+    "requested-buffer-coverage",
+    "effective-buffer-observed",
+    "realtime-worker",
+    "audible-continuity",
+    "nvda-osara",
+    "no-host-plugin-crashes",
+}
 
 
 class PromotionError(RuntimeError):
@@ -168,6 +178,34 @@ def inspect_windows_archive(path: Path, source_commit: str) -> dict[str, Any]:
     }
 
 
+def reporter_passed(document: dict[str, Any]) -> bool:
+    schema = document.get("schema")
+    if schema == "denoize-dpdfnet-reporter-evidence-v1":
+        return document.get("accepted") is True
+    if schema != "denoize-dpdfnet-reporter-evidence-v2":
+        raise PromotionError("unsupported issue-reporter evidence")
+    checks = document.get("checks")
+    if not isinstance(checks, list):
+        raise PromotionError("issue-reporter v2 checks are missing")
+    by_id = {
+        item.get("id"): item
+        for item in checks
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+    if set(by_id) != REPORTER_V2_CHECKS or len(by_id) != len(checks):
+        raise PromotionError("issue-reporter v2 checks are incomplete or duplicated")
+    passed = all(
+        item.get("passed") is True
+        and item.get("observed") == 1
+        and item.get("operator") == "greater-or-equal"
+        and item.get("limit") == 1
+        for item in by_id.values()
+    )
+    if document.get("accepted") is not passed:
+        raise PromotionError("issue-reporter v2 accepted flag differs from its checks")
+    return passed
+
+
 def objective_checks(summary: dict[str, Any], source_commit: str) -> list[dict[str, Any]]:
     if summary.get("schema") != "denoize-dpdfnet-gtcrn-evaluation-summary-v1":
         raise PromotionError("unsupported objective-evaluation summary")
@@ -208,8 +246,9 @@ def generate(args: argparse.Namespace) -> bool:
         raise PromotionError("objective evaluation and listening protocol bind different matrices")
     if automated.get("schema") != "denoize-dpdfnet-reaper-automated-evidence-v1" or automated.get("source_commit") != source_commit:
         raise PromotionError("automated REAPER evidence binds the wrong schema or source")
-    if reporter.get("schema") != "denoize-dpdfnet-reporter-evidence-v1" or nested(reporter, "payload.source_commit") != source_commit:
+    if nested(reporter, "payload.source_commit") != source_commit:
         raise PromotionError("issue-reporter evidence binds the wrong schema or source")
+    reporter_is_accepted = reporter_passed(reporter)
 
     archive = inspect_windows_archive(args.artifact, source_commit)
     if nested(reporter, "payload.artifact_sha256") != archive["archive"]["sha256"]:
@@ -274,8 +313,8 @@ def generate(args: argparse.Namespace) -> bool:
         },
         {
             "id": "issue-reporter-nvda-osara",
-            "observed": int(reporter.get("accepted") is True), "operator": "greater-or-equal", "limit": 1,
-            "passed": reporter.get("accepted") is True,
+            "observed": int(reporter_is_accepted), "operator": "greater-or-equal", "limit": 1,
+            "passed": reporter_is_accepted,
         },
         {
             "id": "attested-windows-experimental-clap",

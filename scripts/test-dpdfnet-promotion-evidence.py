@@ -23,6 +23,7 @@ PREPARE = ROOT / "scripts/prepare-dpdfnet-blind-listening.py"
 SCORE = ROOT / "scripts/score-dpdfnet-blind-listening.py"
 PLATFORM = ROOT / "scripts/generate-dpdfnet-platform-evidence.py"
 PROMOTION = ROOT / "scripts/generate-dpdfnet-promotion-evidence.py"
+FETCH_REPORTER = ROOT / "scripts/fetch-dpdfnet-reporter-evidence.py"
 SCHEMAS = {
     "protocol": ROOT / "schemas/denoize-dpdfnet-blind-protocol-v1.schema.json",
     "answer": ROOT / "schemas/denoize-dpdfnet-blind-answer-key-v1.schema.json",
@@ -30,9 +31,11 @@ SCHEMAS = {
     "result": ROOT / "schemas/denoize-dpdfnet-blind-listening-result-v1.schema.json",
     "worker": ROOT / "schemas/denoize-dpdfnet-worker-run-v1.schema.json",
     "clap_host": ROOT / "schemas/denoize-dpdfnet-clap-host-run-v1.schema.json",
+    "clap_host_v2": ROOT / "schemas/denoize-dpdfnet-clap-host-run-v2.schema.json",
     "platform": ROOT / "schemas/denoize-dpdfnet-platform-evidence-v1.schema.json",
     "reaper": ROOT / "schemas/denoize-dpdfnet-reaper-automated-evidence-v1.schema.json",
-    "reporter": ROOT / "schemas/denoize-dpdfnet-reporter-evidence-v1.schema.json",
+    "reporter_v1": ROOT / "schemas/denoize-dpdfnet-reporter-evidence-v1.schema.json",
+    "reporter_v2": ROOT / "schemas/denoize-dpdfnet-reporter-evidence-v2.schema.json",
     "promotion": ROOT / "schemas/denoize-dpdfnet-promotion-evidence-v1.schema.json",
 }
 
@@ -214,6 +217,16 @@ def load_promotion_module():
     return module
 
 
+def load_reporter_module():
+    specification = importlib.util.spec_from_file_location(
+        "denoize_dpdfnet_reporter", FETCH_REPORTER
+    )
+    assert specification is not None and specification.loader is not None
+    module = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(module)
+    return module
+
+
 def file_record(name: str) -> dict[str, object]:
     return {"name": name, "size_bytes": 1, "sha256": "0" * 64}
 
@@ -318,10 +331,100 @@ def composite_fixtures(
     artifact = root / "experimental.zip"
     artifact.write_bytes(b"attested experimental archive fixture")
     artifact_sha256 = hashlib.sha256(artifact.read_bytes()).hexdigest()
-    reporter = {
-        "schema": "denoize-dpdfnet-reporter-evidence-v1",
-        "schema_version": 1,
-        "github": {
+    reporter_module = load_reporter_module()
+    host_payloads = {}
+    submission_runs = []
+    for index, frames in enumerate((128, 480, 1024)):
+        url = f"https://github.com/user-attachments/files/{12345678 + index}/dpdfnet-{frames}.json"
+        host = {
+            "schema": "denoize-dpdfnet-clap-host-run-v2",
+            "schema_version": 2,
+            "source_commit": commit,
+            "model_id": "dpdfnet2-48khz-hr",
+            "model_sha256": module.MODEL_SHA256,
+            "plugin_id": "org.penguin425.denoize.neural-hq",
+            "sample_rate_hz": 48_000,
+            "channels": 1,
+            "chunk_frames": 480,
+            "latency_frames": 11_520,
+            "processed_frames": 14_446_080,
+            "active_seconds": 301.0,
+            "measurement": {
+                "warmup_frames": 46_080,
+                "measured_frames": 14_400_000,
+            },
+            "host_audio_configuration": {
+                "min_frames_count": frames,
+                "max_frames_count": frames,
+            },
+            "callback_frames": {
+                "calls": 100_000,
+                "minimum": frames,
+                "maximum": frames,
+            },
+            "worker_started": True,
+            "finished_gracefully": True,
+            "metrics": {
+                "overload_blocks": 0,
+                "late_blocks": 0,
+                "invalid_blocks": 0,
+                "worker_errors": 0,
+            },
+            "lifetime_metrics": {
+                "overload_blocks": 0,
+                "late_blocks": 0,
+                "invalid_blocks": 0,
+                "worker_errors": 0,
+            },
+            "environment": {"os": "windows", "arch": "x86_64"},
+        }
+        validators["clap_host_v2"].validate(host)
+        encoded = (json.dumps(host, sort_keys=True) + "\n").encode()
+        host_payloads[url] = encoded
+        submission_runs.append(
+            {
+                "requested_buffer_frames": frames,
+                "host_evidence_url": url,
+                "host_evidence_sha256": hashlib.sha256(encoded).hexdigest(),
+                "audible_xruns": 0,
+                "continuous_audio": True,
+            }
+        )
+    reporter_payload = {
+        "schema": "denoize-dpdfnet-reporter-submission-v2",
+        "schema_version": 2,
+        "source_commit": commit,
+        "artifact_sha256": artifact_sha256,
+        "environment": {
+            "windows_version": "fixture",
+            "cpu_model": "fixture",
+            "audio_device": "fixture",
+            "audio_driver": "fixture",
+            "reaper_version": "7.79",
+            "nvda_version": "fixture",
+            "osara_version": "fixture",
+        },
+        "runs": submission_runs,
+        "accessibility": {
+            "nvda_active": True,
+            "osara_active": True,
+            "parameters_announced": [
+                "Bypass",
+                "Mix",
+                "Output Gain",
+                "Overload Fallback",
+            ],
+            "values_announced": True,
+            "all_adjustable": True,
+            "focus_stable": True,
+            "host_or_plugin_crashes": 0,
+        },
+        "quality_observation": "dpdfnet-better",
+        "consent_to_publish": True,
+    }
+    reporter = reporter_module.build_v2_document(
+        reporter_payload,
+        {
             "repository": "penguin425/denoize",
             "issue": 221,
             "comment_id": 1,
@@ -331,52 +434,94 @@ def composite_fixtures(
             "updated_at": "2026-09-02T00:00:00Z",
             "comment_body_sha256": "1" * 64,
         },
-        "payload": {
-            "schema": "denoize-dpdfnet-reporter-submission-v1",
-            "schema_version": 1,
-            "source_commit": commit,
-            "artifact_sha256": artifact_sha256,
-            "environment": {
-                "windows_version": "fixture",
-                "cpu_model": "fixture",
-                "audio_device": "fixture",
-                "audio_driver": "fixture",
-                "reaper_version": "7.79",
-                "nvda_version": "fixture",
-                "osara_version": "fixture",
-            },
-            "runs": [
-                {
-                    "buffer_frames": frames,
-                    "sample_rate_hz": 48_000,
-                    "duration_seconds": 300,
-                    "overload_events": 0,
-                    "late_events": 0,
-                    "audible_xruns": 0,
-                    "continuous_audio": True,
-                }
-                for frames in (128, 480, 1024)
-            ],
-            "accessibility": {
-                "nvda_active": True,
-                "osara_active": True,
-                "parameters_announced": [
-                    "Bypass",
-                    "Mix",
-                    "Output Gain",
-                    "Overload Fallback",
-                ],
-                "values_announced": True,
-                "all_adjustable": True,
-                "focus_stable": True,
-                "host_or_plugin_crashes": 0,
-            },
-            "quality_observation": "dpdfnet-better",
-            "consent_to_publish": True,
-        },
-        "accepted": True,
-    }
-    validators["reporter"].validate(reporter)
+        loader=lambda url: host_payloads[url],
+    )
+    validators["reporter_v2"].validate(reporter)
+    assert reporter["accepted"] is True
+    inconsistent_reporter = json.loads(json.dumps(reporter))
+    inconsistent_reporter["accepted"] = False
+    try:
+        module.reporter_passed(inconsistent_reporter)
+    except module.PromotionError as error:
+        assert "accepted flag differs" in str(error)
+    else:
+        raise AssertionError("inconsistent reporter result unexpectedly passed")
+
+    failed_payload = json.loads(json.dumps(reporter_payload))
+    failed_hosts = dict(host_payloads)
+    failed_url = failed_payload["runs"][0]["host_evidence_url"]
+    failed_host = json.loads(failed_hosts[failed_url])
+    failed_host["metrics"]["overload_blocks"] = 7
+    failed_encoded = (json.dumps(failed_host, sort_keys=True) + "\n").encode()
+    failed_hosts[failed_url] = failed_encoded
+    failed_payload["runs"][0]["host_evidence_sha256"] = hashlib.sha256(
+        failed_encoded
+    ).hexdigest()
+    failed_reporter = reporter_module.build_v2_document(
+        failed_payload,
+        reporter["github"],
+        loader=lambda url: failed_hosts[url],
+    )
+    validators["reporter_v2"].validate(failed_reporter)
+    assert failed_reporter["accepted"] is False
+    assert failed_reporter["runs"][0]["overload_blocks"] == 7
+    assert next(
+        check for check in failed_reporter["checks"] if check["id"] == "realtime-worker"
+    )["passed"] is False
+
+    failed_body = "```json\n" + json.dumps(failed_payload) + "\n```"
+    failed_comment_url = (
+        "https://github.com/penguin425/denoize/issues/221#issuecomment-2"
+    )
+
+    def reporter_api(path: str):
+        if path == "/repos/penguin425/denoize/issues/221":
+            return {"user": {"login": "UlisesMilani"}}
+        assert path == "/repos/penguin425/denoize/issues/comments/2"
+        return {
+            "user": {"login": "UlisesMilani"},
+            "html_url": failed_comment_url,
+            "body": failed_body,
+            "created_at": "2026-09-03T00:00:00Z",
+            "updated_at": "2026-09-03T00:00:00Z",
+        }
+
+    reporter_module.api = reporter_api
+    reporter_module.attachment = lambda url: failed_hosts[url]
+    preserved_path = root / "reporter-rejected.json"
+    assert reporter_module.generate(
+        SimpleNamespace(comment_url=failed_comment_url, output=preserved_path)
+    ) is False
+    preserved = json.loads(preserved_path.read_text(encoding="utf-8"))
+    validators["reporter_v2"].validate(preserved)
+    assert preserved["runs"][0]["overload_blocks"] == 7
+    assert preserved["accepted"] is False
+
+    legacy_payload = json.loads(json.dumps(reporter_payload))
+    legacy_hosts = {}
+    for run in legacy_payload["runs"]:
+        url = run["host_evidence_url"]
+        legacy = json.loads(host_payloads[url])
+        legacy["schema"] = "denoize-dpdfnet-clap-host-run-v1"
+        legacy["schema_version"] = 1
+        del legacy["host_audio_configuration"]
+        del legacy["callback_frames"]
+        encoded = (json.dumps(legacy, sort_keys=True) + "\n").encode()
+        legacy_hosts[url] = encoded
+        run["host_evidence_sha256"] = hashlib.sha256(encoded).hexdigest()
+    legacy_reporter = reporter_module.build_v2_document(
+        legacy_payload,
+        reporter["github"],
+        loader=lambda url: legacy_hosts[url],
+    )
+    validators["reporter_v2"].validate(legacy_reporter)
+    assert legacy_reporter["accepted"] is False
+    assert all(run["effective_buffer_frames"] is None for run in legacy_reporter["runs"])
+    assert next(
+        check
+        for check in legacy_reporter["checks"]
+        if check["id"] == "effective-buffer-observed"
+    )["passed"] is False
     reporter_path = root / "reporter.json"
     reporter_path.write_text(json.dumps(reporter) + "\n", encoding="utf-8")
 
