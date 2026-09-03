@@ -862,6 +862,48 @@ def main() -> int:
         )
         assert "promotion stress evidence must be real-time paced" in unpaced_result.stderr
 
+        fast_worker = json.loads(worker_path.read_text(encoding="utf-8"))
+        fast_worker["measurement_wall_seconds"] = 50.0
+        fast_worker_path = platform_root / "fast-worker.json"
+        fast_worker_path.write_text(
+            json.dumps(fast_worker) + "\n", encoding="utf-8"
+        )
+        fast_worker_result = run(
+            [
+                sys.executable,
+                str(PLATFORM),
+                "--stress",
+                str(stress_path),
+                "--worker",
+                str(fast_worker_path),
+                "--output",
+                str(platform_root / "fast-worker-platform.json"),
+            ],
+            success=False,
+        )
+        assert "completed too quickly" in fast_worker_result.stderr
+
+        slow_worker = json.loads(worker_path.read_text(encoding="utf-8"))
+        slow_worker["measurement_wall_seconds"] = 204.0
+        slow_worker_path = platform_root / "slow-worker.json"
+        slow_worker_path.write_text(
+            json.dumps(slow_worker) + "\n", encoding="utf-8"
+        )
+        slow_worker_result = run(
+            [
+                sys.executable,
+                str(PLATFORM),
+                "--stress",
+                str(stress_path),
+                "--worker",
+                str(slow_worker_path),
+                "--output",
+                str(platform_root / "slow-worker-platform.json"),
+            ],
+            success=False,
+        )
+        assert "completed too slowly" in slow_worker_result.stderr
+
         short_worker = json.loads(worker_path.read_text(encoding="utf-8"))
         short_worker["paced_blocks"] = 100
         short_worker["measured_frames"] = 59_520

@@ -23,29 +23,35 @@ pub const NEURAL_DAW_LATENCY_CHUNKS: u32 = 24;
 pub const NEURAL_DAW_LATENCY_POLICY: &str = "fixed-24x10ms-worker-v1";
 pub const NEURAL_DAW_MAX_SAMPLE_RATE: u32 = crate::daw::DAW_MAX_SAMPLE_RATE;
 
-/// Keeps the neural inference worker in the Windows `Pro Audio` MMCSS task.
+/// Keeps the neural inference worker in the platform's interactive audio class.
 ///
 /// The CLAP audio callback only exchanges bounded queue entries with the
 /// worker, but Windows DAWs can run that callback in the `Pro Audio` class.
 /// Keeping the dependent inference worker at ordinary priority can therefore
 /// starve it even when the model's measured compute time is below its buffered
-/// deadline. Other platforms deliberately keep their existing scheduling.
+/// deadline. Windows uses the `Pro Audio` MMCSS task and macOS uses interactive
+/// QoS; other platforms deliberately keep their existing scheduling.
 #[doc(hidden)]
 #[must_use = "dropping the guard releases the neural worker scheduling class"]
 pub struct NeuralDawWorkerPriorityGuard {
     #[cfg(windows)]
     handle: windows_sys::Win32::Foundation::HANDLE,
-    // AvRevertMmThreadCharacteristics must run on the thread that acquired the
-    // handle. Make that invariant a type property instead of relying on callers.
-    #[cfg(windows)]
+    #[cfg(target_os = "macos")]
+    previous_qos_class: libc::qos_class_t,
+    #[cfg(target_os = "macos")]
+    previous_relative_priority: libc::c_int,
+    // Both platform APIs must be reverted on the thread that acquired them.
+    // Make that invariant a type property instead of relying on callers.
+    #[cfg(any(windows, target_os = "macos"))]
     _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
 impl NeuralDawWorkerPriorityGuard {
     /// Enters the scheduling class appropriate for a neural audio worker.
     ///
-    /// On Windows, activation fails closed if MMCSS cannot register the current
-    /// thread. On other platforms this is a no-op guard.
+    /// On Windows and macOS, activation fails closed if the current thread
+    /// cannot enter the platform scheduling class. On other platforms this is
+    /// a no-op guard.
     pub fn acquire() -> Result<Self, String> {
         #[cfg(windows)]
         {
@@ -70,7 +76,47 @@ impl NeuralDawWorkerPriorityGuard {
             })
         }
 
-        #[cfg(not(windows))]
+        #[cfg(target_os = "macos")]
+        {
+            let mut previous_qos_class = libc::qos_class_t::QOS_CLASS_UNSPECIFIED;
+            let mut previous_relative_priority = 0;
+            // SAFETY: `pthread_self` returns the current live pthread, and both
+            // output pointers remain valid for the duration of the call.
+            let result = unsafe {
+                libc::pthread_get_qos_class_np(
+                    libc::pthread_self(),
+                    &mut previous_qos_class,
+                    &mut previous_relative_priority,
+                )
+            };
+            if result != 0 {
+                return Err(format!(
+                    "read neural inference worker macOS QoS: {}",
+                    std::io::Error::from_raw_os_error(result)
+                ));
+            }
+            // SAFETY: this changes only the calling pthread. The guard is
+            // !Send and restores the captured class on this same thread.
+            let result = unsafe {
+                libc::pthread_set_qos_class_self_np(
+                    libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE,
+                    0,
+                )
+            };
+            if result != 0 {
+                return Err(format!(
+                    "register neural inference worker with macOS interactive QoS: {}",
+                    std::io::Error::from_raw_os_error(result)
+                ));
+            }
+            Ok(Self {
+                previous_qos_class,
+                previous_relative_priority,
+                _not_send: std::marker::PhantomData,
+            })
+        }
+
+        #[cfg(not(any(windows, target_os = "macos")))]
         {
             Ok(Self {})
         }
@@ -90,6 +136,24 @@ impl Drop for NeuralDawWorkerPriorityGuard {
                 eprintln!(
                     "denoize Neural worker could not leave Windows Pro Audio MMCSS: {}",
                     std::io::Error::last_os_error()
+                );
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            // SAFETY: the guard is !Send, so it is dropped on the acquiring
+            // pthread. Both values were returned by pthread_get_qos_class_np.
+            let result = unsafe {
+                libc::pthread_set_qos_class_self_np(
+                    self.previous_qos_class,
+                    self.previous_relative_priority,
+                )
+            };
+            if result != 0 {
+                eprintln!(
+                    "denoize Neural worker could not restore macOS QoS: {}",
+                    std::io::Error::from_raw_os_error(result)
                 );
             }
         }

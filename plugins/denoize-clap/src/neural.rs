@@ -2484,12 +2484,21 @@ mod tests {
         );
         let paced_blocks = paced_seconds * 100;
         let latency = engine.latency_frames as usize;
-        let frames = latency + engine.chunk_frames * paced_blocks;
+        assert_eq!(
+            latency % engine.chunk_frames,
+            0,
+            "worker latency must contain whole callback blocks"
+        );
+        let latency_blocks = latency / engine.chunk_frames;
+        let total_blocks = latency_blocks + paced_blocks;
+        let frames = engine.chunk_frames * total_blocks;
         let mut finite = 0usize;
         let mut neural_frames = 0usize;
         let mut inputs = Vec::with_capacity(frames);
         let mut noise_state = 0x5eed_1234_9876_abcd_u64;
-        let measurement_started = Instant::now();
+        // Fixture generation is not part of the simulated callback cadence.
+        // Build it before starting the wall-clock measurement so every block
+        // can be presented on one absolute 10 ms schedule.
         for frame in 0..frames {
             let phase = frame as f64 * 440.0 * std::f64::consts::TAU / 48_000.0;
             noise_state = noise_state
@@ -2498,15 +2507,26 @@ mod tests {
             let noise = f64::from((noise_state >> 32) as u32) / f64::from(u32::MAX) - 0.5;
             let input = phase.sin() * 0.03 + noise * 0.08;
             inputs.push(input);
-            let output = engine.process_frame([input, 0.0], parameters)[0];
-            finite += usize::from(output.is_finite());
-            if frame >= latency && (output - inputs[frame - latency]).abs() > 1.0e-6 {
-                neural_frames += 1;
+        }
+
+        let measurement_started = Instant::now();
+        for block in 0..total_blocks {
+            let due = measurement_started
+                + Duration::from_micros(
+                    (block as u64)
+                        .saturating_mul(u64::from(denoize::NEURAL_DAW_CHUNK_MILLIS))
+                        .saturating_mul(1_000),
+                );
+            if let Some(delay) = due.checked_duration_since(Instant::now()) {
+                thread::sleep(delay);
             }
-            if frame % engine.chunk_frames == 0 {
-                thread::sleep(Duration::from_millis(u64::from(
-                    denoize::NEURAL_DAW_CHUNK_MILLIS,
-                )));
+            let start = block * engine.chunk_frames;
+            for frame in start..start + engine.chunk_frames {
+                let output = engine.process_frame([inputs[frame], 0.0], parameters)[0];
+                finite += usize::from(output.is_finite());
+                if frame >= latency && (output - inputs[frame - latency]).abs() > 1.0e-6 {
+                    neural_frames += 1;
+                }
             }
         }
         let measurement_wall_seconds = measurement_started.elapsed().as_secs_f64();

@@ -20,6 +20,9 @@ MAX_JSON_BYTES = 16 * 1024 * 1024
 MAX_PEAK_RSS_BYTES = 512 * 1024 * 1024
 MAX_SINGLE_CALL_MS = 20.0
 MAX_DEADLINE_MISS_FRACTION = 0.001
+WORKER_WALL_LOWER_RATIO = 0.95
+WORKER_WALL_UPPER_RATIO = 1.05
+WORKER_WALL_UPPER_SLACK_SECONDS = 0.25
 
 
 class EvidenceError(RuntimeError):
@@ -163,8 +166,14 @@ def generate(args: argparse.Namespace) -> bool:
         raise EvidenceError("unsupported paced-worker schema")
     if worker.get("source_commit") != source_commit:
         raise EvidenceError("stress and worker evidence bind different commits")
-    if worker.get("model_id") != "dpdfnet2-48khz-hr" or worker.get("model_sha256") != MODEL_SHA256:
+    if (
+        worker.get("model_id") != "dpdfnet2-48khz-hr"
+        or worker.get("model_sha256") != MODEL_SHA256
+        or worker.get("plugin_id") != "org.penguin425.denoize.neural-hq"
+    ):
         raise EvidenceError("worker run did not bind the pinned DPDFNet model")
+    if worker.get("sample_rate_hz") != 48_000 or worker.get("channels") != 1:
+        raise EvidenceError("worker run did not exercise the 48 kHz mono gate geometry")
     worker_environment = worker.get("environment")
     if not isinstance(worker_environment, dict) or worker_environment.get("os") != operating_system:
         raise EvidenceError("stress and worker evidence bind different operating systems")
@@ -191,14 +200,28 @@ def generate(args: argparse.Namespace) -> bool:
     neural_frames = integer(worker.get("neural_frames"), "neural_frames")
     chunk_frames = integer(worker.get("chunk_frames"), "worker chunk_frames")
     latency_frames = integer(worker.get("latency_frames"), "worker latency_frames")
+    if chunk_frames != 480 or latency_frames != 11_520:
+        raise EvidenceError("worker run did not exercise the fixed 24x10 ms scheduler")
     worker_wall_seconds = number(
         worker.get("measurement_wall_seconds"), "worker measurement_wall_seconds"
     )
     expected_worker_frames = latency_frames + paced_blocks * chunk_frames
     if measured_frames != expected_worker_frames:
         raise EvidenceError("paced worker frame accounting is inconsistent")
-    if worker_wall_seconds < paced_blocks / 100 * 0.95:
-        raise EvidenceError("paced worker completed too quickly to represent real time")
+    expected_worker_wall_seconds = expected_worker_frames / 48_000
+    minimum_worker_wall_seconds = expected_worker_wall_seconds * WORKER_WALL_LOWER_RATIO
+    maximum_worker_wall_seconds = (
+        expected_worker_wall_seconds * WORKER_WALL_UPPER_RATIO
+        + WORKER_WALL_UPPER_SLACK_SECONDS
+    )
+    if worker_wall_seconds < minimum_worker_wall_seconds:
+        raise EvidenceError(
+            "paced worker completed too quickly to represent its absolute real-time schedule"
+        )
+    if worker_wall_seconds > maximum_worker_wall_seconds:
+        raise EvidenceError(
+            "paced worker completed too slowly to represent its absolute real-time schedule"
+        )
     deadline_miss_limit = math.floor(calls * MAX_DEADLINE_MISS_FRACTION)
 
     checks = [

@@ -305,7 +305,12 @@ measurement (6,000 blocks for the 60-second gate) and remains stricter:
 overload, late, invalid, and worker-error counters must all be zero. This tests
 the actual 240 ms bounded-queue contract while preserving the direct-call tail
 diagnostics and avoids mistaking continuous container CPU-quota throttling for
-a DAW callback workload.
+a DAW callback workload. Input fixtures are prepared before measurement, then
+whole 480-frame blocks are submitted on one absolute 10 ms clock; processing
+time is carried into the next deadline instead of added to a relative sleep.
+Evidence is rejected if the measured wall time falls below 95% or exceeds 105%
+plus 250 ms of the complete scheduled window (including latency priming), so a
+slow feeder cannot hide production-worker deadline failures.
 
 ## Sources
 
