@@ -30,6 +30,11 @@ listening. Hash each JSON before uploading it to issue #221:
 Get-FileHash .\dpdfnet-128.json -Algorithm SHA256
 ```
 
+If you heard one or more audible discontinuities but did not count their exact
+number, set `"audible_xruns": null` and `"continuous_audio": false`. `null`
+means “observed, exact count not measured”; do not estimate a number from the
+worker counters. The importer preserves that run as valid failed evidence.
+
 Upload the three JSON files to the issue, then use their GitHub attachment URLs
 and hashes in exactly one fenced JSON object:
 
@@ -88,5 +93,7 @@ and hashes in exactly one fenced JSON object:
 Report observed failures exactly. The importer preserves a structurally valid
 failed submission, its raw host files, normalized counters, and individual gate
 results with `accepted: false`; it does not require failures to be rewritten as
-zero. Host-evidence v1 files are also retained, but cannot pass the new
-effective-buffer provenance gate because they did not record callback sizes.
+zero. An unknown exact audible-XRUN count must remain `null`, not be replaced
+with zero or an estimate. Host-evidence v1 files are also retained, but cannot
+pass the new effective-buffer provenance gate because they did not record
+callback sizes.
