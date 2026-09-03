@@ -105,9 +105,10 @@ rules and `request_exec` waits for completion.
 
 On Windows, the named worker joins the `Pro Audio` Multimedia Class Scheduler
 Service task at its critical relative priority. On macOS it combines
-interactive pthread QoS with a 10 ms Mach time-constraint policy and an 8 ms
-nominal computation allowance. These changes happen after model preparation
-and warm-up and before activation reports the worker ready. If any scheduling
+interactive pthread QoS with a 10 ms Mach time-constraint policy whose nominal
+computation allowance matches the full 10 ms deadline. These changes happen
+after model preparation and warm-up and before activation reports the worker
+ready. If any scheduling
 step fails, neural inference stays unavailable and the fixed-latency fallback
 remains active. The previous scheduling policies are restored when the worker
 exits; other platforms retain their native scheduler behavior.

@@ -26,7 +26,7 @@ pub const NEURAL_DAW_MAX_SAMPLE_RATE: u32 = crate::daw::DAW_MAX_SAMPLE_RATE;
 #[cfg(target_os = "macos")]
 const MACOS_NEURAL_PERIOD_NANOS: u64 = NEURAL_DAW_CHUNK_MILLIS as u64 * 1_000_000;
 #[cfg(target_os = "macos")]
-const MACOS_NEURAL_COMPUTATION_NANOS: u64 = MACOS_NEURAL_PERIOD_NANOS * 4 / 5;
+const MACOS_NEURAL_COMPUTATION_NANOS: u64 = MACOS_NEURAL_PERIOD_NANOS;
 
 /// Keeps the neural inference worker in the platform's interactive audio class.
 ///
@@ -306,8 +306,12 @@ fn acquire_macos_time_constraint() -> Result<
     };
 
     // XNU defines these values as the periodic arrival interval, nominal CPU
-    // demand, and completion deadline. Reserving 8 ms of each 10 ms audio
-    // period covers the measured model tail without changing the 10 ms gate.
+    // demand, and completion deadline, and may preempt the thread once its
+    // declared computation time elapses. The production gate requires one
+    // inference to finish anywhere inside the full 10 ms audio period, so do
+    // not advertise a shorter 8 ms budget that permits preemption before the
+    // actual deadline. The thread sleeps between arrivals, so this declaration
+    // does not turn unused time into CPU work.
     let mut active = thread_time_constraint_policy_data_t {
         period: absolute_ticks(MACOS_NEURAL_PERIOD_NANOS)?,
         computation: absolute_ticks(MACOS_NEURAL_COMPUTATION_NANOS)?,
