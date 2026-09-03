@@ -70,10 +70,12 @@ Copy-Item -LiteralPath $PluginBinary -Destination $plugin
 $sampleRate = 48000
 $evidenceWarmupFrames = 46080
 $measurementDelaySeconds = $DurationSeconds + 1
-# Keep the media item longer than the measured interval. A repeated short item
-# introduces transport discontinuities and recurrent-state resets into what is
-# intended to be a sustained real-time scheduling measurement.
-$sampleCount = $sampleRate * ($DurationSeconds + 10)
+# Keep the media item well beyond the measured interval. REAPER's Dummy Audio
+# device can advance the project timeline faster than wall time on hosted
+# runners; the repeated Bypass probe must still run while transport is active.
+# A repeated short item would introduce discontinuities and recurrent-state
+# resets into the sustained scheduling measurement.
+$sampleCount = $sampleRate * ($DurationSeconds + 120)
 $dataSize = $sampleCount * 2
 $writer = [System.IO.BinaryWriter]::new([System.IO.File]::Create($tone))
 try {
@@ -253,7 +255,8 @@ for ($index = 0; $index -lt $expectedBypassStages.Count; $index++) {
     [Math]::Abs([double]$fields[2] - $expected.Target) -gt 1e-9 -or
     $fields[3] -ne $expected.Applied -or $fields[4] -ne "true" -or
     [Math]::Abs([double]$fields[5] - $expected.Target) -gt 1e-9 -or
-    $fields[6] -ne "true" -or $fields[8] -ne "false" -or
+    $fields[6] -ne "true" -or $fields[7] -ne "true" -or
+    $fields[8] -ne "false" -or
     (([int]$fields[9] -band 1) -ne 1)) {
     throw "REAPER did not retain the repeated Bypass sequence"
   }
