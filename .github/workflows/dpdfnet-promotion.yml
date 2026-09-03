@@ -14,14 +14,13 @@ on:
       - ".github/workflows/dpdfnet-promotion.yml"
       - "Cargo.lock"
       - "Cargo.toml"
-      - "examples/dpdfnet_gtcrn_stress.rs"
+      - "examples/*dpdfnet*"
       - "models/**"
       - "plugins/denoize-clap/**"
       - "schemas/denoize-dpdfnet-*"
       - "scripts/*dpdfnet*"
       - "scripts/reaper-clap-parameter-smoke.lua"
-      - "src/backend/dpdfnet.rs"
-      - "src/neural_daw.rs"
+      - "src/**"
   pull_request:
     branches:
       - main
@@ -29,14 +28,13 @@ on:
       - ".github/workflows/dpdfnet-promotion.yml"
       - "Cargo.lock"
       - "Cargo.toml"
-      - "examples/dpdfnet_gtcrn_stress.rs"
+      - "examples/*dpdfnet*"
       - "models/**"
       - "plugins/denoize-clap/**"
       - "schemas/denoize-dpdfnet-*"
       - "scripts/*dpdfnet*"
       - "scripts/reaper-clap-parameter-smoke.lua"
-      - "src/backend/dpdfnet.rs"
-      - "src/neural_daw.rs"
+      - "src/**"
 
 permissions:
   contents: read
@@ -92,7 +90,7 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends libasound2-dev python3-jsonschema
+          sudo apt-get install --no-install-recommends libasound2-dev python3-jsonschema python3-venv
 
       - name: Record evidence environment
         shell: bash
@@ -145,6 +143,36 @@ jobs:
           fi
           test "$observed" = "$DPDFNET_MODEL_SHA256"
           echo "DPDFNET_MODEL=$model" >> "$GITHUB_ENV"
+
+      - name: Install pinned official ONNX reference runtime
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          python3 -m venv "$RUNNER_TEMP/dpdfnet-reference-python"
+          "$RUNNER_TEMP/dpdfnet-reference-python/bin/python" -m pip install \
+            --disable-pip-version-check \
+            'numpy==2.5.2' \
+            'onnxruntime==1.29.0'
+
+      - name: Validate compensated production path against ONNX Runtime
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          RAYON_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+        run: |
+          cargo run --locked --release --target "${{ matrix.target }}" \
+            --features dpdfnet,gtcrn --example dpdfnet_production_reference -- \
+            --model "$DPDFNET_MODEL" \
+            --input "$DENOIZE_EVIDENCE_DIR/production-reference-input.wav" \
+            --actual "$DENOIZE_EVIDENCE_DIR/production-aligned.wav"
+          "$RUNNER_TEMP/dpdfnet-reference-python/bin/python" \
+            scripts/validate-dpdfnet-poc.py \
+            --model "$DPDFNET_MODEL" \
+            --input "$DENOIZE_EVIDENCE_DIR/production-reference-input.wav" \
+            --actual "$DENOIZE_EVIDENCE_DIR/production-aligned.wav" \
+            --alignment-samples 1920 \
+            | tee "$DENOIZE_EVIDENCE_DIR/production-reference-validation.txt"
 
       - name: Measure production DPDFNet DAW path
         shell: bash

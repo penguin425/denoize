@@ -73,11 +73,14 @@ fn run() -> Result<(), String> {
     })?;
 
     let dpdfnet_raw = with_channels(&noisy, dpdfnet_channels)?;
+    let dpdfnet_aligned = with_channels(
+        &noisy,
+        dpdfnet.process_aligned(&noisy.channels, noisy.sample_rate)?,
+    )?;
     let gtcrn_output = with_channels(&noisy, gtcrn_channels)?;
     let alignment_samples = ((MODEL_LOOKAHEAD_SAMPLES as u64 * noisy.sample_rate as u64
         + (DPDFNET_RATE as u64 / 2))
         / DPDFNET_RATE as u64) as usize;
-    let dpdfnet_aligned = advance_audio(&dpdfnet_raw, alignment_samples);
 
     let dpdfnet_raw_quality = ComparisonReport::compare(&clean, &noisy, &dpdfnet_raw)?;
     let dpdfnet_aligned_quality = ComparisonReport::compare(&clean, &noisy, &dpdfnet_aligned)?;
@@ -204,20 +207,6 @@ fn with_channels(template: &Audio, channels: Vec<Vec<f64>>) -> Result<Audio, Str
     let mut output = template.clone();
     output.channels = channels;
     Ok(output)
-}
-
-fn advance_audio(input: &Audio, samples: usize) -> Audio {
-    let mut output = input.clone();
-    for channel in &mut output.channels {
-        if samples >= channel.len() {
-            channel.fill(0.0);
-        } else {
-            let tail_start = channel.len() - samples;
-            channel.copy_within(samples.., 0);
-            channel[tail_start..].fill(0.0);
-        }
-    }
-    output
 }
 
 fn downmix(audio: &Audio) -> Vec<f64> {

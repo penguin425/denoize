@@ -27,7 +27,7 @@ def parse_args() -> argparse.Namespace:
         "--alignment-samples",
         type=int,
         default=0,
-        help="compare an actual file advanced by this many causal output samples",
+        help="advance the causal reference by this many samples before comparison",
     )
     return parser.parse_args()
 
@@ -120,25 +120,33 @@ def main() -> None:
     )
     source = read_pcm16_mono(args.input)
     actual = read_pcm16_mono(args.actual)
-    if args.alignment_samples < 0 or args.alignment_samples >= source.size:
-        raise SystemExit("--alignment-samples must be non-negative and shorter than input")
-    expected_actual_size = source.size - args.alignment_samples
-    if actual.size != expected_actual_size:
+    if args.alignment_samples < 0:
+        raise SystemExit("--alignment-samples must be non-negative")
+    if actual.size != source.size:
         raise SystemExit(
-            "Rust output length differs from the aligned input: "
-            f"actual={actual.size}, expected={expected_actual_size}"
+            "Rust output length differs from the production exact-length contract: "
+            f"actual={actual.size}, expected={source.size}"
         )
     # The Rust finite wrapper presents a zero-padded final 10 ms host hop and
     # trims it afterward. Mirror that call contract around the official causal
     # frame loop so non-hop-aligned WAV lengths remain exactly preserved.
-    padded_size = ((source.size + HOP_SIZE - 1) // HOP_SIZE) * HOP_SIZE
-    expected = enhance(session, np.pad(source, (0, padded_size - source.size)))[
-        args.alignment_samples : source.size
+    padded_input_size = ((source.size + HOP_SIZE - 1) // HOP_SIZE) * HOP_SIZE
+    reference_size = padded_input_size + args.alignment_samples
+    causal_reference = enhance(
+        session,
+        np.pad(source, (0, reference_size - source.size)),
+    )
+    expected = causal_reference[
+        args.alignment_samples : args.alignment_samples + source.size
     ]
     difference = actual.astype(np.float64) - expected.astype(np.float64)
     maximum = float(np.max(np.abs(difference)))
     rms = float(np.sqrt(np.mean(difference * difference)))
     correlation = float(np.corrcoef(actual, expected)[0, 1])
+    print(f"ONNX Runtime: {ort.__version__}")
+    print(f"NumPy: {np.__version__}")
+    print(f"alignment samples: {args.alignment_samples}")
+    print(f"compared samples: {actual.size}")
     print(f"maximum absolute error: {maximum:.9g}")
     print(f"RMS error: {rms:.9g}")
     print(f"correlation: {correlation:.12f}")
