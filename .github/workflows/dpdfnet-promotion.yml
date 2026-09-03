@@ -161,18 +161,25 @@ jobs:
           RAYON_NUM_THREADS: "1"
           OMP_NUM_THREADS: "1"
         run: |
+          reference_dir=$(mktemp -d /tmp/denoize-dpdfnet-reference.XXXXXX)
+          reference_input="$reference_dir/input.wav"
+          reference_actual="$reference_dir/production-aligned.wav"
           cargo run --locked --release --target "${{ matrix.target }}" \
             --features dpdfnet,gtcrn --example dpdfnet_production_reference -- \
             --model "$DPDFNET_MODEL" \
-            --input "$DENOIZE_EVIDENCE_DIR/production-reference-input.wav" \
-            --actual "$DENOIZE_EVIDENCE_DIR/production-aligned.wav"
+            --input "$reference_input" \
+            --actual "$reference_actual"
           "$RUNNER_TEMP/dpdfnet-reference-python/bin/python" \
             scripts/validate-dpdfnet-poc.py \
             --model "$DPDFNET_MODEL" \
-            --input "$DENOIZE_EVIDENCE_DIR/production-reference-input.wav" \
-            --actual "$DENOIZE_EVIDENCE_DIR/production-aligned.wav" \
+            --input "$reference_input" \
+            --actual "$reference_actual" \
             --alignment-samples 1920 \
             | tee "$DENOIZE_EVIDENCE_DIR/production-reference-validation.txt"
+          install -m 644 "$reference_input" \
+            "$DENOIZE_EVIDENCE_DIR/production-reference-input.wav"
+          install -m 644 "$reference_actual" \
+            "$DENOIZE_EVIDENCE_DIR/production-aligned.wav"
 
       - name: Measure production DPDFNet DAW path
         shell: bash
