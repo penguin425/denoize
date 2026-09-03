@@ -486,6 +486,62 @@ impl StreamingProcessor {
         Ok(output)
     }
 
+    /// Process an owned block while reusing its mono native-rate storage for
+    /// the result when the caller already prepared one exact model hop.
+    pub(crate) fn process_owned_block(
+        &mut self,
+        mut input: Vec<Vec<f64>>,
+    ) -> Result<Vec<Vec<f64>>, String> {
+        if self.finished {
+            return Err("DPDFNet stream is finished; reset it before processing more input".into());
+        }
+        let frames = validate_stream_block(&input, self.channels)?;
+        if !self.native_rate
+            || self.channels != 1
+            || frames != HOP_SIZE
+            || self
+                .pending_model_rate
+                .iter()
+                .any(|pending| !pending.is_empty())
+        {
+            return self.process_block(&input);
+        }
+
+        let input_frames = self
+            .input_frames
+            .checked_add(frames)
+            .ok_or_else(|| "DPDFNet streaming input length overflow".to_string())?;
+        self.model_input_frames = self
+            .model_input_frames
+            .checked_add(frames)
+            .ok_or_else(|| "DPDFNet model input length overflow".to_string())?;
+        for (&source, destination) in input[0].iter().zip(&mut self.hop_scratch[0]) {
+            *destination = crate::audio::sanitize_sample(source) as f32;
+        }
+
+        let remaining = self
+            .model_input_frames
+            .checked_sub(self.model_output_frames)
+            .ok_or_else(|| "DPDFNet model output exceeded its input clock".to_string())?;
+        input[0].clear();
+        input[0]
+            .try_reserve(remaining.min(HOP_SIZE))
+            .map_err(|_| "unable to reserve DPDFNet output samples".to_string())?;
+        self.process_scratch_hop(&mut input)?;
+
+        let produced = validate_stream_block(&input, self.channels)?;
+        let output_frames = self
+            .output_frames
+            .checked_add(produced)
+            .ok_or_else(|| "DPDFNet streaming output length overflow".to_string())?;
+        if output_frames > input_frames {
+            return Err("DPDFNet stream produced samples ahead of its input clock".into());
+        }
+        self.input_frames = input_frames;
+        self.output_frames = output_frames;
+        Ok(input)
+    }
+
     pub(crate) fn finish(&mut self) -> Result<Vec<Vec<f64>>, String> {
         let remaining = self
             .input_frames
@@ -1183,6 +1239,40 @@ mod tests {
             .map(|(left, right)| (left - right).abs())
             .fold(0.0f64, f64::max);
         assert!(maximum < 1e-6, "exact-hop maximum difference was {maximum}");
+    }
+
+    #[test]
+    fn native_owned_hops_reuse_input_storage_and_match_borrowed_processing() {
+        let (_directory, path) = write_identity_model();
+        let config = OnnxModelConfig {
+            path,
+            sample_rate: SAMPLE_RATE,
+        };
+        let model = DpdfnetModel::load(&config).unwrap();
+        let mut borrowed = StreamingProcessor::new_with_model(&model, SAMPLE_RATE, 1).unwrap();
+        let mut owned = StreamingProcessor::new_with_model(&model, SAMPLE_RATE, 1).unwrap();
+
+        for hop_index in 0..8 {
+            let input: Vec<f64> = (0..HOP_SIZE)
+                .map(|index| {
+                    let position = hop_index * HOP_SIZE + index;
+                    (std::f64::consts::TAU * 521.0 * position as f64 / SAMPLE_RATE as f64).sin()
+                        * 0.2
+                })
+                .collect();
+            let expected = borrowed.process_block(&[input.clone()]).unwrap();
+            let samples_ptr = input.as_ptr();
+            let mut input_channels = Vec::with_capacity(2);
+            input_channels.push(input);
+            let channels_ptr = input_channels.as_ptr();
+
+            let actual = owned.process_owned_block(input_channels).unwrap();
+
+            assert_eq!(actual.as_ptr(), channels_ptr);
+            assert_eq!(actual[0].as_ptr(), samples_ptr);
+            assert_eq!(actual, expected);
+        }
+        assert_eq!(owned.finish().unwrap(), borrowed.finish().unwrap());
     }
 
     fn write_identity_model() -> (tempfile::TempDir, std::path::PathBuf) {
