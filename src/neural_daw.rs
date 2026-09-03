@@ -29,7 +29,8 @@ pub const NEURAL_DAW_MAX_SAMPLE_RATE: u32 = crate::daw::DAW_MAX_SAMPLE_RATE;
 /// worker, but Windows DAWs can run that callback in the `Pro Audio` class.
 /// Keeping the dependent inference worker at ordinary priority can therefore
 /// starve it even when the model's measured compute time is below its buffered
-/// deadline. Other platforms deliberately keep their existing scheduling.
+/// deadline. The worker uses the task's critical relative priority; other
+/// platforms deliberately keep their existing scheduling.
 #[doc(hidden)]
 #[must_use = "dropping the guard releases the neural worker scheduling class"]
 pub struct NeuralDawWorkerPriorityGuard {
@@ -49,7 +50,10 @@ impl NeuralDawWorkerPriorityGuard {
     pub fn acquire() -> Result<Self, String> {
         #[cfg(windows)]
         {
-            use windows_sys::Win32::System::Threading::AvSetMmThreadCharacteristicsW;
+            use windows_sys::Win32::System::Threading::{
+                AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW,
+                AvSetMmThreadPriority, AVRT_PRIORITY_CRITICAL,
+            };
 
             let mut task_index = 0u32;
             // SAFETY: `w!` supplies a process-lifetime, NUL-terminated UTF-16
@@ -63,6 +67,27 @@ impl NeuralDawWorkerPriorityGuard {
                     "register neural inference worker with Windows Pro Audio MMCSS: {}",
                     std::io::Error::last_os_error()
                 ));
+            }
+            // Registration chooses the task category, while this call selects
+            // the worker's relative priority inside that task. The inference
+            // result is a dependency of the audio callback, so it must not be
+            // left at MMCSS's default relative priority.
+            if unsafe { AvSetMmThreadPriority(handle, AVRT_PRIORITY_CRITICAL) } == 0 {
+                let priority_error = std::io::Error::last_os_error();
+                // SAFETY: `handle` was returned to this calling thread above.
+                // Revert it before failing activation so registration cannot
+                // leak when setting the relative priority fails.
+                let reverted = unsafe { AvRevertMmThreadCharacteristics(handle) } != 0;
+                let mut message = format!(
+                    "set neural inference worker Windows Pro Audio MMCSS priority: {priority_error}"
+                );
+                if !reverted {
+                    message.push_str(&format!(
+                        "; leave Windows Pro Audio MMCSS after priority failure: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+                return Err(message);
             }
             Ok(Self {
                 handle,
