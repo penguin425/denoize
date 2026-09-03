@@ -870,8 +870,14 @@ impl<'a> PluginAudioProcessor<'a, NeuralShared, NeuralMainThread<'a>> for Neural
     ) -> Result<Self, PluginError> {
         let sample_rate = validated_sample_rate(audio_config.sample_rate).map_err(invalid_state)?;
         let channels = main_thread.port_configuration.channels();
-        let engine = NeuralEngine::new_model(shared.model, sample_rate, channels, shared)
-            .map_err(invalid_state)?;
+        let engine = NeuralEngine::new_model_for_host(
+            shared.model,
+            sample_rate,
+            channels,
+            shared,
+            audio_config,
+        )
+        .map_err(invalid_state)?;
         main_thread.latency_frames = engine.latency_frames;
         Ok(Self {
             shared,
@@ -935,6 +941,7 @@ impl NeuralAudioProcessor<'_> {
             ));
         }
         let frames = channels.frames_count() as usize;
+        self.engine.record_callback(frames);
         let mut left = channels.channel_pair(0).ok_or(PluginError::Message(
             "denoize Neural left channel is missing",
         ))?;
@@ -1253,15 +1260,34 @@ struct NeuralEngine<'a> {
     activated_at: std::time::Instant,
     host_evidence_warmup_frames: u64,
     host_evidence_baseline: Option<WorkerMetrics>,
+    host_min_frames_count: u32,
+    host_max_frames_count: u32,
+    callback_calls: u64,
+    callback_min_frames: u32,
+    callback_max_frames: u32,
     generation: u64,
     last_safe_gain: [f64; 2],
     running: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
     worker_started: bool,
+    finished_gracefully: bool,
     metrics: &'a NeuralShared,
 }
 
 impl<'a> NeuralEngine<'a> {
+    fn new_model_for_host(
+        model: NeuralDawModel,
+        sample_rate: f64,
+        channels: usize,
+        metrics: &'a NeuralShared,
+        audio_config: PluginAudioConfiguration,
+    ) -> Result<Self, String> {
+        let mut engine = Self::new_model(model, sample_rate, channels, metrics)?;
+        engine.host_min_frames_count = audio_config.min_frames_count;
+        engine.host_max_frames_count = audio_config.max_frames_count;
+        Ok(engine)
+    }
+
     fn new_model(
         model: NeuralDawModel,
         sample_rate: f64,
@@ -1405,6 +1431,7 @@ impl<'a> NeuralEngine<'a> {
                 drop(priority_guard);
             })
             .map_err(|error| format!("start neural inference worker: {error}"))?;
+        let mut finished_gracefully = true;
         let worker = match ready_rx.recv() {
             Ok(Ok(())) => Some(worker),
             Ok(Err(error)) => {
@@ -1416,14 +1443,20 @@ impl<'a> NeuralEngine<'a> {
                 eprintln!("denoize Neural worker startup error: {error}");
                 metrics.worker_errors.fetch_add(1, Ordering::Relaxed);
                 running.store(false, Ordering::Release);
-                let _ = worker.join();
+                if worker.join().is_err() {
+                    finished_gracefully = false;
+                    metrics.worker_errors.fetch_add(1, Ordering::Relaxed);
+                }
                 None
             }
             Err(error) => {
                 eprintln!("denoize Neural worker startup handshake error: {error}");
                 metrics.worker_errors.fetch_add(1, Ordering::Relaxed);
                 running.store(false, Ordering::Release);
-                let _ = worker.join();
+                if worker.join().is_err() {
+                    finished_gracefully = false;
+                    metrics.worker_errors.fetch_add(1, Ordering::Relaxed);
+                }
                 None
             }
         };
@@ -1455,13 +1488,31 @@ impl<'a> NeuralEngine<'a> {
             activated_at: std::time::Instant::now(),
             host_evidence_warmup_frames,
             host_evidence_baseline,
+            host_min_frames_count: 1,
+            host_max_frames_count: chunk_frames as u32,
+            callback_calls: 0,
+            callback_min_frames: u32::MAX,
+            callback_max_frames: 0,
             generation: 1,
             last_safe_gain: [1.0; 2],
             running,
             worker,
             worker_started,
+            finished_gracefully,
             metrics,
         })
+    }
+
+    fn record_callback(&mut self, frames: usize) {
+        let Ok(frames) = u32::try_from(frames) else {
+            return;
+        };
+        if frames == 0 {
+            return;
+        }
+        self.callback_calls = self.callback_calls.saturating_add(1);
+        self.callback_min_frames = self.callback_min_frames.min(frames);
+        self.callback_max_frames = self.callback_max_frames.max(frames);
     }
 
     #[inline]
@@ -1652,8 +1703,12 @@ impl<'a> NeuralEngine<'a> {
 
     fn stop(&mut self) {
         self.running.store(false, Ordering::Release);
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+        if let Some(worker) = self.worker.take()
+            && worker.join().is_err()
+        {
+            self.finished_gracefully = false;
+            self.metrics.worker_errors.fetch_add(1, Ordering::Relaxed);
+            eprintln!("denoize Neural worker panicked during shutdown");
         }
     }
 }
@@ -1686,8 +1741,8 @@ impl NeuralEngine<'_> {
             .processed_frames
             .saturating_sub(self.host_evidence_warmup_frames);
         let document = serde_json::json!({
-            "schema": "denoize-dpdfnet-clap-host-run-v1",
-            "schema_version": 1,
+            "schema": "denoize-dpdfnet-clap-host-run-v2",
+            "schema_version": 2,
             "source_commit": std::env::var("DENOIZE_EVIDENCE_SOURCE_COMMIT").unwrap_or_default(),
             "model_id": self.metrics.model.model_id(),
             "model_sha256": self.metrics.model.model_sha256(),
@@ -1702,10 +1757,19 @@ impl NeuralEngine<'_> {
                 "warmup_frames": self.host_evidence_warmup_frames,
                 "measured_frames": measured_frames,
             },
+            "host_audio_configuration": {
+                "min_frames_count": self.host_min_frames_count,
+                "max_frames_count": self.host_max_frames_count,
+            },
+            "callback_frames": {
+                "calls": self.callback_calls,
+                "minimum": self.callback_min_frames,
+                "maximum": self.callback_max_frames,
+            },
             // `deactivate()` stops and joins the worker before `Drop`. Keep
             // the successful startup fact independently of the live handle.
             "worker_started": self.worker_started,
-            "finished_gracefully": true,
+            "finished_gracefully": self.finished_gracefully,
             "metrics": {
                 "overload_blocks": measured_metrics.overload_blocks,
                 "late_blocks": measured_metrics.late_blocks,
@@ -2167,6 +2231,62 @@ mod tests {
         let measured = lifetime.saturating_since(engine.host_evidence_baseline.unwrap());
         assert_eq!(lifetime.overload_blocks, 5);
         assert_eq!(measured.overload_blocks, 2);
+    }
+
+    #[test]
+    fn host_callback_geometry_records_activation_and_observed_bounds() {
+        let mut engine = test_engine(1, || Ok(Box::new(IdentityProcessor)));
+        engine.host_min_frames_count = 64;
+        engine.host_max_frames_count = 1_024;
+        engine.record_callback(128);
+        engine.record_callback(1_024);
+        engine.record_callback(480);
+
+        assert_eq!(engine.host_min_frames_count, 64);
+        assert_eq!(engine.host_max_frames_count, 1_024);
+        assert_eq!(engine.callback_calls, 3);
+        assert_eq!(engine.callback_min_frames, 128);
+        assert_eq!(engine.callback_max_frames, 1_024);
+    }
+
+    #[test]
+    fn worker_panic_during_shutdown_is_recorded() {
+        struct PanicOnDrop;
+
+        impl BlockProcessor for PanicOnDrop {
+            fn process(&mut self, channels: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, String> {
+                Ok(channels.to_vec())
+            }
+
+            fn reset(&mut self) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        impl Drop for PanicOnDrop {
+            fn drop(&mut self) {
+                panic!("injected worker shutdown panic");
+            }
+        }
+
+        let mut engine = test_engine(1, || Ok(Box::new(PanicOnDrop)));
+        assert!(engine.finished_gracefully);
+        engine.stop();
+        assert!(!engine.finished_gracefully);
+        assert_eq!(engine.metrics.worker_errors.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn repeated_bypass_updates_remain_latched() {
+        let shared = NeuralShared::new().unwrap();
+        for expected in [true, false, true] {
+            assert!(
+                shared
+                    .parameters
+                    .set_value(PARAM_BYPASS, f64::from(bool_value(expected)))
+            );
+            assert_eq!(shared.parameters.snapshot().bypass, expected);
+        }
     }
 
     #[test]

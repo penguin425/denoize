@@ -149,6 +149,7 @@ local function osara_target(parameter, before, minimum, maximum)
 end
 
 local probes = {}
+local bypass_latch_failures = 0
 local verify_started = nil
 local function verify_after_host_flush()
   if reaper.time_precise() - verify_started < 0.75 then
@@ -156,7 +157,7 @@ local function verify_after_host_flush()
     return
   end
 
-  local failures = 0
+  local failures = bypass_latch_failures
   for _, probe in ipairs(probes) do
     local after = reaper.TrackFX_GetParam(track, fx, probe.parameter)
     local changed = math.abs(after - probe.before) > 1e-9
@@ -184,6 +185,73 @@ local function verify_after_host_flush()
   end
   write_line("complete", failures)
   result:close()
+end
+
+local function begin_parameter_verification()
+  verify_started = reaper.time_precise()
+  reaper.defer(verify_after_host_flush)
+end
+
+local function exercise_repeated_bypass(probe)
+  local stages = {
+    { label = "on-1", target = probe.maximum, apply = true, wait = 0.75 },
+    { label = "off", target = probe.minimum, apply = true, wait = 0.75 },
+    { label = "on-2", target = probe.maximum, apply = true, wait = 0.75 },
+    { label = "on-2-held", target = probe.maximum, apply = false, wait = 2.0 },
+  }
+  local stage_index = 0
+  local stage_started = nil
+  local set_accepted = true
+
+  local function advance()
+    if stage_index > 0 then
+      local stage = stages[stage_index]
+      if reaper.time_precise() - stage_started < stage.wait then
+        reaper.defer(advance)
+        return
+      end
+
+      local observed = reaper.TrackFX_GetParam(track, fx, probe.parameter)
+      local matched = math.abs(observed - stage.target) <= 1e-9
+      if not set_accepted or not matched then
+        bypass_latch_failures = bypass_latch_failures + 1
+      end
+      write_line(
+        "bypass-latch",
+        stage.label,
+        string.format("%.17g", stage.target),
+        tostring(stage.apply),
+        tostring(set_accepted),
+        string.format("%.17g", observed),
+        tostring(matched),
+        tostring(reaper.TrackFX_GetEnabled(track, fx)),
+        tostring(reaper.TrackFX_GetOffline(track, fx)),
+        reaper.GetPlayState()
+      )
+    end
+
+    stage_index = stage_index + 1
+    if stage_index > #stages then
+      write_line("bypass-latch-summary", bypass_latch_failures)
+      begin_parameter_verification()
+      return
+    end
+
+    local stage = stages[stage_index]
+    set_accepted = true
+    if stage.apply then
+      set_accepted = reaper.TrackFX_SetParam(
+        track,
+        fx,
+        probe.parameter,
+        stage.target
+      )
+    end
+    stage_started = reaper.time_precise()
+    reaper.defer(advance)
+  end
+
+  advance()
 end
 
 local function set_parameters()
@@ -266,8 +334,25 @@ local function set_parameters()
     }
   end
 
-  verify_started = reaper.time_precise()
-  reaper.defer(verify_after_host_flush)
+  if os.getenv("DENOIZE_REAPER_BYPASS_LATCH") == "1" then
+    local bypass_probe = nil
+    for _, probe in ipairs(probes) do
+      if probe.name == "Bypass" then
+        bypass_probe = probe
+        break
+      end
+    end
+    if bypass_probe == nil then
+      bypass_latch_failures = bypass_latch_failures + 1
+      write_line("bypass-latch-error", "Bypass parameter was not found")
+      write_line("bypass-latch-summary", bypass_latch_failures)
+      begin_parameter_verification()
+    else
+      exercise_repeated_bypass(bypass_probe)
+    end
+  else
+    begin_parameter_verification()
+  end
 end
 
 local set_delay = tonumber(os.getenv("DENOIZE_REAPER_SET_DELAY") or "0") or 0
