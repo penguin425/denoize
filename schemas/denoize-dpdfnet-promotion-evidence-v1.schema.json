@@ -35,6 +35,7 @@
       "required": ["objective_evaluation", "blinded_listening", "automated_reaper", "issue_reporter"],
       "properties": {
         "objective_evaluation": { "$ref": "#/$defs/jsonFile" },
+        "objective_equivalence": { "$ref": "#/$defs/jsonFile" },
         "blinded_listening": { "$ref": "#/$defs/jsonFile" },
         "automated_reaper": { "$ref": "#/$defs/jsonFile" },
         "issue_reporter": { "$ref": "#/$defs/jsonFile" }

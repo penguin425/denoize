@@ -24,6 +24,7 @@ SCORE = ROOT / "scripts/score-dpdfnet-blind-listening.py"
 PLATFORM = ROOT / "scripts/generate-dpdfnet-platform-evidence.py"
 PROMOTION = ROOT / "scripts/generate-dpdfnet-promotion-evidence.py"
 FETCH_REPORTER = ROOT / "scripts/fetch-dpdfnet-reporter-evidence.py"
+EQUIVALENCE = ROOT / "scripts/verify-dpdfnet-objective-equivalence.py"
 SCHEMAS = {
     "protocol": ROOT / "schemas/denoize-dpdfnet-blind-protocol-v1.schema.json",
     "answer": ROOT / "schemas/denoize-dpdfnet-blind-answer-key-v1.schema.json",
@@ -37,6 +38,7 @@ SCHEMAS = {
     "reaper": ROOT / "schemas/denoize-dpdfnet-reaper-automated-evidence-v1.schema.json",
     "reporter_v1": ROOT / "schemas/denoize-dpdfnet-reporter-evidence-v1.schema.json",
     "reporter_v2": ROOT / "schemas/denoize-dpdfnet-reporter-evidence-v2.schema.json",
+    "equivalence": ROOT / "schemas/denoize-dpdfnet-objective-equivalence-v1.schema.json",
     "promotion": ROOT / "schemas/denoize-dpdfnet-promotion-evidence-v1.schema.json",
 }
 
@@ -232,6 +234,65 @@ def load_reporter_module():
 
 def file_record(name: str) -> dict[str, object]:
     return {"name": name, "size_bytes": 1, "sha256": "0" * 64}
+
+
+def objective_matrix_fixture(
+    root: Path, label: str, commit: str, timing_offset: float
+) -> tuple[Path, Path]:
+    model_names = ("dpdfnet2_48khz_hr", "dpdfnet8_48khz_hr", "gtcrn")
+    models = {
+        name: {
+            "path": f"/{label}/{name}.onnx",
+            "load_ms": timing_offset + index + 1.0,
+            "identity": f"fixture-{name}",
+        }
+        for index, name in enumerate(model_names)
+    }
+    cases = []
+    for index in range(295):
+        case = {
+            "id": f"case-{index:03d}",
+            "kind": "noise-matrix" if index < 280 else "clean-preservation",
+            "speaker": f"speaker-{index % 10}",
+        }
+        for model_index, name in enumerate(model_names):
+            case[name] = {
+                "process_ms": timing_offset + index + model_index / 10,
+                "rtf": timing_offset / 100 + model_index / 1000,
+                "quality": {"score": index - model_index / 10},
+            }
+        cases.append(case)
+    matrix = {
+        "schema": "denoize-dpdfnet-gtcrn-matrix-v1",
+        "fixture_manifest": f"/{label}/manifest.json",
+        "fixture_fingerprint": "f" * 64,
+        "models": models,
+        "environment": {
+            "arch": "x86_64",
+            "logical_parallelism": max(1, int(timing_offset)),
+            "os": "linux",
+            "visqol_enabled": False,
+        },
+        "cases": cases,
+    }
+    matrix_path = root / f"{label}-matrix.json"
+    matrix_path.write_text(json.dumps(matrix, sort_keys=True) + "\n", encoding="utf-8")
+    matrix_payload = matrix_path.read_bytes()
+    summary = {
+        "schema": "denoize-dpdfnet-gtcrn-evaluation-summary-v1",
+        "source_commit": commit,
+        "fixture_fingerprint": "f" * 64,
+        "matrix_result_sha256": hashlib.sha256(matrix_payload).hexdigest(),
+        "models": {
+            "dpdfnet2-48khz-hr": "7f0575a5cec0ba4ffd8f8bd657e06d007e4ccdd955d76faab922b9d3291dc14b",
+            "dpdfnet8-48khz-hr": "7b3afbb260a08fe9af3d16e3bda992971be1e7e951d1dee7c2d235f5c43f5631",
+            "gtcrn-dns3": "b4718df6228e7bdf1a8a435cf98f838636eb2fd331acabf86ba87c5192ebcb87",
+        },
+        "quality": {"case_counts": {"total": 295}},
+    }
+    summary_path = root / f"{label}-summary.json"
+    summary_path.write_text(json.dumps(summary, sort_keys=True) + "\n", encoding="utf-8")
+    return matrix_path, summary_path
 
 
 def composite_fixtures(
@@ -712,6 +773,7 @@ def composite_fixtures(
     arguments = SimpleNamespace(
         source_commit=commit,
         evaluation_summary=summary_path,
+        objective_equivalence=None,
         listening_result=listening_path,
         reaper_automated=reaper_path,
         reporter_evidence=reporter_path,
@@ -767,6 +829,112 @@ def main() -> int:
             "environment": {"os": "windows", "arch": "x86_64"},
         }
         validators["clap_host"].validate(clap_host)
+
+        equivalence_root = root / "objective-equivalence"
+        equivalence_root.mkdir()
+        reference_matrix, reference_summary = objective_matrix_fixture(
+            equivalence_root,
+            "reference",
+            "1111111111111111111111111111111111111111",
+            2.0,
+        )
+        candidate_matrix, candidate_summary = objective_matrix_fixture(
+            equivalence_root,
+            "candidate",
+            "2222222222222222222222222222222222222222",
+            8.0,
+        )
+        def equivalence_command_for(
+            matrix_path: Path, summary_path: Path, output_path: Path
+        ) -> list[str]:
+            return [
+                sys.executable,
+                str(EQUIVALENCE),
+                "--reference-matrix",
+                str(reference_matrix),
+                "--reference-summary",
+                str(reference_summary),
+                "--candidate-matrix",
+                str(matrix_path),
+                "--candidate-summary",
+                str(summary_path),
+                "--output",
+                str(output_path),
+            ]
+
+        equivalence_path = equivalence_root / "equivalence.json"
+        equivalence_command = equivalence_command_for(
+            candidate_matrix, candidate_summary, equivalence_path
+        )
+        run(equivalence_command)
+        equivalence = json.loads(equivalence_path.read_text(encoding="utf-8"))
+        validators["equivalence"].validate(equivalence)
+        assert equivalence["equivalent"] is True
+        assert equivalence["case_count"] == 295
+        assert equivalence["reference"]["matrix"]["sha256"] != equivalence[
+            "candidate"
+        ]["matrix"]["sha256"]
+
+        duplicate_equivalence = run(equivalence_command, success=False)
+        assert "refusing to replace objective equivalence" in duplicate_equivalence.stderr
+
+        candidate_document = json.loads(candidate_matrix.read_text(encoding="utf-8"))
+        changed_document = json.loads(json.dumps(candidate_document))
+        changed_document["cases"][0]["dpdfnet2_48khz_hr"]["quality"]["score"] += 1
+        changed_matrix = equivalence_root / "changed-matrix.json"
+        changed_matrix.write_text(
+            json.dumps(changed_document, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        changed_summary_document = json.loads(
+            candidate_summary.read_text(encoding="utf-8")
+        )
+        changed_summary_document["matrix_result_sha256"] = hashlib.sha256(
+            changed_matrix.read_bytes()
+        ).hexdigest()
+        changed_summary = equivalence_root / "changed-summary.json"
+        changed_summary.write_text(
+            json.dumps(changed_summary_document, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        changed_result = run(
+            equivalence_command_for(
+                changed_matrix,
+                changed_summary,
+                equivalence_root / "changed-equivalence.json",
+            ),
+            success=False,
+        )
+        assert "differ outside allowed measurements" in changed_result.stderr
+
+        reserved_document = json.loads(json.dumps(candidate_document))
+        reserved_document["cases"][0]["dpdfnet2_48khz_hr"]["quality"][
+            "process_ms"
+        ] = 1.0
+        reserved_matrix = equivalence_root / "reserved-matrix.json"
+        reserved_matrix.write_text(
+            json.dumps(reserved_document, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        reserved_summary_document = json.loads(
+            candidate_summary.read_text(encoding="utf-8")
+        )
+        reserved_summary_document["matrix_result_sha256"] = hashlib.sha256(
+            reserved_matrix.read_bytes()
+        ).hexdigest()
+        reserved_summary = equivalence_root / "reserved-summary.json"
+        reserved_summary.write_text(
+            json.dumps(reserved_summary_document, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        reserved_result = run(
+            equivalence_command_for(
+                reserved_matrix,
+                reserved_summary,
+                equivalence_root / "reserved-equivalence.json",
+            ),
+            success=False,
+        )
+        assert "nondeterministic-field contract differs" in reserved_result.stderr
+
         matrix, audio = fixture(root)
         bundle, answer_path = prepare(root, matrix, audio)
         protocol_path = bundle / "protocol.json"
@@ -1803,6 +1971,109 @@ def main() -> int:
                 "passed": True,
             },
         ]
+        unnecessary_equivalence = SimpleNamespace(**vars(arguments))
+        unnecessary_equivalence.objective_equivalence = equivalence_path
+        unnecessary_equivalence.output = promotion_root / "promotion-unnecessary-equivalence.json"
+        try:
+            module.generate(unnecessary_equivalence)
+        except module.PromotionError as error:
+            assert "must be omitted for byte-identical matrices" in str(error)
+        else:
+            raise AssertionError("unnecessary objective equivalence unexpectedly passed")
+
+        mismatched_summary = json.loads(
+            arguments.evaluation_summary.read_text(encoding="utf-8")
+        )
+        mismatched_summary["matrix_result_sha256"] = "a" * 64
+        mismatched_summary["fixture_fingerprint"] = "f" * 64
+        mismatched_summary["models"]["dpdfnet8-48khz-hr"] = module.DPDFNET8_SHA256
+        mismatched_summary["quality"]["case_counts"]["total"] = 295
+        mismatched_summary_path = promotion_root / "evaluation-summary-mismatched.json"
+        mismatched_summary_path.write_text(
+            json.dumps(mismatched_summary) + "\n", encoding="utf-8"
+        )
+
+        missing_equivalence = SimpleNamespace(**vars(arguments))
+        missing_equivalence.evaluation_summary = mismatched_summary_path
+        missing_equivalence.output = promotion_root / "promotion-missing-equivalence.json"
+        try:
+            module.generate(missing_equivalence)
+        except module.PromotionError as error:
+            assert "without equivalence evidence" in str(error)
+        else:
+            raise AssertionError("mismatched objective matrix unexpectedly passed")
+
+        promotion_equivalence = {
+            "schema": "denoize-dpdfnet-objective-equivalence-v1",
+            "schema_version": 1,
+            "reference": {
+                "source_commit": "1" * 40,
+                "matrix": {
+                    "name": "reference-matrix.json",
+                    "size_bytes": 1,
+                    "sha256": passing["source_matrix_sha256"],
+                },
+                "summary": file_record("reference-summary.json"),
+            },
+            "candidate": {
+                "source_commit": arguments.source_commit,
+                "matrix": {
+                    "name": "candidate-matrix.json",
+                    "size_bytes": 1,
+                    "sha256": mismatched_summary["matrix_result_sha256"],
+                },
+                "summary": module.file_record(
+                    mismatched_summary_path, mismatched_summary_path.read_bytes()
+                ),
+            },
+            "fixture_fingerprint": mismatched_summary["fixture_fingerprint"],
+            "models": module.OBJECTIVE_MODELS,
+            "case_count": 295,
+            "canonicalization": {
+                "algorithm": "denoize-dpdfnet-objective-deterministic-v1",
+                "excluded_fields": module.OBJECTIVE_EQUIVALENCE_FIELDS,
+                "sha256": "c" * 64,
+            },
+            "equivalent": True,
+        }
+        validators["equivalence"].validate(promotion_equivalence)
+        promotion_equivalence_path = promotion_root / "objective-equivalence.json"
+        promotion_equivalence_path.write_text(
+            json.dumps(promotion_equivalence) + "\n", encoding="utf-8"
+        )
+
+        with_equivalence = SimpleNamespace(**vars(missing_equivalence))
+        with_equivalence.objective_equivalence = promotion_equivalence_path
+        with_equivalence.output = promotion_root / "promotion-with-equivalence.json"
+        assert module.generate(with_equivalence) is True
+        equivalent_promotion = json.loads(
+            with_equivalence.output.read_text(encoding="utf-8")
+        )
+        validators["promotion"].validate(equivalent_promotion)
+        assert equivalent_promotion["inputs"]["objective_equivalence"] == (
+            module.file_record(
+                promotion_equivalence_path, promotion_equivalence_path.read_bytes()
+            )
+        )
+
+        wrong_summary_equivalence = json.loads(json.dumps(promotion_equivalence))
+        wrong_summary_equivalence["candidate"]["summary"]["sha256"] = "d" * 64
+        wrong_summary_equivalence_path = (
+            promotion_root / "objective-equivalence-wrong-summary.json"
+        )
+        wrong_summary_equivalence_path.write_text(
+            json.dumps(wrong_summary_equivalence) + "\n", encoding="utf-8"
+        )
+        wrong_summary = SimpleNamespace(**vars(missing_equivalence))
+        wrong_summary.objective_equivalence = wrong_summary_equivalence_path
+        wrong_summary.output = promotion_root / "promotion-wrong-summary.json"
+        try:
+            module.generate(wrong_summary)
+        except module.PromotionError as error:
+            assert "does not bind the candidate summary" in str(error)
+        else:
+            raise AssertionError("wrong candidate-summary binding unexpectedly passed")
+
         legacy_portable = json.loads(
             arguments.platform_evidence[0].read_text(encoding="utf-8")
         )
