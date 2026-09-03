@@ -104,13 +104,13 @@ its own specification warns that synchronization may violate hard real-time
 rules and `request_exec` waits for completion.
 
 On Windows, the named worker joins the `Pro Audio` Multimedia Class Scheduler
-Service task. On macOS it combines interactive pthread QoS with a 10 ms Mach
-time-constraint policy and an 8 ms nominal computation allowance. These
-changes happen after model preparation and warm-up and before activation
-reports the worker ready. If registration fails, neural inference stays
-unavailable and the fixed-latency fallback remains active. The previous
-scheduling policies are restored when the worker exits; other platforms retain
-their native scheduler behavior.
+Service task at its critical relative priority. On macOS it combines
+interactive pthread QoS with a 10 ms Mach time-constraint policy and an 8 ms
+nominal computation allowance. These changes happen after model preparation
+and warm-up and before activation reports the worker ready. If any scheduling
+step fails, neural inference stays unavailable and the fixed-latency fallback
+remains active. The previous scheduling policies are restored when the worker
+exits; other platforms retain their native scheduler behavior.
 
 Automated REAPER evidence separates device priming from sustained processing.
 REAPER's Dummy Audio device can request about one output-buffer horizon faster
