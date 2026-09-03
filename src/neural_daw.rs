@@ -187,6 +187,22 @@ impl NeuralDawWorkerPriorityGuard {
         }
         process()
     }
+
+    /// Starts a new measured-cycle window after an unmeasured scheduler
+    /// pre-roll.
+    ///
+    /// This only resets diagnostic counters. It does not alter the active
+    /// scheduling class or Audio Work Interval membership.
+    #[doc(hidden)]
+    pub fn begin_inference_cycle_measurement(&mut self) {
+        #[cfg(target_os = "macos")]
+        if let Some(interval) = self.audio_work_interval.as_mut() {
+            interval.started_cycles = 0;
+            interval.finished_cycles = 0;
+            interval.start_failures = 0;
+            interval.finish_failures = 0;
+        }
+    }
 }
 
 impl Drop for NeuralDawWorkerPriorityGuard {

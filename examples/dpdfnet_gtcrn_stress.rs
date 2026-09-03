@@ -440,14 +440,18 @@ fn run_dpdfnet_daw_threads(
             &model,
         )?;
         let input = daw_input(thread_index);
+        // The released worker receives an unmeasured pre-roll before host
+        // evidence begins. Exercise the platform scheduler during this same
+        // window so its workgroup and performance controller are established
+        // before the direct timing samples begin.
+        let mut priority_guard = denoize::neural_daw::NeuralDawWorkerPriorityGuard::acquire()?;
         for _ in 0..WARMUP_CALLS {
-            stream.process_block(&input)?;
+            priority_guard.run_inference_cycle(|| stream.process_block(&input))?;
         }
         stream.reset()?;
-        // Exercise direct production calls under the same platform scheduling
-        // class as the released inference worker. The guard is thread-bound
-        // and remains live for the complete measurement.
-        let mut priority_guard = denoize::neural_daw::NeuralDawWorkerPriorityGuard::acquire()?;
+        priority_guard.begin_inference_cycle_measurement();
+        // Exercise direct production calls under the same thread-bound
+        // platform scheduling class for the complete measurement.
         barrier.wait();
         let wall_started = Instant::now();
         let mut durations_ms = Vec::with_capacity(calls);
