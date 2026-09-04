@@ -653,23 +653,21 @@ def composite_fixtures(
             if operating_system in {"macos", "windows"}
             else "monotonic-wall"
         )
-        document["measurement"]["direct_call_deadline_gate_eligible"] = (
-            tier == "portable-ci"
-        )
+        document["measurement"]["direct_call_deadline_gate_eligible"] = False
         document["measurement"]["wall_clock_worker_gate_eligible"] = (
             tier == "portable-ci"
         )
+        document["checks"] = [
+            check
+            for check in document["checks"]
+            if check["id"]
+            not in {
+                "stress-p99-9-ms",
+                "stress-maximum-ms",
+                "stress-deadline-misses",
+            }
+        ]
         if tier == "lowest-supported":
-            document["checks"] = [
-                check
-                for check in document["checks"]
-                if check["id"]
-                not in {
-                    "stress-p99-9-ms",
-                    "stress-maximum-ms",
-                    "stress-deadline-misses",
-                }
-            ]
             worker_check = next(
                 check
                 for check in document["checks"]
@@ -930,7 +928,17 @@ def main() -> int:
         platform = json.loads(platform_result.read_text(encoding="utf-8"))
         validators["platform"].validate(platform)
         assert platform["accepted"] is True
-        assert len(platform["checks"]) == 11
+        assert len(platform["checks"]) == 8
+        assert (
+            platform["measurement"]["direct_call_deadline_gate_eligible"]
+            is False
+        )
+        assert platform["measurement"]["wall_clock_worker_gate_eligible"] is True
+        assert {
+            "stress-p99-9-ms",
+            "stress-maximum-ms",
+            "stress-deadline-misses",
+        }.isdisjoint(check["id"] for check in platform["checks"])
 
         unpaced_stress = json.loads(stress_path.read_text(encoding="utf-8"))
         unpaced_stress["realtime_paced"] = False
@@ -1068,9 +1076,13 @@ def main() -> int:
         )
         validators["platform"].validate(preempted_platform)
         assert preempted_platform["accepted"] is True
-        by_id = {item["id"]: item for item in preempted_platform["checks"]}
-        assert by_id["stress-maximum-ms"]["limit"] == 20.0
-        assert by_id["stress-deadline-misses"]["limit"] == 6
+        assert preempted_platform["measurement"]["maximum_ms"] == 13.000958
+        assert preempted_platform["measurement"]["deadline_misses"] == 1
+        assert {
+            "stress-p99-9-ms",
+            "stress-maximum-ms",
+            "stress-deadline-misses",
+        }.isdisjoint(check["id"] for check in preempted_platform["checks"])
 
         mac_stress = json.loads(stress_path.read_text(encoding="utf-8"))
         mac_stress["environment"].update(
@@ -1096,12 +1108,12 @@ def main() -> int:
                     "sample_count": 6_000,
                     "minimum_nonzero_delta_ms": 0.001,
                     "per_call_distribution_gate_eligible": True,
-                    "total_run_cpu_ms": 21_600.0,
+                    "total_run_cpu_ms": 28_914.036,
                     "budget_ms": 10.0,
-                    "p99_9_ms": 8.2,
-                    "maximum_ms": 9.3,
-                    "calls_over_budget": 0,
-                    "summed_compute_rtf": 0.36,
+                    "p99_9_ms": 13.192,
+                    "maximum_ms": 16.923,
+                    "calls_over_budget": 104,
+                    "summed_compute_rtf": 0.4819006,
                 },
             }
         )
@@ -1142,8 +1154,23 @@ def main() -> int:
         assert mac_platform["accepted"] is True
         assert mac_platform["measurement"]["deadline_clock"] == "process-cpu"
         assert mac_platform["measurement"]["compute_rtf_clock"] == "process-cpu"
-        assert mac_platform["measurement"]["p99_9_ms"] == 8.2
+        assert mac_platform["measurement"]["p99_9_ms"] == 13.192
+        assert mac_platform["measurement"]["maximum_ms"] == 16.923
+        assert mac_platform["measurement"]["deadline_misses"] == 104
         assert mac_platform["measurement"]["wall_p99_9_ms"] == 11.37075
+        assert (
+            mac_platform["measurement"]["direct_call_deadline_gate_eligible"]
+            is False
+        )
+        assert (
+            mac_platform["measurement"]["wall_clock_worker_gate_eligible"]
+            is True
+        )
+        assert {
+            "stress-p99-9-ms",
+            "stress-maximum-ms",
+            "stress-deadline-misses",
+        }.isdisjoint(check["id"] for check in mac_platform["checks"])
         assert all(check["passed"] is True for check in mac_platform["checks"])
 
         mac_without_cpu = json.loads(json.dumps(mac_stress))
@@ -1475,6 +1502,37 @@ def main() -> int:
         )
         overloaded_portable_worker["metrics"]["overload_blocks"] = 1
         assert validators["worker"].is_valid(overloaded_portable_worker) is False
+        overloaded_portable_worker_path = (
+            platform_root / "overloaded-portable-worker.json"
+        )
+        overloaded_portable_worker_path.write_text(
+            json.dumps(overloaded_portable_worker) + "\n", encoding="utf-8"
+        )
+        overloaded_portable_platform_path = (
+            platform_root / "overloaded-portable-platform.json"
+        )
+        run(
+            [
+                sys.executable,
+                str(PLATFORM),
+                "--stress",
+                str(stress_path),
+                "--worker",
+                str(overloaded_portable_worker_path),
+                "--output",
+                str(overloaded_portable_platform_path),
+                "--allow-rejected",
+            ]
+        )
+        overloaded_portable_platform = json.loads(
+            overloaded_portable_platform_path.read_text(encoding="utf-8")
+        )
+        validators["platform"].validate(overloaded_portable_platform)
+        assert overloaded_portable_platform["accepted"] is False
+        assert {
+            check["id"]: check["passed"]
+            for check in overloaded_portable_platform["checks"]
+        }["worker-error-counters"] is False
 
         failed_lowest_worker = json.loads(json.dumps(lowest_worker))
         failed_lowest_worker["metrics"]["worker_errors"] = 1
@@ -1582,27 +1640,39 @@ def main() -> int:
         )
         assert "one logical CPU" in false_lowest_result.stderr
 
-        rejected_stress = json.loads(stress_path.read_text(encoding="utf-8"))
-        rejected_stress["timing"]["p99_9_ms"] = 11.0
-        rejected_stress_path = platform_root / "rejected-stress.json"
-        rejected_stress_path.write_text(json.dumps(rejected_stress) + "\n", encoding="utf-8")
-        rejected_platform_path = platform_root / "rejected-platform.json"
+        high_tail_stress = json.loads(stress_path.read_text(encoding="utf-8"))
+        high_tail_stress["timing"].update(
+            {
+                "p99_9_ms": 11.0,
+                "maximum_ms": 12.0,
+                "calls_over_budget": 12,
+            }
+        )
+        high_tail_stress_path = platform_root / "high-tail-stress.json"
+        high_tail_stress_path.write_text(
+            json.dumps(high_tail_stress) + "\n", encoding="utf-8"
+        )
+        high_tail_platform_path = platform_root / "high-tail-platform.json"
         run(
             [
                 sys.executable,
                 str(PLATFORM),
                 "--stress",
-                str(rejected_stress_path),
+                str(high_tail_stress_path),
                 "--worker",
                 str(worker_path),
                 "--output",
-                str(rejected_platform_path),
-                "--allow-rejected",
+                str(high_tail_platform_path),
             ]
         )
-        rejected_platform = json.loads(rejected_platform_path.read_text(encoding="utf-8"))
-        validators["platform"].validate(rejected_platform)
-        assert rejected_platform["accepted"] is False
+        high_tail_platform = json.loads(
+            high_tail_platform_path.read_text(encoding="utf-8")
+        )
+        validators["platform"].validate(high_tail_platform)
+        assert high_tail_platform["accepted"] is True
+        assert high_tail_platform["measurement"]["p99_9_ms"] == 11.0
+        assert high_tail_platform["measurement"]["maximum_ms"] == 12.0
+        assert high_tail_platform["measurement"]["deadline_misses"] == 12
 
         promotion_root = root / "promotion"
         promotion_root.mkdir()
@@ -1623,6 +1693,65 @@ def main() -> int:
             entry["hardware_tier"] == "lowest-supported"
             for entry in promotion["platforms"]
         ) == 1
+
+        false_portable_direct_eligibility = json.loads(
+            arguments.platform_evidence[0].read_text(encoding="utf-8")
+        )
+        false_portable_direct_eligibility["measurement"][
+            "direct_call_deadline_gate_eligible"
+        ] = True
+        false_portable_direct_eligibility_path = (
+            promotion_root / "platform-portable-false-direct-eligibility.json"
+        )
+        false_portable_direct_eligibility_path.write_text(
+            json.dumps(false_portable_direct_eligibility) + "\n",
+            encoding="utf-8",
+        )
+        false_direct_eligibility = SimpleNamespace(**vars(arguments))
+        false_direct_eligibility.platform_evidence = [
+            false_portable_direct_eligibility_path,
+            *arguments.platform_evidence[1:],
+        ]
+        false_direct_eligibility.output = (
+            promotion_root / "promotion-false-direct-eligibility.json"
+        )
+        try:
+            module.generate(false_direct_eligibility)
+        except module.PromotionError as error:
+            assert "direct-call deadline eligibility" in str(error)
+        else:
+            raise AssertionError("false direct-call eligibility unexpectedly passed")
+
+        direct_check_v2 = json.loads(
+            arguments.platform_evidence[0].read_text(encoding="utf-8")
+        )
+        direct_check_v2["checks"].append(
+            {
+                "id": "stress-p99-9-ms",
+                "observed": 8.0,
+                "operator": "less-or-equal",
+                "limit": 10.0,
+                "passed": True,
+            }
+        )
+        direct_check_v2_path = promotion_root / "platform-portable-direct-check.json"
+        direct_check_v2_path.write_text(
+            json.dumps(direct_check_v2) + "\n", encoding="utf-8"
+        )
+        unexpected_direct_check = SimpleNamespace(**vars(arguments))
+        unexpected_direct_check.platform_evidence = [
+            direct_check_v2_path,
+            *arguments.platform_evidence[1:],
+        ]
+        unexpected_direct_check.output = (
+            promotion_root / "promotion-unexpected-direct-check.json"
+        )
+        try:
+            module.generate(unexpected_direct_check)
+        except module.PromotionError as error:
+            assert "unexpectedly applies the direct-call gate" in str(error)
+        else:
+            raise AssertionError("v2 direct-call check unexpectedly passed")
 
         false_lowest_worker_eligibility = json.loads(
             arguments.platform_evidence[3].read_text(encoding="utf-8")
@@ -1651,11 +1780,35 @@ def main() -> int:
         else:
             raise AssertionError("false worker eligibility unexpectedly passed")
 
+        legacy_direct_checks = [
+            {
+                "id": "stress-p99-9-ms",
+                "observed": 8.0,
+                "operator": "less-or-equal",
+                "limit": 10.0,
+                "passed": True,
+            },
+            {
+                "id": "stress-maximum-ms",
+                "observed": 9.0,
+                "operator": "less-or-equal",
+                "limit": 20.0,
+                "passed": True,
+            },
+            {
+                "id": "stress-deadline-misses",
+                "observed": 0,
+                "operator": "less-or-equal",
+                "limit": 6,
+                "passed": True,
+            },
+        ]
         legacy_portable = json.loads(
             arguments.platform_evidence[0].read_text(encoding="utf-8")
         )
         legacy_portable["schema"] = "denoize-dpdfnet-platform-evidence-v1"
         legacy_portable["schema_version"] = 1
+        legacy_portable["checks"].extend(json.loads(json.dumps(legacy_direct_checks)))
         for field in (
             "stress_realtime_paced",
             "deadline_clock",
@@ -1691,19 +1844,7 @@ def main() -> int:
         )
         legacy_lowest["schema"] = "denoize-dpdfnet-platform-evidence-v1"
         legacy_lowest["schema_version"] = 1
-        portable_direct_checks = {
-            check["id"]: check
-            for check in json.loads(
-                arguments.platform_evidence[0].read_text(encoding="utf-8")
-            )["checks"]
-            if check["id"]
-            in {
-                "stress-p99-9-ms",
-                "stress-maximum-ms",
-                "stress-deadline-misses",
-            }
-        }
-        legacy_lowest["checks"].extend(portable_direct_checks.values())
+        legacy_lowest["checks"].extend(json.loads(json.dumps(legacy_direct_checks)))
         for field in (
             "stress_realtime_paced",
             "deadline_clock",

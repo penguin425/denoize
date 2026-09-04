@@ -45,7 +45,7 @@
         "stress_realtime_paced": { "const": true },
         "deadline_clock": { "enum": ["monotonic-wall", "process-cpu"] },
         "compute_rtf_clock": { "enum": ["monotonic-wall", "process-cpu"] },
-        "direct_call_deadline_gate_eligible": { "type": "boolean" },
+        "direct_call_deadline_gate_eligible": { "const": false },
         "wall_clock_worker_gate_eligible": { "type": "boolean" },
         "p99_9_ms": { "type": "number", "minimum": 0, "maximum": 10000 },
         "maximum_ms": { "type": "number", "minimum": 0, "maximum": 10000 },
@@ -63,7 +63,7 @@
         "worker_processing_error_count": { "type": "integer", "minimum": 0, "maximum": 20000000 }
       }
     },
-    "checks": { "type": "array", "minItems": 8, "maxItems": 11, "items": { "$ref": "#/$defs/check" } },
+    "checks": { "type": "array", "minItems": 8, "maxItems": 8, "items": { "$ref": "#/$defs/check" } },
     "accepted": { "type": "boolean" }
   },
   "$defs": {

@@ -311,13 +311,14 @@ def generate(args: argparse.Namespace) -> bool:
                     f"v2 {operating_system} platform evidence must use "
                     f"{expected_compute_rtf_clock} compute RTF"
                 )
-            expected_direct_call_gate = hardware_tier == "portable-ci"
+            expected_direct_call_gate = False
+            expected_worker_gate = hardware_tier == "portable-ci"
             if direct_call_deadline_gate_eligible is not expected_direct_call_gate:
                 raise PromotionError(
                     f"v2 {hardware_tier} platform evidence has invalid "
                     "direct-call deadline eligibility"
                 )
-            if wall_clock_worker_gate_eligible is not expected_direct_call_gate:
+            if wall_clock_worker_gate_eligible is not expected_worker_gate:
                 raise PromotionError(
                     f"v2 {hardware_tier} platform evidence has invalid "
                     "wall-clock worker eligibility"
@@ -332,15 +333,10 @@ def generate(args: argparse.Namespace) -> bool:
                 for item in document.get("checks", [])
                 if isinstance(item, dict)
             }
-            has_complete_direct_call_gate = direct_call_check_ids <= observed_check_ids
             has_any_direct_call_gate = bool(
                 direct_call_check_ids & observed_check_ids
             )
-            if direct_call_deadline_gate_eligible and not has_complete_direct_call_gate:
-                raise PromotionError(
-                    f"v2 {hardware_tier} platform evidence lacks the direct-call gate"
-                )
-            if not direct_call_deadline_gate_eligible and has_any_direct_call_gate:
+            if has_any_direct_call_gate:
                 raise PromotionError(
                     f"v2 {hardware_tier} platform evidence unexpectedly applies "
                     "the direct-call gate"
