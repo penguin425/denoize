@@ -297,15 +297,20 @@ Hosted runners are not real-time schedulers. Every promotion direct-call probe
 therefore presents one 480-frame block every 10 ms instead of saturating its
 runner continuously. Sleep time is excluded from each call measurement, and an
 overrun is carried into the next scheduled call rather than resetting the
-clock. Linux applies the direct-call thresholds to monotonic wall time. The
-shared macOS and Windows virtual runners apply the same thresholds to
-process-wide CPU time: `CLOCK_PROCESS_CPUTIME_ID` on macOS and summed kernel
-plus user time from `GetProcessTimes` on Windows. Both clocks account for all
-process threads, so synchronous helper-thread work remains included while time
-when the virtual machine is not scheduled is excluded. Their monotonic
-wall-time tails remain in the closed evidence as diagnostics. Every direct
-compute gate requires p99.9 at or below 10 ms, at most 0.1% of calls above 10
-ms, and no single call above 20 ms.
+clock. Linux applies the direct-call thresholds to monotonic wall time. macOS
+applies them to process-wide `CLOCK_PROCESS_CPUTIME_ID`, with wall-time tails
+retained as diagnostics. Windows applies p99.9, maximum, and deadline-miss
+thresholds to monotonic wall time. Its `GetProcessTimes` kernel-plus-user total
+still supplies the aggregate compute RTF, but not the per-call distribution:
+although the API expresses values in 100 ns units, the hosted runner produced
+15.625 ms per-call accounting steps. Treating those quantized deltas as a tail
+distribution would turn normal calls into alternating zero/15.625 ms samples.
+The raw stress evidence records that distribution and explicitly marks it
+ineligible for the per-call gate. `QueryThreadCycleTime` is not used as a
+substitute because Microsoft explicitly warns not to convert its cycle count to
+elapsed time. Every selected direct-call deadline clock requires p99.9 at or
+below 10 ms, at most 0.1% of calls above 10 ms, and no single call above 20 ms;
+every aggregate compute clock requires summed RTF at or below 1.0.
 
 The production CLAP worker is independently paced for the full requested
 measurement (6,000 blocks for the 60-second gate) and remains stricter:
@@ -332,3 +337,4 @@ production-worker deadline failures.
 - [DeepFilterNet fixture licensing](https://github.com/Rikorose/DeepFilterNet/blob/d375b2d8309e0935d165700c91da9de862a99c31/assets/README.md)
 - [Apple `clock_gettime` contract](https://github.com/apple-oss-distributions/Libc/blob/main/gen/clock_gettime.3)
 - [Microsoft `GetProcessTimes` contract](https://learn.microsoft.com/windows/win32/api/processthreadsapi/nf-processthreadsapi-getprocesstimes)
+- [Microsoft `QueryThreadCycleTime` contract](https://learn.microsoft.com/windows/win32/api/realtimeapiset/nf-realtimeapiset-querythreadcycletime)

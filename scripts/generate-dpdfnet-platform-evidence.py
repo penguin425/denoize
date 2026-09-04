@@ -147,6 +147,11 @@ def generate(args: argparse.Namespace) -> bool:
         raise EvidenceError("stress run lacks timing, memory, or robustness evidence")
     seconds = integer(stress.get("requested_seconds_per_stream"), "requested_seconds_per_stream")
     calls = integer(stress.get("calls"), "calls")
+    measured_audio_seconds = number(
+        stress.get("measured_audio_seconds"), "measured_audio_seconds"
+    )
+    if measured_audio_seconds <= 0.0:
+        raise EvidenceError("stress run measured no audio")
     wall_p99_9_ms = number(timing.get("p99_9_ms"), "p99_9_ms")
     wall_maximum_ms = number(timing.get("maximum_ms"), "maximum_ms")
     wall_summed_rtf = number(timing.get("summed_compute_rtf"), "summed_compute_rtf")
@@ -158,6 +163,7 @@ def generate(args: argparse.Namespace) -> bool:
         "macos": ("CLOCK_PROCESS_CPUTIME_ID", "macOS"),
         "windows": ("GetProcessTimes", "Windows"),
     }.get(operating_system)
+    process_cpu_summed_rtf = None
     if process_cpu_config is not None:
         process_cpu_clock, process_cpu_label = process_cpu_config
         process_cpu = timing.get("process_cpu")
@@ -171,19 +177,61 @@ def generate(args: argparse.Namespace) -> bool:
             raise EvidenceError("process CPU timing sample count does not match stress calls")
         if process_cpu.get("budget_ms") != 10.0:
             raise EvidenceError("process CPU timing must use a 10 ms DAW deadline")
-        deadline_clock = "process-cpu"
-        p99_9_ms = number(process_cpu.get("p99_9_ms"), "process CPU p99_9_ms")
-        maximum_ms = number(process_cpu.get("maximum_ms"), "process CPU maximum_ms")
-        summed_rtf = number(
+        expected_distribution_eligibility = operating_system != "windows"
+        if (
+            process_cpu.get("per_call_distribution_gate_eligible")
+            is not expected_distribution_eligibility
+        ):
+            raise EvidenceError(
+                f"{process_cpu_label} process CPU distribution eligibility is invalid"
+            )
+        minimum_nonzero_delta_ms = number(
+            process_cpu.get("minimum_nonzero_delta_ms"),
+            "process CPU minimum_nonzero_delta_ms",
+        )
+        if minimum_nonzero_delta_ms <= 0.0:
+            raise EvidenceError("process CPU timing has no positive clock delta")
+        total_run_cpu_ms = number(
+            process_cpu.get("total_run_cpu_ms"), "process CPU total_run_cpu_ms"
+        )
+        if total_run_cpu_ms <= 0.0:
+            raise EvidenceError("process CPU timing has no positive run total")
+        process_cpu_summed_rtf = number(
             process_cpu.get("summed_compute_rtf"),
             "process CPU summed_compute_rtf",
         )
+        expected_process_cpu_rtf = total_run_cpu_ms / 1_000.0 / measured_audio_seconds
+        if not math.isclose(
+            process_cpu_summed_rtf,
+            expected_process_cpu_rtf,
+            rel_tol=1.0e-12,
+            abs_tol=1.0e-12,
+        ):
+            raise EvidenceError("process CPU run total and summed RTF are inconsistent")
+    if operating_system == "macos":
+        deadline_clock = "process-cpu"
+        compute_rtf_clock = "process-cpu"
+        p99_9_ms = number(process_cpu.get("p99_9_ms"), "process CPU p99_9_ms")
+        maximum_ms = number(process_cpu.get("maximum_ms"), "process CPU maximum_ms")
+        summed_rtf = process_cpu_summed_rtf
         calls_over_budget = integer(
             process_cpu.get("calls_over_budget"),
             "process CPU calls_over_budget",
         )
+    elif operating_system == "windows":
+        # GetProcessTimes is accurate when accumulated across the complete run,
+        # but its per-call deltas are quantized on hosted Windows runners. Keep
+        # wall time for the direct-call distribution and use process CPU time
+        # only for the aggregate compute-capacity check.
+        deadline_clock = "monotonic-wall"
+        compute_rtf_clock = "process-cpu"
+        p99_9_ms = wall_p99_9_ms
+        maximum_ms = wall_maximum_ms
+        summed_rtf = process_cpu_summed_rtf
+        calls_over_budget = wall_calls_over_budget
     else:
         deadline_clock = "monotonic-wall"
+        compute_rtf_clock = "monotonic-wall"
         p99_9_ms = wall_p99_9_ms
         maximum_ms = wall_maximum_ms
         summed_rtf = wall_summed_rtf
@@ -262,10 +310,10 @@ def generate(args: argparse.Namespace) -> bool:
         check("minimum-stress-seconds", seconds, "greater-or-equal", 60),
         check("minimum-stress-calls", calls, "greater-or-equal", 6000),
         check("stress-p99-9-ms", p99_9_ms, "less-or-equal", 10.0),
-        # The macOS and Windows portable runners are shared virtual machines,
-        # so their direct compute gates use whole-process CPU time and retain
-        # monotonic wall time as a diagnostic. The separately paced production
-        # worker remains the strict wall-clock zero-overload/zero-late gate.
+        # macOS uses whole-process CPU time for its per-call distribution.
+        # Windows GetProcessTimes deltas are too coarse for a distribution, so
+        # Windows uses wall tails plus aggregate process CPU RTF. The separately
+        # paced production worker remains the strict zero-overload/zero-late gate.
         check("stress-maximum-ms", maximum_ms, "less-or-equal", MAX_SINGLE_CALL_MS),
         check(
             "stress-deadline-misses",
@@ -311,6 +359,7 @@ def generate(args: argparse.Namespace) -> bool:
             "stress_calls": calls,
             "stress_realtime_paced": realtime_paced,
             "deadline_clock": deadline_clock,
+            "compute_rtf_clock": compute_rtf_clock,
             "p99_9_ms": p99_9_ms,
             "maximum_ms": maximum_ms,
             "deadline_misses": calls_over_budget,

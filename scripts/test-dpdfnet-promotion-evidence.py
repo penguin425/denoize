@@ -140,6 +140,7 @@ def platform_fixture(root: Path) -> tuple[Path, Path]:
         "parallel_streams": 1,
         "requested_seconds_per_stream": 60,
         "realtime_paced": True,
+        "measured_audio_seconds": 60.0,
         "calls": 6_000,
         "timing": {
             "p99_9_ms": 8.0,
@@ -645,6 +646,9 @@ def composite_fixtures(
         )
         document["measurement"]["stress_realtime_paced"] = True
         document["measurement"]["deadline_clock"] = (
+            "process-cpu" if operating_system == "macos" else "monotonic-wall"
+        )
+        document["measurement"]["compute_rtf_clock"] = (
             "process-cpu"
             if operating_system in {"macos", "windows"}
             else "monotonic-wall"
@@ -1067,6 +1071,9 @@ def main() -> int:
                 "process_cpu": {
                     "clock": "CLOCK_PROCESS_CPUTIME_ID",
                     "sample_count": 6_000,
+                    "minimum_nonzero_delta_ms": 0.001,
+                    "per_call_distribution_gate_eligible": True,
+                    "total_run_cpu_ms": 21_600.0,
                     "budget_ms": 10.0,
                     "p99_9_ms": 8.2,
                     "maximum_ms": 9.3,
@@ -1111,6 +1118,7 @@ def main() -> int:
         validators["platform"].validate(mac_platform)
         assert mac_platform["accepted"] is True
         assert mac_platform["measurement"]["deadline_clock"] == "process-cpu"
+        assert mac_platform["measurement"]["compute_rtf_clock"] == "process-cpu"
         assert mac_platform["measurement"]["p99_9_ms"] == 8.2
         assert mac_platform["measurement"]["wall_p99_9_ms"] == 11.37075
         assert all(check["passed"] is True for check in mac_platform["checks"])
@@ -1150,19 +1158,22 @@ def main() -> int:
         )
         windows_stress["timing"].update(
             {
-                "p99_9_ms": 10.3638,
-                "maximum_ms": 14.518,
-                "calls_over_budget": 12,
-                "calls_over_budget_fraction": 12 / 6000,
-                "summed_compute_rtf": 0.59573,
+                "p99_9_ms": 9.1723,
+                "maximum_ms": 12.0235,
+                "calls_over_budget": 1,
+                "calls_over_budget_fraction": 1 / 6000,
+                "summed_compute_rtf": 0.55760228,
                 "process_cpu": {
                     "clock": "GetProcessTimes",
                     "sample_count": 6_000,
+                    "minimum_nonzero_delta_ms": 15.625,
+                    "per_call_distribution_gate_eligible": False,
+                    "total_run_cpu_ms": 30_625.0,
                     "budget_ms": 10.0,
-                    "p99_9_ms": 8.7,
-                    "maximum_ms": 9.8,
-                    "calls_over_budget": 0,
-                    "summed_compute_rtf": 0.56,
+                    "p99_9_ms": 15.625,
+                    "maximum_ms": 15.625,
+                    "calls_over_budget": 1_960,
+                    "summed_compute_rtf": 0.5104166666666666,
                 },
             }
         )
@@ -1203,9 +1214,11 @@ def main() -> int:
         )
         validators["platform"].validate(windows_platform)
         assert windows_platform["accepted"] is True
-        assert windows_platform["measurement"]["deadline_clock"] == "process-cpu"
-        assert windows_platform["measurement"]["p99_9_ms"] == 8.7
-        assert windows_platform["measurement"]["wall_p99_9_ms"] == 10.3638
+        assert windows_platform["measurement"]["deadline_clock"] == "monotonic-wall"
+        assert windows_platform["measurement"]["compute_rtf_clock"] == "process-cpu"
+        assert windows_platform["measurement"]["p99_9_ms"] == 9.1723
+        assert windows_platform["measurement"]["wall_p99_9_ms"] == 9.1723
+        assert windows_platform["measurement"]["summed_compute_rtf"] == 0.5104166666666666
         assert all(check["passed"] is True for check in windows_platform["checks"])
 
         windows_without_cpu = json.loads(json.dumps(windows_stress))
@@ -1257,6 +1270,66 @@ def main() -> int:
             "Windows stress run used an unsupported process CPU clock"
             in wrong_windows_clock.stderr
         )
+
+        windows_wrong_distribution = json.loads(json.dumps(windows_stress))
+        windows_wrong_distribution["timing"]["process_cpu"][
+            "per_call_distribution_gate_eligible"
+        ] = True
+        windows_wrong_distribution_path = (
+            platform_root / "windows-wrong-distribution-stress.json"
+        )
+        windows_wrong_distribution_path.write_text(
+            json.dumps(windows_wrong_distribution) + "\n", encoding="utf-8"
+        )
+        wrong_windows_distribution = run(
+            [
+                sys.executable,
+                str(PLATFORM),
+                "--stress",
+                str(windows_wrong_distribution_path),
+                "--worker",
+                str(windows_worker_path),
+                "--output",
+                str(platform_root / "windows-wrong-distribution-platform.json"),
+            ],
+            success=False,
+        )
+        assert (
+            "Windows process CPU distribution eligibility is invalid"
+            in wrong_windows_distribution.stderr
+        )
+
+        windows_slow_compute = json.loads(json.dumps(windows_stress))
+        windows_slow_compute["timing"]["process_cpu"]["summed_compute_rtf"] = 1.01
+        windows_slow_compute["timing"]["process_cpu"]["total_run_cpu_ms"] = 60_600.0
+        windows_slow_compute_path = platform_root / "windows-slow-compute-stress.json"
+        windows_slow_compute_path.write_text(
+            json.dumps(windows_slow_compute) + "\n", encoding="utf-8"
+        )
+        windows_slow_compute_platform_path = (
+            platform_root / "windows-slow-compute-platform.json"
+        )
+        run(
+            [
+                sys.executable,
+                str(PLATFORM),
+                "--stress",
+                str(windows_slow_compute_path),
+                "--worker",
+                str(windows_worker_path),
+                "--output",
+                str(windows_slow_compute_platform_path),
+            ],
+            success=False,
+        )
+        windows_slow_compute_platform = json.loads(
+            windows_slow_compute_platform_path.read_text(encoding="utf-8")
+        )
+        assert windows_slow_compute_platform["accepted"] is False
+        assert {
+            check["id"]: check["passed"]
+            for check in windows_slow_compute_platform["checks"]
+        }["stress-summed-rtf"] is False
 
         lowest_stress = json.loads(stress_path.read_text(encoding="utf-8"))
         lowest_stress["environment"].update(
@@ -1397,6 +1470,7 @@ def main() -> int:
         for field in (
             "stress_realtime_paced",
             "deadline_clock",
+            "compute_rtf_clock",
             "wall_p99_9_ms",
             "wall_maximum_ms",
             "wall_deadline_misses",
@@ -1427,6 +1501,7 @@ def main() -> int:
         for field in (
             "stress_realtime_paced",
             "deadline_clock",
+            "compute_rtf_clock",
             "wall_p99_9_ms",
             "wall_maximum_ms",
             "wall_deadline_misses",

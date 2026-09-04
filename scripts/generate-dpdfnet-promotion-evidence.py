@@ -286,18 +286,29 @@ def generate(args: argparse.Namespace) -> bool:
             )
         if platform_schema == "denoize-dpdfnet-platform-evidence-v2":
             deadline_clock = nested(document, "measurement.deadline_clock")
-            expected_clock = (
+            compute_rtf_clock = nested(document, "measurement.compute_rtf_clock")
+            expected_deadline_clock = (
+                "process-cpu" if operating_system == "macos" else "monotonic-wall"
+            )
+            expected_compute_rtf_clock = (
                 "process-cpu"
                 if operating_system in {"macos", "windows"}
                 else "monotonic-wall"
             )
-            if deadline_clock != expected_clock:
+            if deadline_clock != expected_deadline_clock:
                 raise PromotionError(
-                    f"v2 {operating_system} platform evidence must use {expected_clock}"
+                    f"v2 {operating_system} platform evidence must use "
+                    f"{expected_deadline_clock} deadlines"
+                )
+            if compute_rtf_clock != expected_compute_rtf_clock:
+                raise PromotionError(
+                    f"v2 {operating_system} platform evidence must use "
+                    f"{expected_compute_rtf_clock} compute RTF"
                 )
             wall_p99_9_ms = nested(document, "measurement.wall_p99_9_ms")
         else:
             deadline_clock = "monotonic-wall"
+            compute_rtf_clock = "monotonic-wall"
             wall_p99_9_ms = nested(document, "measurement.p99_9_ms")
         if (
             hardware_tier == "lowest-supported"
@@ -323,6 +334,7 @@ def generate(args: argparse.Namespace) -> bool:
             "hardware_tier": hardware_tier,
             "runner_label": nested(document, "platform.runner_label"),
             "deadline_clock": deadline_clock,
+            "compute_rtf_clock": compute_rtf_clock,
             "p99_9_ms": nested(document, "measurement.p99_9_ms"),
             "wall_p99_9_ms": wall_p99_9_ms,
             "peak_rss_bytes": nested(document, "measurement.peak_rss_bytes"),

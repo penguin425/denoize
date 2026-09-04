@@ -63,6 +63,7 @@ struct Args {
 struct ThreadResult {
     durations_ms: Vec<f64>,
     process_cpu_durations_ms: Option<Vec<f64>>,
+    process_cpu_total_ms: Option<f64>,
     audio_seconds: f64,
     wall_seconds: f64,
     checksum: f64,
@@ -222,20 +223,37 @@ fn finish(
     if !process_cpu_durations.is_empty() && process_cpu_durations.len() != durations.len() {
         return Err("process CPU timing sample count does not match wall timing".into());
     }
+    let process_cpu_totals: Vec<f64> = threads
+        .iter()
+        .filter_map(|thread| thread.process_cpu_total_ms)
+        .collect();
+    if !process_cpu_durations.is_empty() && process_cpu_totals.len() != threads.len() {
+        return Err("process CPU total count does not match timed threads".into());
+    }
     process_cpu_durations.sort_by(f64::total_cmp);
     let process_cpu_timing = if process_cpu_durations.is_empty() {
         Value::Null
     } else {
         let cpu_sum = process_cpu_durations.iter().sum::<f64>();
+        let cpu_total = process_cpu_totals.iter().sum::<f64>();
         let cpu_mean = cpu_sum / process_cpu_durations.len() as f64;
         let cpu_variance = process_cpu_durations
             .iter()
             .map(|duration| (duration - cpu_mean).powi(2))
             .sum::<f64>()
             / process_cpu_durations.len() as f64;
+        let minimum_nonzero_delta_ms = process_cpu_durations
+            .iter()
+            .copied()
+            .filter(|duration| *duration > 0.0)
+            .min_by(f64::total_cmp);
         json!({
             "clock": process_cpu_clock_name(),
             "sample_count": process_cpu_durations.len(),
+            "sampled_call_cpu_ms": cpu_sum,
+            "total_run_cpu_ms": cpu_total,
+            "minimum_nonzero_delta_ms": minimum_nonzero_delta_ms,
+            "per_call_distribution_gate_eligible": !cfg!(target_os = "windows"),
             "mean_ms": cpu_mean,
             "standard_deviation_ms": cpu_variance.sqrt(),
             "p50_ms": percentile(&process_cpu_durations, 0.50),
@@ -253,7 +271,7 @@ fn finish(
                 .filter(|duration| **duration > budget_ms)
                 .count() as f64
                 / process_cpu_durations.len() as f64,
-            "summed_compute_rtf": cpu_sum / 1_000.0 / total_audio_seconds,
+            "summed_compute_rtf": cpu_total / 1_000.0 / total_audio_seconds,
         })
     };
     let total_processing_seconds = sum / 1_000.0;
@@ -355,6 +373,7 @@ fn run_dpdfnet_threads(
         Ok(ThreadResult {
             durations_ms,
             process_cpu_durations_ms: None,
+            process_cpu_total_ms: None,
             audio_seconds: calls as f64 * dpdfnet::HOP_SIZE as f64 / dpdfnet::SAMPLE_RATE as f64,
             wall_seconds: wall_started.elapsed().as_secs_f64(),
             checksum,
@@ -394,6 +413,7 @@ fn run_gtcrn_threads(
         Ok(ThreadResult {
             durations_ms,
             process_cpu_durations_ms: None,
+            process_cpu_total_ms: None,
             audio_seconds: calls as f64 * gtcrn::HOP_SIZE as f64 / gtcrn::SAMPLE_RATE as f64,
             wall_seconds: wall_started.elapsed().as_secs_f64(),
             checksum,
@@ -454,6 +474,7 @@ fn run_gtcrn_daw_threads(
         Ok(ThreadResult {
             durations_ms,
             process_cpu_durations_ms: None,
+            process_cpu_total_ms: None,
             audio_seconds: calls as f64 * DAW_BLOCK_FRAMES as f64 / DAW_SAMPLE_RATE as f64,
             wall_seconds: wall_started.elapsed().as_secs_f64(),
             checksum,
@@ -512,10 +533,15 @@ fn run_dpdfnet_daw_threads(
         // Exercise direct production calls under the same thread-bound
         // platform scheduling class for the complete measurement.
         barrier.wait();
+        let measure_process_cpu = parallel == 1 && cfg!(any(unix, target_os = "windows"));
+        let process_cpu_run_started = if measure_process_cpu {
+            Some(process_cpu_time()?)
+        } else {
+            None
+        };
         let wall_started = Instant::now();
         let mut durations_ms = Vec::with_capacity(calls);
-        let mut process_cpu_durations_ms =
-            cfg!(any(unix, target_os = "windows")).then(|| Vec::with_capacity(calls));
+        let mut process_cpu_durations_ms = measure_process_cpu.then(|| Vec::with_capacity(calls));
         let mut checksum = 0.0;
         for index in 0..calls {
             if realtime_paced {
@@ -554,9 +580,18 @@ fn run_dpdfnet_daw_threads(
                 return Err("DPDFNet DAW path produced a non-finite stress sample".into());
             }
         }
+        let process_cpu_total_ms = process_cpu_run_started
+            .map(|started| {
+                process_cpu_time()?
+                    .checked_sub(started)
+                    .map(milliseconds)
+                    .ok_or_else(|| "process CPU clock moved backwards".to_owned())
+            })
+            .transpose()?;
         Ok(ThreadResult {
             durations_ms,
             process_cpu_durations_ms,
+            process_cpu_total_ms,
             audio_seconds: calls as f64 * DAW_BLOCK_FRAMES as f64 / DAW_SAMPLE_RATE as f64,
             wall_seconds: wall_started.elapsed().as_secs_f64(),
             checksum,

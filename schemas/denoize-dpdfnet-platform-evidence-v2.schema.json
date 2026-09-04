@@ -38,12 +38,13 @@
     "measurement": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["stress_seconds", "stress_calls", "stress_realtime_paced", "deadline_clock", "p99_9_ms", "maximum_ms", "deadline_misses", "summed_compute_rtf", "wall_p99_9_ms", "wall_maximum_ms", "wall_deadline_misses", "wall_summed_compute_rtf", "peak_rss_bytes", "paced_worker_blocks", "worker_neural_frames", "worker_error_counter_total"],
+      "required": ["stress_seconds", "stress_calls", "stress_realtime_paced", "deadline_clock", "compute_rtf_clock", "p99_9_ms", "maximum_ms", "deadline_misses", "summed_compute_rtf", "wall_p99_9_ms", "wall_maximum_ms", "wall_deadline_misses", "wall_summed_compute_rtf", "peak_rss_bytes", "paced_worker_blocks", "worker_neural_frames", "worker_error_counter_total"],
       "properties": {
         "stress_seconds": { "type": "integer", "minimum": 1, "maximum": 3600 },
         "stress_calls": { "type": "integer", "minimum": 100, "maximum": 360000 },
         "stress_realtime_paced": { "const": true },
         "deadline_clock": { "enum": ["monotonic-wall", "process-cpu"] },
+        "compute_rtf_clock": { "enum": ["monotonic-wall", "process-cpu"] },
         "p99_9_ms": { "type": "number", "minimum": 0, "maximum": 10000 },
         "maximum_ms": { "type": "number", "minimum": 0, "maximum": 10000 },
         "deadline_misses": { "type": "integer", "minimum": 0, "maximum": 360000 },

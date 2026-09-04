@@ -124,6 +124,7 @@
         "hardware_tier": { "enum": ["portable-ci", "lowest-supported"] },
         "runner_label": { "enum": ["ubuntu-24.04", "macos-14", "macos-15", "windows-2025", "ubuntu-slim"] },
         "deadline_clock": { "enum": ["monotonic-wall", "process-cpu"] },
+        "compute_rtf_clock": { "enum": ["monotonic-wall", "process-cpu"] },
         "p99_9_ms": { "type": "number", "minimum": 0, "maximum": 10 },
         "wall_p99_9_ms": { "type": "number", "minimum": 0, "maximum": 10000 },
         "peak_rss_bytes": { "type": "integer", "minimum": 1, "maximum": 536870912 },
