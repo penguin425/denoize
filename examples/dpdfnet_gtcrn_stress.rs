@@ -62,6 +62,7 @@ struct Args {
 #[derive(Debug)]
 struct ThreadResult {
     durations_ms: Vec<f64>,
+    process_cpu_durations_ms: Option<Vec<f64>>,
     audio_seconds: f64,
     wall_seconds: f64,
     checksum: f64,
@@ -209,6 +210,52 @@ fn finish(
         .iter()
         .map(|thread| thread.audio_seconds)
         .sum::<f64>();
+    let mut process_cpu_durations: Vec<f64> = threads
+        .iter()
+        .flat_map(|thread| {
+            thread
+                .process_cpu_durations_ms
+                .iter()
+                .flat_map(|durations| durations.iter().copied())
+        })
+        .collect();
+    if !process_cpu_durations.is_empty() && process_cpu_durations.len() != durations.len() {
+        return Err("process CPU timing sample count does not match wall timing".into());
+    }
+    process_cpu_durations.sort_by(f64::total_cmp);
+    let process_cpu_timing = if process_cpu_durations.is_empty() {
+        Value::Null
+    } else {
+        let cpu_sum = process_cpu_durations.iter().sum::<f64>();
+        let cpu_mean = cpu_sum / process_cpu_durations.len() as f64;
+        let cpu_variance = process_cpu_durations
+            .iter()
+            .map(|duration| (duration - cpu_mean).powi(2))
+            .sum::<f64>()
+            / process_cpu_durations.len() as f64;
+        json!({
+            "clock": "CLOCK_PROCESS_CPUTIME_ID",
+            "sample_count": process_cpu_durations.len(),
+            "mean_ms": cpu_mean,
+            "standard_deviation_ms": cpu_variance.sqrt(),
+            "p50_ms": percentile(&process_cpu_durations, 0.50),
+            "p95_ms": percentile(&process_cpu_durations, 0.95),
+            "p99_ms": percentile(&process_cpu_durations, 0.99),
+            "p99_9_ms": percentile(&process_cpu_durations, 0.999),
+            "maximum_ms": process_cpu_durations[process_cpu_durations.len() - 1],
+            "budget_ms": budget_ms,
+            "calls_over_budget": process_cpu_durations
+                .iter()
+                .filter(|duration| **duration > budget_ms)
+                .count(),
+            "calls_over_budget_fraction": process_cpu_durations
+                .iter()
+                .filter(|duration| **duration > budget_ms)
+                .count() as f64
+                / process_cpu_durations.len() as f64,
+            "summed_compute_rtf": cpu_sum / 1_000.0 / total_audio_seconds,
+        })
+    };
     let total_processing_seconds = sum / 1_000.0;
     let concurrent_wall_seconds = threads
         .iter()
@@ -244,6 +291,7 @@ fn finish(
             "summed_compute_rtf": total_processing_seconds / total_audio_seconds,
             "concurrent_wall_seconds": concurrent_wall_seconds,
             "aggregate_realtime_throughput_x": total_audio_seconds / concurrent_wall_seconds.max(1.0e-20),
+            "process_cpu": process_cpu_timing,
         },
         "memory": {
             "rss_before_model_load_bytes": rss_before_load,
@@ -306,6 +354,7 @@ fn run_dpdfnet_threads(
         }
         Ok(ThreadResult {
             durations_ms,
+            process_cpu_durations_ms: None,
             audio_seconds: calls as f64 * dpdfnet::HOP_SIZE as f64 / dpdfnet::SAMPLE_RATE as f64,
             wall_seconds: wall_started.elapsed().as_secs_f64(),
             checksum,
@@ -344,6 +393,7 @@ fn run_gtcrn_threads(
         }
         Ok(ThreadResult {
             durations_ms,
+            process_cpu_durations_ms: None,
             audio_seconds: calls as f64 * gtcrn::HOP_SIZE as f64 / gtcrn::SAMPLE_RATE as f64,
             wall_seconds: wall_started.elapsed().as_secs_f64(),
             checksum,
@@ -403,6 +453,7 @@ fn run_gtcrn_daw_threads(
         }
         Ok(ThreadResult {
             durations_ms,
+            process_cpu_durations_ms: None,
             audio_seconds: calls as f64 * DAW_BLOCK_FRAMES as f64 / DAW_SAMPLE_RATE as f64,
             wall_seconds: wall_started.elapsed().as_secs_f64(),
             checksum,
@@ -463,6 +514,7 @@ fn run_dpdfnet_daw_threads(
         barrier.wait();
         let wall_started = Instant::now();
         let mut durations_ms = Vec::with_capacity(calls);
+        let mut process_cpu_durations_ms = cfg!(unix).then(|| Vec::with_capacity(calls));
         let mut checksum = 0.0;
         for index in 0..calls {
             if realtime_paced {
@@ -476,9 +528,22 @@ fn run_dpdfnet_daw_threads(
                     std::thread::park_timeout(delay.min(DAW_WORKER_POLL));
                 }
             }
+            let process_cpu_started = if process_cpu_durations_ms.is_some() {
+                Some(process_cpu_time()?)
+            } else {
+                None
+            };
             let started = Instant::now();
             let output = priority_guard.run_inference_cycle(|| stream.process_block(&input))?;
             durations_ms.push(milliseconds(started.elapsed()));
+            if let (Some(durations), Some(process_cpu_started)) =
+                (&mut process_cpu_durations_ms, process_cpu_started)
+            {
+                let elapsed = process_cpu_time()?
+                    .checked_sub(process_cpu_started)
+                    .ok_or_else(|| "process CPU clock moved backwards".to_owned())?;
+                durations.push(milliseconds(elapsed));
+            }
             checksum += output
                 .first()
                 .and_then(|channel| channel.get(index % channel.len().max(1)))
@@ -490,6 +555,7 @@ fn run_dpdfnet_daw_threads(
         }
         Ok(ThreadResult {
             durations_ms,
+            process_cpu_durations_ms,
             audio_seconds: calls as f64 * DAW_BLOCK_FRAMES as f64 / DAW_SAMPLE_RATE as f64,
             wall_seconds: wall_started.elapsed().as_secs_f64(),
             checksum,
@@ -694,6 +760,33 @@ fn percentile(sorted: &[f64], quantile: f64) -> f64 {
 
 fn optional_difference(after: Option<u64>, before: Option<u64>) -> Option<u64> {
     Some(after?.saturating_sub(before?))
+}
+
+#[cfg(unix)]
+fn process_cpu_time() -> Result<Duration, String> {
+    let mut timestamp = std::mem::MaybeUninit::<libc::timespec>::uninit();
+    // SAFETY: clock_gettime initializes the provided timespec on success.
+    if unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, timestamp.as_mut_ptr()) } != 0 {
+        return Err(format!(
+            "read process CPU clock: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: the successful call above initialized the value.
+    let timestamp = unsafe { timestamp.assume_init() };
+    let seconds = u64::try_from(timestamp.tv_sec)
+        .map_err(|_| "process CPU clock returned negative seconds".to_owned())?;
+    let nanoseconds = u32::try_from(timestamp.tv_nsec)
+        .map_err(|_| "process CPU clock returned negative nanoseconds".to_owned())?;
+    if nanoseconds >= 1_000_000_000 {
+        return Err("process CPU clock returned invalid nanoseconds".into());
+    }
+    Ok(Duration::new(seconds, nanoseconds))
+}
+
+#[cfg(not(unix))]
+fn process_cpu_time() -> Result<Duration, String> {
+    Err("process CPU clock is unavailable on this platform".into())
 }
 
 fn current_rss_bytes() -> Option<u64> {

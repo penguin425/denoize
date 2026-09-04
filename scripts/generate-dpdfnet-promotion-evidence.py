@@ -284,6 +284,19 @@ def generate(args: argparse.Namespace) -> bool:
             raise PromotionError(
                 "v2 platform promotion evidence must record real-time pacing"
             )
+        if platform_schema == "denoize-dpdfnet-platform-evidence-v2":
+            deadline_clock = nested(document, "measurement.deadline_clock")
+            expected_clock = (
+                "process-cpu" if operating_system == "macos" else "monotonic-wall"
+            )
+            if deadline_clock != expected_clock:
+                raise PromotionError(
+                    f"v2 {operating_system} platform evidence must use {expected_clock}"
+                )
+            wall_p99_9_ms = nested(document, "measurement.wall_p99_9_ms")
+        else:
+            deadline_clock = "monotonic-wall"
+            wall_p99_9_ms = nested(document, "measurement.p99_9_ms")
         if (
             hardware_tier == "lowest-supported"
             and platform_schema != "denoize-dpdfnet-platform-evidence-v2"
@@ -307,7 +320,9 @@ def generate(args: argparse.Namespace) -> bool:
             "cpu_model": nested(document, "platform.cpu_model"),
             "hardware_tier": hardware_tier,
             "runner_label": nested(document, "platform.runner_label"),
+            "deadline_clock": deadline_clock,
             "p99_9_ms": nested(document, "measurement.p99_9_ms"),
+            "wall_p99_9_ms": wall_p99_9_ms,
             "peak_rss_bytes": nested(document, "measurement.peak_rss_bytes"),
             "accepted": document.get("accepted") is True and all(item.get("passed") is True for item in document.get("checks", [])),
         })

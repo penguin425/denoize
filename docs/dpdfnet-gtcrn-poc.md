@@ -297,20 +297,27 @@ Hosted runners are not real-time schedulers. Every promotion direct-call probe
 therefore presents one 480-frame block every 10 ms instead of saturating its
 runner continuously. Sleep time is excluded from each call measurement, and an
 overrun is carried into the next scheduled call rather than resetting the
-clock. The gate still requires p99.9 at or below 10 ms, at most 0.1% of calls
-above 10 ms, and no single call above 20 ms.
+clock. Linux and Windows apply the direct-call thresholds to monotonic wall
+time. The shared macOS virtual runner applies the same thresholds to
+`CLOCK_PROCESS_CPUTIME_ID`, which Apple defines as user- plus kernel-mode CPU
+used by the complete calling process. This includes synchronous helper-thread
+work while excluding time when the virtual machine is not scheduled. macOS
+monotonic wall-time tails remain in the closed evidence as diagnostics. In both
+cases the gate requires p99.9 at or below 10 ms, at most 0.1% of calls above 10
+ms, and no single call above 20 ms.
 
 The production CLAP worker is independently paced for the full requested
 measurement (6,000 blocks for the 60-second gate) and remains stricter:
-overload, late, invalid, and worker-error counters must all be zero. This tests
-the actual 240 ms bounded-queue contract while preserving the direct-call tail
-diagnostics and avoids mistaking continuous container CPU-quota throttling for
-a DAW callback workload. Input fixtures are prepared before measurement, then
-whole 480-frame blocks are submitted on one absolute 10 ms clock; processing
-time is carried into the next deadline instead of added to a relative sleep.
-Evidence is rejected if the measured wall time falls below 95% or exceeds 105%
-plus 250 ms of the complete scheduled window (including latency priming), so a
-slow feeder cannot hide production-worker deadline failures.
+overload, late, invalid, and worker-error counters must all be zero. This is the
+wall-clock scheduling gate and tests the actual 240 ms bounded-queue contract;
+process CPU timing cannot hide a worker miss. It also preserves the direct-call
+wall tails without mistaking virtual-host descheduling for model computation.
+Input fixtures are prepared before measurement, then whole 480-frame blocks are
+submitted on one absolute 10 ms clock; processing time is carried into the next
+deadline instead of added to a relative sleep. Evidence is rejected if the
+measured wall time falls below 95% or exceeds 105% plus 250 ms of the complete
+scheduled window (including latency priming), so a slow feeder cannot hide
+production-worker deadline failures.
 
 ## Sources
 
@@ -322,3 +329,4 @@ slow feeder cannot hide production-worker deadline failures.
 - [GTCRN paper](https://ieeexplore.ieee.org/document/10448310)
 - [VCTK corpus](https://datashare.ed.ac.uk/handle/10283/3443)
 - [DeepFilterNet fixture licensing](https://github.com/Rikorose/DeepFilterNet/blob/d375b2d8309e0935d165700c91da9de862a99c31/assets/README.md)
+- [Apple `clock_gettime` contract](https://github.com/apple-oss-distributions/Libc/blob/main/gen/clock_gettime.3)

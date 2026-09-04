@@ -147,13 +147,40 @@ def generate(args: argparse.Namespace) -> bool:
         raise EvidenceError("stress run lacks timing, memory, or robustness evidence")
     seconds = integer(stress.get("requested_seconds_per_stream"), "requested_seconds_per_stream")
     calls = integer(stress.get("calls"), "calls")
-    p99_9_ms = number(timing.get("p99_9_ms"), "p99_9_ms")
-    maximum_ms = number(timing.get("maximum_ms"), "maximum_ms")
-    summed_rtf = number(timing.get("summed_compute_rtf"), "summed_compute_rtf")
-    calls_over_budget = integer(timing.get("calls_over_budget"), "calls_over_budget")
+    wall_p99_9_ms = number(timing.get("p99_9_ms"), "p99_9_ms")
+    wall_maximum_ms = number(timing.get("maximum_ms"), "maximum_ms")
+    wall_summed_rtf = number(timing.get("summed_compute_rtf"), "summed_compute_rtf")
+    wall_calls_over_budget = integer(timing.get("calls_over_budget"), "calls_over_budget")
     peak_rss = integer(memory.get("peak_rss_bytes"), "peak_rss_bytes")
     if timing.get("budget_ms") != 10.0:
         raise EvidenceError("stress run must use a 10 ms DAW deadline")
+    if operating_system == "macos":
+        process_cpu = timing.get("process_cpu")
+        if not isinstance(process_cpu, dict):
+            raise EvidenceError("macOS stress run lacks process CPU timing")
+        if process_cpu.get("clock") != "CLOCK_PROCESS_CPUTIME_ID":
+            raise EvidenceError("macOS stress run used an unsupported process CPU clock")
+        if integer(process_cpu.get("sample_count"), "process CPU sample_count") != calls:
+            raise EvidenceError("process CPU timing sample count does not match stress calls")
+        if process_cpu.get("budget_ms") != 10.0:
+            raise EvidenceError("process CPU timing must use a 10 ms DAW deadline")
+        deadline_clock = "process-cpu"
+        p99_9_ms = number(process_cpu.get("p99_9_ms"), "process CPU p99_9_ms")
+        maximum_ms = number(process_cpu.get("maximum_ms"), "process CPU maximum_ms")
+        summed_rtf = number(
+            process_cpu.get("summed_compute_rtf"),
+            "process CPU summed_compute_rtf",
+        )
+        calls_over_budget = integer(
+            process_cpu.get("calls_over_budget"),
+            "process CPU calls_over_budget",
+        )
+    else:
+        deadline_clock = "monotonic-wall"
+        p99_9_ms = wall_p99_9_ms
+        maximum_ms = wall_maximum_ms
+        summed_rtf = wall_summed_rtf
+        calls_over_budget = wall_calls_over_budget
     if robustness.get("independent_stream_bit_exact") is not True or robustness.get("empty_input_exact") is not True:
         raise EvidenceError("stress reset/empty-input robustness did not pass")
     finite_geometry = robustness.get("finite_geometry")
@@ -228,10 +255,10 @@ def generate(args: argparse.Namespace) -> bool:
         check("minimum-stress-seconds", seconds, "greater-or-equal", 60),
         check("minimum-stress-calls", calls, "greater-or-equal", 6000),
         check("stress-p99-9-ms", p99_9_ms, "less-or-equal", 10.0),
-        # Hosted CI runners are not real-time systems and can be preempted for
-        # one isolated call. Bound that tail explicitly while keeping p99.9
-        # below one 10 ms hop; the paced production worker remains the strict
-        # zero-overload/zero-late gate.
+        # The macOS portable runner is a shared virtual machine, so its direct
+        # compute gate uses whole-process CPU time and retains monotonic wall
+        # time as a diagnostic. The separately paced production worker remains
+        # the strict wall-clock zero-overload/zero-late scheduling gate.
         check("stress-maximum-ms", maximum_ms, "less-or-equal", MAX_SINGLE_CALL_MS),
         check(
             "stress-deadline-misses",
@@ -276,10 +303,15 @@ def generate(args: argparse.Namespace) -> bool:
             "stress_seconds": seconds,
             "stress_calls": calls,
             "stress_realtime_paced": realtime_paced,
+            "deadline_clock": deadline_clock,
             "p99_9_ms": p99_9_ms,
             "maximum_ms": maximum_ms,
             "deadline_misses": calls_over_budget,
             "summed_compute_rtf": summed_rtf,
+            "wall_p99_9_ms": wall_p99_9_ms,
+            "wall_maximum_ms": wall_maximum_ms,
+            "wall_deadline_misses": wall_calls_over_budget,
+            "wall_summed_compute_rtf": wall_summed_rtf,
             "peak_rss_bytes": peak_rss,
             "paced_worker_blocks": paced_blocks,
             "worker_neural_frames": neural_frames,

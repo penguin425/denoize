@@ -644,6 +644,9 @@ def composite_fixtures(
             }
         )
         document["measurement"]["stress_realtime_paced"] = True
+        document["measurement"]["deadline_clock"] = (
+            "process-cpu" if operating_system == "macos" else "monotonic-wall"
+        )
         validators["platform"].validate(document)
         path = root / f"platform-{index}.json"
         path.write_text(json.dumps(document) + "\n", encoding="utf-8")
@@ -1040,6 +1043,97 @@ def main() -> int:
         assert by_id["stress-maximum-ms"]["limit"] == 20.0
         assert by_id["stress-deadline-misses"]["limit"] == 6
 
+        mac_stress = json.loads(stress_path.read_text(encoding="utf-8"))
+        mac_stress["environment"].update(
+            {
+                "os": "macos",
+                "arch": "aarch64",
+                "target": "aarch64-apple-darwin",
+                "os_version": "macOS-15.7.9-fixture",
+                "cpu_model": "Apple M1 (Virtual)",
+                "runner_label": "macos-15",
+                "logical_parallelism": 3,
+            }
+        )
+        mac_stress["timing"].update(
+            {
+                "p99_9_ms": 11.37075,
+                "maximum_ms": 16.252792,
+                "calls_over_budget": 17,
+                "calls_over_budget_fraction": 17 / 6000,
+                "summed_compute_rtf": 0.39796,
+                "process_cpu": {
+                    "clock": "CLOCK_PROCESS_CPUTIME_ID",
+                    "sample_count": 6_000,
+                    "budget_ms": 10.0,
+                    "p99_9_ms": 8.2,
+                    "maximum_ms": 9.3,
+                    "calls_over_budget": 0,
+                    "summed_compute_rtf": 0.36,
+                },
+            }
+        )
+        mac_worker = json.loads(worker_path.read_text(encoding="utf-8"))
+        mac_worker["environment"].update(
+            {
+                "os": "macos",
+                "arch": "aarch64",
+                "target": "aarch64-apple-darwin",
+                "cpu_model": "Apple M1 (Virtual)",
+                "runner_label": "macos-15",
+                "logical_parallelism": 3,
+            }
+        )
+        mac_stress_path = platform_root / "mac-stress.json"
+        mac_worker_path = platform_root / "mac-worker.json"
+        mac_stress_path.write_text(
+            json.dumps(mac_stress) + "\n", encoding="utf-8"
+        )
+        mac_worker_path.write_text(
+            json.dumps(mac_worker) + "\n", encoding="utf-8"
+        )
+        mac_platform_path = platform_root / "mac-platform.json"
+        run(
+            [
+                sys.executable,
+                str(PLATFORM),
+                "--stress",
+                str(mac_stress_path),
+                "--worker",
+                str(mac_worker_path),
+                "--output",
+                str(mac_platform_path),
+            ]
+        )
+        mac_platform = json.loads(mac_platform_path.read_text(encoding="utf-8"))
+        validators["platform"].validate(mac_platform)
+        assert mac_platform["accepted"] is True
+        assert mac_platform["measurement"]["deadline_clock"] == "process-cpu"
+        assert mac_platform["measurement"]["p99_9_ms"] == 8.2
+        assert mac_platform["measurement"]["wall_p99_9_ms"] == 11.37075
+        assert all(check["passed"] is True for check in mac_platform["checks"])
+
+        mac_without_cpu = json.loads(json.dumps(mac_stress))
+        del mac_without_cpu["timing"]["process_cpu"]
+        mac_without_cpu_path = platform_root / "mac-without-cpu-stress.json"
+        mac_without_cpu_path.write_text(
+            json.dumps(mac_without_cpu) + "\n", encoding="utf-8"
+        )
+        missing_cpu = run(
+            [
+                sys.executable,
+                str(PLATFORM),
+                "--stress",
+                str(mac_without_cpu_path),
+                "--worker",
+                str(mac_worker_path),
+                "--output",
+                str(platform_root / "mac-without-cpu-platform.json"),
+            ],
+            success=False,
+        )
+        assert "macOS stress run lacks process CPU timing" in missing_cpu.stderr
+
         lowest_stress = json.loads(stress_path.read_text(encoding="utf-8"))
         lowest_stress["environment"].update(
             {
@@ -1176,7 +1270,15 @@ def main() -> int:
         )
         legacy_portable["schema"] = "denoize-dpdfnet-platform-evidence-v1"
         legacy_portable["schema_version"] = 1
-        del legacy_portable["measurement"]["stress_realtime_paced"]
+        for field in (
+            "stress_realtime_paced",
+            "deadline_clock",
+            "wall_p99_9_ms",
+            "wall_maximum_ms",
+            "wall_deadline_misses",
+            "wall_summed_compute_rtf",
+        ):
+            del legacy_portable["measurement"][field]
         validators["platform_v1"].validate(legacy_portable)
         legacy_portable_path = promotion_root / "platform-portable-v1.json"
         legacy_portable_path.write_text(
@@ -1198,7 +1300,15 @@ def main() -> int:
         )
         legacy_lowest["schema"] = "denoize-dpdfnet-platform-evidence-v1"
         legacy_lowest["schema_version"] = 1
-        del legacy_lowest["measurement"]["stress_realtime_paced"]
+        for field in (
+            "stress_realtime_paced",
+            "deadline_clock",
+            "wall_p99_9_ms",
+            "wall_maximum_ms",
+            "wall_deadline_misses",
+            "wall_summed_compute_rtf",
+        ):
+            del legacy_lowest["measurement"][field]
         validators["platform_v1"].validate(legacy_lowest)
         legacy_lowest_path = promotion_root / "platform-lowest-v1.json"
         legacy_lowest_path.write_text(
