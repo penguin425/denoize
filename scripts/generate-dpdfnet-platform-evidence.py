@@ -154,12 +154,19 @@ def generate(args: argparse.Namespace) -> bool:
     peak_rss = integer(memory.get("peak_rss_bytes"), "peak_rss_bytes")
     if timing.get("budget_ms") != 10.0:
         raise EvidenceError("stress run must use a 10 ms DAW deadline")
-    if operating_system == "macos":
+    process_cpu_config = {
+        "macos": ("CLOCK_PROCESS_CPUTIME_ID", "macOS"),
+        "windows": ("GetProcessTimes", "Windows"),
+    }.get(operating_system)
+    if process_cpu_config is not None:
+        process_cpu_clock, process_cpu_label = process_cpu_config
         process_cpu = timing.get("process_cpu")
         if not isinstance(process_cpu, dict):
-            raise EvidenceError("macOS stress run lacks process CPU timing")
-        if process_cpu.get("clock") != "CLOCK_PROCESS_CPUTIME_ID":
-            raise EvidenceError("macOS stress run used an unsupported process CPU clock")
+            raise EvidenceError(f"{process_cpu_label} stress run lacks process CPU timing")
+        if process_cpu.get("clock") != process_cpu_clock:
+            raise EvidenceError(
+                f"{process_cpu_label} stress run used an unsupported process CPU clock"
+            )
         if integer(process_cpu.get("sample_count"), "process CPU sample_count") != calls:
             raise EvidenceError("process CPU timing sample count does not match stress calls")
         if process_cpu.get("budget_ms") != 10.0:
@@ -255,10 +262,10 @@ def generate(args: argparse.Namespace) -> bool:
         check("minimum-stress-seconds", seconds, "greater-or-equal", 60),
         check("minimum-stress-calls", calls, "greater-or-equal", 6000),
         check("stress-p99-9-ms", p99_9_ms, "less-or-equal", 10.0),
-        # The macOS portable runner is a shared virtual machine, so its direct
-        # compute gate uses whole-process CPU time and retains monotonic wall
-        # time as a diagnostic. The separately paced production worker remains
-        # the strict wall-clock zero-overload/zero-late scheduling gate.
+        # The macOS and Windows portable runners are shared virtual machines,
+        # so their direct compute gates use whole-process CPU time and retain
+        # monotonic wall time as a diagnostic. The separately paced production
+        # worker remains the strict wall-clock zero-overload/zero-late gate.
         check("stress-maximum-ms", maximum_ms, "less-or-equal", MAX_SINGLE_CALL_MS),
         check(
             "stress-deadline-misses",

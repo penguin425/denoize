@@ -234,7 +234,7 @@ fn finish(
             .sum::<f64>()
             / process_cpu_durations.len() as f64;
         json!({
-            "clock": "CLOCK_PROCESS_CPUTIME_ID",
+            "clock": process_cpu_clock_name(),
             "sample_count": process_cpu_durations.len(),
             "mean_ms": cpu_mean,
             "standard_deviation_ms": cpu_variance.sqrt(),
@@ -514,7 +514,8 @@ fn run_dpdfnet_daw_threads(
         barrier.wait();
         let wall_started = Instant::now();
         let mut durations_ms = Vec::with_capacity(calls);
-        let mut process_cpu_durations_ms = cfg!(unix).then(|| Vec::with_capacity(calls));
+        let mut process_cpu_durations_ms =
+            cfg!(any(unix, target_os = "windows")).then(|| Vec::with_capacity(calls));
         let mut checksum = 0.0;
         for index in 0..calls {
             if realtime_paced {
@@ -784,9 +785,69 @@ fn process_cpu_time() -> Result<Duration, String> {
     Ok(Duration::new(seconds, nanoseconds))
 }
 
-#[cfg(not(unix))]
+#[cfg(target_os = "windows")]
+fn process_cpu_time() -> Result<Duration, String> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+
+    let mut creation = std::mem::MaybeUninit::<FILETIME>::uninit();
+    let mut exit = std::mem::MaybeUninit::<FILETIME>::uninit();
+    let mut kernel = std::mem::MaybeUninit::<FILETIME>::uninit();
+    let mut user = std::mem::MaybeUninit::<FILETIME>::uninit();
+    // SAFETY: GetCurrentProcess returns a valid pseudo-handle, and
+    // GetProcessTimes initializes all four writable FILETIME values on success.
+    if unsafe {
+        GetProcessTimes(
+            GetCurrentProcess(),
+            creation.as_mut_ptr(),
+            exit.as_mut_ptr(),
+            kernel.as_mut_ptr(),
+            user.as_mut_ptr(),
+        )
+    } == 0
+    {
+        return Err(format!(
+            "read process CPU clock: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: the successful call above initialized the kernel value.
+    let kernel = unsafe { kernel.assume_init() };
+    // SAFETY: the successful call above initialized the user value.
+    let user = unsafe { user.assume_init() };
+    let ticks = filetime_ticks(kernel)
+        .checked_add(filetime_ticks(user))
+        .ok_or_else(|| "process CPU clock overflowed".to_owned())?;
+    const TICKS_PER_SECOND: u64 = 10_000_000;
+    let seconds = ticks / TICKS_PER_SECOND;
+    let nanoseconds = u32::try_from((ticks % TICKS_PER_SECOND) * 100)
+        .map_err(|_| "process CPU clock returned invalid subsecond ticks".to_owned())?;
+    Ok(Duration::new(seconds, nanoseconds))
+}
+
+#[cfg(target_os = "windows")]
+fn filetime_ticks(value: windows_sys::Win32::Foundation::FILETIME) -> u64 {
+    (u64::from(value.dwHighDateTime) << 32) | u64::from(value.dwLowDateTime)
+}
+
+#[cfg(unix)]
+fn process_cpu_clock_name() -> &'static str {
+    "CLOCK_PROCESS_CPUTIME_ID"
+}
+
+#[cfg(target_os = "windows")]
+fn process_cpu_clock_name() -> &'static str {
+    "GetProcessTimes"
+}
+
+#[cfg(not(any(unix, target_os = "windows")))]
 fn process_cpu_time() -> Result<Duration, String> {
     Err("process CPU clock is unavailable on this platform".into())
+}
+
+#[cfg(not(any(unix, target_os = "windows")))]
+fn process_cpu_clock_name() -> &'static str {
+    "unavailable"
 }
 
 fn current_rss_bytes() -> Option<u64> {

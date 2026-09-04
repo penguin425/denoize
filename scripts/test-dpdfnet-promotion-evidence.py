@@ -645,7 +645,9 @@ def composite_fixtures(
         )
         document["measurement"]["stress_realtime_paced"] = True
         document["measurement"]["deadline_clock"] = (
-            "process-cpu" if operating_system == "macos" else "monotonic-wall"
+            "process-cpu"
+            if operating_system in {"macos", "windows"}
+            else "monotonic-wall"
         )
         validators["platform"].validate(document)
         path = root / f"platform-{index}.json"
@@ -1133,6 +1135,128 @@ def main() -> int:
             success=False,
         )
         assert "macOS stress run lacks process CPU timing" in missing_cpu.stderr
+
+        windows_stress = json.loads(stress_path.read_text(encoding="utf-8"))
+        windows_stress["environment"].update(
+            {
+                "os": "windows",
+                "arch": "x86_64",
+                "target": "x86_64-pc-windows-msvc",
+                "os_version": "Microsoft Windows NT 10.0.26100.0",
+                "cpu_model": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+                "runner_label": "windows-2025",
+                "logical_parallelism": 4,
+            }
+        )
+        windows_stress["timing"].update(
+            {
+                "p99_9_ms": 10.3638,
+                "maximum_ms": 14.518,
+                "calls_over_budget": 12,
+                "calls_over_budget_fraction": 12 / 6000,
+                "summed_compute_rtf": 0.59573,
+                "process_cpu": {
+                    "clock": "GetProcessTimes",
+                    "sample_count": 6_000,
+                    "budget_ms": 10.0,
+                    "p99_9_ms": 8.7,
+                    "maximum_ms": 9.8,
+                    "calls_over_budget": 0,
+                    "summed_compute_rtf": 0.56,
+                },
+            }
+        )
+        windows_worker = json.loads(worker_path.read_text(encoding="utf-8"))
+        windows_worker["environment"].update(
+            {
+                "os": "windows",
+                "arch": "x86_64",
+                "target": "x86_64-pc-windows-msvc",
+                "cpu_model": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+                "runner_label": "windows-2025",
+                "logical_parallelism": 4,
+            }
+        )
+        windows_stress_path = platform_root / "windows-stress.json"
+        windows_worker_path = platform_root / "windows-worker.json"
+        windows_stress_path.write_text(
+            json.dumps(windows_stress) + "\n", encoding="utf-8"
+        )
+        windows_worker_path.write_text(
+            json.dumps(windows_worker) + "\n", encoding="utf-8"
+        )
+        windows_platform_path = platform_root / "windows-platform.json"
+        run(
+            [
+                sys.executable,
+                str(PLATFORM),
+                "--stress",
+                str(windows_stress_path),
+                "--worker",
+                str(windows_worker_path),
+                "--output",
+                str(windows_platform_path),
+            ]
+        )
+        windows_platform = json.loads(
+            windows_platform_path.read_text(encoding="utf-8")
+        )
+        validators["platform"].validate(windows_platform)
+        assert windows_platform["accepted"] is True
+        assert windows_platform["measurement"]["deadline_clock"] == "process-cpu"
+        assert windows_platform["measurement"]["p99_9_ms"] == 8.7
+        assert windows_platform["measurement"]["wall_p99_9_ms"] == 10.3638
+        assert all(check["passed"] is True for check in windows_platform["checks"])
+
+        windows_without_cpu = json.loads(json.dumps(windows_stress))
+        del windows_without_cpu["timing"]["process_cpu"]
+        windows_without_cpu_path = platform_root / "windows-without-cpu-stress.json"
+        windows_without_cpu_path.write_text(
+            json.dumps(windows_without_cpu) + "\n", encoding="utf-8"
+        )
+        missing_windows_cpu = run(
+            [
+                sys.executable,
+                str(PLATFORM),
+                "--stress",
+                str(windows_without_cpu_path),
+                "--worker",
+                str(windows_worker_path),
+                "--output",
+                str(platform_root / "windows-without-cpu-platform.json"),
+            ],
+            success=False,
+        )
+        assert (
+            "Windows stress run lacks process CPU timing"
+            in missing_windows_cpu.stderr
+        )
+
+        windows_wrong_clock = json.loads(json.dumps(windows_stress))
+        windows_wrong_clock["timing"]["process_cpu"]["clock"] = (
+            "CLOCK_PROCESS_CPUTIME_ID"
+        )
+        windows_wrong_clock_path = platform_root / "windows-wrong-clock-stress.json"
+        windows_wrong_clock_path.write_text(
+            json.dumps(windows_wrong_clock) + "\n", encoding="utf-8"
+        )
+        wrong_windows_clock = run(
+            [
+                sys.executable,
+                str(PLATFORM),
+                "--stress",
+                str(windows_wrong_clock_path),
+                "--worker",
+                str(windows_worker_path),
+                "--output",
+                str(platform_root / "windows-wrong-clock-platform.json"),
+            ],
+            success=False,
+        )
+        assert (
+            "Windows stress run used an unsupported process CPU clock"
+            in wrong_windows_clock.stderr
+        )
 
         lowest_stress = json.loads(stress_path.read_text(encoding="utf-8"))
         lowest_stress["environment"].update(

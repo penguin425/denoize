@@ -287,7 +287,9 @@ def generate(args: argparse.Namespace) -> bool:
         if platform_schema == "denoize-dpdfnet-platform-evidence-v2":
             deadline_clock = nested(document, "measurement.deadline_clock")
             expected_clock = (
-                "process-cpu" if operating_system == "macos" else "monotonic-wall"
+                "process-cpu"
+                if operating_system in {"macos", "windows"}
+                else "monotonic-wall"
             )
             if deadline_clock != expected_clock:
                 raise PromotionError(
