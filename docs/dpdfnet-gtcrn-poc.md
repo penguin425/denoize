@@ -281,6 +281,25 @@ requires at least twenty retained listeners, and uses a 20,000-resample
 listener-cluster bootstrap. Keep the randomization key and answer key private
 until responses are frozen.
 
+If a version 1 private answer key is lost but the exact source matrix and its
+named candidate outputs remain available, recover a version 2 key without
+rerandomizing the public protocol:
+
+```console
+python3 scripts/recover-dpdfnet-blind-answer-key.py \
+  --protocol public-bundle/protocol.json \
+  --matrix-result matrix-result.json \
+  --audio-dir listening-candidates \
+  --output private/recovered-answer-key.json
+```
+
+The recovery matches only SHA-256 fingerprints already bound by the public
+protocol. For each duplicated source case, the lexicographically smallest
+opaque trial ID is the core trial and the other is its repeat. Fix this rule
+before collecting further responses, keep the recovered file private, and do
+not replace an intact version 1 key: only that original key preserves the
+randomization-key digest and the originally selected core/repeat assignment.
+
 The VCTK mirror is pinned per file and the underlying corpus is CC BY 4.0.
 DeepFilterNet's asset manifest identifies Freesound 2530 as CC BY 3.0 and
 Freesound 573577 as CC0 1.0. Evaluation audio is downloaded to the work
