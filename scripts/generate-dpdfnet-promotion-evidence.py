@@ -287,6 +287,12 @@ def generate(args: argparse.Namespace) -> bool:
         if platform_schema == "denoize-dpdfnet-platform-evidence-v2":
             deadline_clock = nested(document, "measurement.deadline_clock")
             compute_rtf_clock = nested(document, "measurement.compute_rtf_clock")
+            direct_call_deadline_gate_eligible = nested(
+                document, "measurement.direct_call_deadline_gate_eligible"
+            )
+            wall_clock_worker_gate_eligible = nested(
+                document, "measurement.wall_clock_worker_gate_eligible"
+            )
             expected_deadline_clock = (
                 "process-cpu" if operating_system == "macos" else "monotonic-wall"
             )
@@ -305,10 +311,63 @@ def generate(args: argparse.Namespace) -> bool:
                     f"v2 {operating_system} platform evidence must use "
                     f"{expected_compute_rtf_clock} compute RTF"
                 )
+            expected_direct_call_gate = hardware_tier == "portable-ci"
+            if direct_call_deadline_gate_eligible is not expected_direct_call_gate:
+                raise PromotionError(
+                    f"v2 {hardware_tier} platform evidence has invalid "
+                    "direct-call deadline eligibility"
+                )
+            if wall_clock_worker_gate_eligible is not expected_direct_call_gate:
+                raise PromotionError(
+                    f"v2 {hardware_tier} platform evidence has invalid "
+                    "wall-clock worker eligibility"
+                )
+            direct_call_check_ids = {
+                "stress-p99-9-ms",
+                "stress-maximum-ms",
+                "stress-deadline-misses",
+            }
+            observed_check_ids = {
+                item.get("id")
+                for item in document.get("checks", [])
+                if isinstance(item, dict)
+            }
+            has_complete_direct_call_gate = direct_call_check_ids <= observed_check_ids
+            has_any_direct_call_gate = bool(
+                direct_call_check_ids & observed_check_ids
+            )
+            if direct_call_deadline_gate_eligible and not has_complete_direct_call_gate:
+                raise PromotionError(
+                    f"v2 {hardware_tier} platform evidence lacks the direct-call gate"
+                )
+            if not direct_call_deadline_gate_eligible and has_any_direct_call_gate:
+                raise PromotionError(
+                    f"v2 {hardware_tier} platform evidence unexpectedly applies "
+                    "the direct-call gate"
+                )
+            worker_gate_id = (
+                "worker-error-counters"
+                if wall_clock_worker_gate_eligible
+                else "worker-processing-errors"
+            )
+            unexpected_worker_gate_id = (
+                "worker-processing-errors"
+                if wall_clock_worker_gate_eligible
+                else "worker-error-counters"
+            )
+            if (
+                worker_gate_id not in observed_check_ids
+                or unexpected_worker_gate_id in observed_check_ids
+            ):
+                raise PromotionError(
+                    f"v2 {hardware_tier} platform evidence applies the wrong worker gate"
+                )
             wall_p99_9_ms = nested(document, "measurement.wall_p99_9_ms")
         else:
             deadline_clock = "monotonic-wall"
             compute_rtf_clock = "monotonic-wall"
+            direct_call_deadline_gate_eligible = True
+            wall_clock_worker_gate_eligible = True
             wall_p99_9_ms = nested(document, "measurement.p99_9_ms")
         if (
             hardware_tier == "lowest-supported"
@@ -335,6 +394,8 @@ def generate(args: argparse.Namespace) -> bool:
             "runner_label": nested(document, "platform.runner_label"),
             "deadline_clock": deadline_clock,
             "compute_rtf_clock": compute_rtf_clock,
+            "direct_call_deadline_gate_eligible": direct_call_deadline_gate_eligible,
+            "wall_clock_worker_gate_eligible": wall_clock_worker_gate_eligible,
             "p99_9_ms": nested(document, "measurement.p99_9_ms"),
             "wall_p99_9_ms": wall_p99_9_ms,
             "peak_rss_bytes": nested(document, "measurement.peak_rss_bytes"),

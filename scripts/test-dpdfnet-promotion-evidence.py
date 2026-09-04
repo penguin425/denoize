@@ -653,6 +653,29 @@ def composite_fixtures(
             if operating_system in {"macos", "windows"}
             else "monotonic-wall"
         )
+        document["measurement"]["direct_call_deadline_gate_eligible"] = (
+            tier == "portable-ci"
+        )
+        document["measurement"]["wall_clock_worker_gate_eligible"] = (
+            tier == "portable-ci"
+        )
+        if tier == "lowest-supported":
+            document["checks"] = [
+                check
+                for check in document["checks"]
+                if check["id"]
+                not in {
+                    "stress-p99-9-ms",
+                    "stress-maximum-ms",
+                    "stress-deadline-misses",
+                }
+            ]
+            worker_check = next(
+                check
+                for check in document["checks"]
+                if check["id"] == "worker-error-counters"
+            )
+            worker_check["id"] = "worker-processing-errors"
         validators["platform"].validate(document)
         path = root / f"platform-{index}.json"
         path.write_text(json.dumps(document) + "\n", encoding="utf-8")
@@ -1340,6 +1363,15 @@ def main() -> int:
             }
         )
         lowest_stress["realtime_paced"] = True
+        lowest_stress["timing"].update(
+            {
+                "p99_9_ms": 21.453856,
+                "maximum_ms": 28.027151,
+                "calls_over_budget": 156,
+                "calls_over_budget_fraction": 156 / 6_000,
+                "summed_compute_rtf": 0.481972666,
+            }
+        )
         lowest_worker = json.loads(worker_path.read_text(encoding="utf-8"))
         lowest_worker["environment"].update(
             {
@@ -1377,6 +1409,136 @@ def main() -> int:
         assert lowest_platform["platform"]["logical_cpus"] == 1
         assert lowest_platform["platform"]["runner_label"] == "ubuntu-slim"
         assert lowest_platform["measurement"]["stress_realtime_paced"] is True
+        assert (
+            lowest_platform["measurement"]["direct_call_deadline_gate_eligible"]
+            is False
+        )
+        assert (
+            lowest_platform["measurement"]["wall_clock_worker_gate_eligible"]
+            is False
+        )
+        assert lowest_platform["measurement"]["p99_9_ms"] == 21.453856
+        assert len(lowest_platform["checks"]) == 8
+        assert {
+            "stress-p99-9-ms",
+            "stress-maximum-ms",
+            "stress-deadline-misses",
+        }.isdisjoint(check["id"] for check in lowest_platform["checks"])
+
+        overloaded_lowest_worker = json.loads(json.dumps(lowest_worker))
+        overloaded_lowest_worker["metrics"]["overload_blocks"] = 1
+        validators["worker"].validate(overloaded_lowest_worker)
+        overloaded_lowest_worker_path = platform_root / "overloaded-lowest-worker.json"
+        overloaded_lowest_worker_path.write_text(
+            json.dumps(overloaded_lowest_worker) + "\n", encoding="utf-8"
+        )
+        overloaded_lowest_platform_path = (
+            platform_root / "overloaded-lowest-platform.json"
+        )
+        run(
+            [
+                sys.executable,
+                str(PLATFORM),
+                "--stress",
+                str(lowest_stress_path),
+                "--worker",
+                str(overloaded_lowest_worker_path),
+                "--output",
+                str(overloaded_lowest_platform_path),
+                "--allow-rejected",
+            ]
+        )
+        overloaded_lowest_platform = json.loads(
+            overloaded_lowest_platform_path.read_text(encoding="utf-8")
+        )
+        validators["platform"].validate(overloaded_lowest_platform)
+        assert overloaded_lowest_platform["accepted"] is True
+        assert (
+            overloaded_lowest_platform["measurement"][
+                "worker_scheduling_counter_total"
+            ]
+            == 1
+        )
+        assert (
+            overloaded_lowest_platform["measurement"][
+                "worker_processing_error_count"
+            ]
+            == 0
+        )
+        assert {
+            check["id"]: check["passed"]
+            for check in overloaded_lowest_platform["checks"]
+        }["worker-processing-errors"] is True
+
+        overloaded_portable_worker = json.loads(
+            worker_path.read_text(encoding="utf-8")
+        )
+        overloaded_portable_worker["metrics"]["overload_blocks"] = 1
+        assert validators["worker"].is_valid(overloaded_portable_worker) is False
+
+        failed_lowest_worker = json.loads(json.dumps(lowest_worker))
+        failed_lowest_worker["metrics"]["worker_errors"] = 1
+        failed_lowest_worker_path = platform_root / "failed-lowest-worker.json"
+        failed_lowest_worker_path.write_text(
+            json.dumps(failed_lowest_worker) + "\n", encoding="utf-8"
+        )
+        failed_lowest_platform_path = platform_root / "failed-lowest-platform.json"
+        run(
+            [
+                sys.executable,
+                str(PLATFORM),
+                "--stress",
+                str(lowest_stress_path),
+                "--worker",
+                str(failed_lowest_worker_path),
+                "--output",
+                str(failed_lowest_platform_path),
+                "--allow-rejected",
+            ]
+        )
+        failed_lowest_platform = json.loads(
+            failed_lowest_platform_path.read_text(encoding="utf-8")
+        )
+        validators["platform"].validate(failed_lowest_platform)
+        assert failed_lowest_platform["accepted"] is False
+        assert {
+            check["id"]: check["passed"]
+            for check in failed_lowest_platform["checks"]
+        }["worker-processing-errors"] is False
+
+        over_capacity_lowest_stress = json.loads(json.dumps(lowest_stress))
+        over_capacity_lowest_stress["timing"]["summed_compute_rtf"] = 1.01
+        over_capacity_lowest_stress_path = (
+            platform_root / "over-capacity-lowest-stress.json"
+        )
+        over_capacity_lowest_stress_path.write_text(
+            json.dumps(over_capacity_lowest_stress) + "\n", encoding="utf-8"
+        )
+        over_capacity_lowest_platform_path = (
+            platform_root / "over-capacity-lowest-platform.json"
+        )
+        run(
+            [
+                sys.executable,
+                str(PLATFORM),
+                "--stress",
+                str(over_capacity_lowest_stress_path),
+                "--worker",
+                str(lowest_worker_path),
+                "--output",
+                str(over_capacity_lowest_platform_path),
+                "--allow-rejected",
+            ]
+        )
+        over_capacity_lowest_platform = json.loads(
+            over_capacity_lowest_platform_path.read_text(encoding="utf-8")
+        )
+        validators["platform"].validate(over_capacity_lowest_platform)
+        assert over_capacity_lowest_platform["accepted"] is False
+        assert {
+            check["id"]: check["passed"]
+            for check in over_capacity_lowest_platform["checks"]
+        }["stress-summed-rtf"] is False
 
         unpaced_lowest = json.loads(json.dumps(lowest_stress))
         unpaced_lowest["realtime_paced"] = False
@@ -1462,6 +1624,33 @@ def main() -> int:
             for entry in promotion["platforms"]
         ) == 1
 
+        false_lowest_worker_eligibility = json.loads(
+            arguments.platform_evidence[3].read_text(encoding="utf-8")
+        )
+        false_lowest_worker_eligibility["measurement"][
+            "wall_clock_worker_gate_eligible"
+        ] = True
+        false_lowest_worker_eligibility_path = (
+            promotion_root / "platform-lowest-false-worker-eligibility.json"
+        )
+        false_lowest_worker_eligibility_path.write_text(
+            json.dumps(false_lowest_worker_eligibility) + "\n", encoding="utf-8"
+        )
+        false_worker_eligibility = SimpleNamespace(**vars(arguments))
+        false_worker_eligibility.platform_evidence = [
+            *arguments.platform_evidence[:3],
+            false_lowest_worker_eligibility_path,
+        ]
+        false_worker_eligibility.output = (
+            promotion_root / "promotion-false-worker-eligibility.json"
+        )
+        try:
+            module.generate(false_worker_eligibility)
+        except module.PromotionError as error:
+            assert "wall-clock worker eligibility" in str(error)
+        else:
+            raise AssertionError("false worker eligibility unexpectedly passed")
+
         legacy_portable = json.loads(
             arguments.platform_evidence[0].read_text(encoding="utf-8")
         )
@@ -1471,10 +1660,14 @@ def main() -> int:
             "stress_realtime_paced",
             "deadline_clock",
             "compute_rtf_clock",
+            "direct_call_deadline_gate_eligible",
+            "wall_clock_worker_gate_eligible",
             "wall_p99_9_ms",
             "wall_maximum_ms",
             "wall_deadline_misses",
             "wall_summed_compute_rtf",
+            "worker_scheduling_counter_total",
+            "worker_processing_error_count",
         ):
             del legacy_portable["measurement"][field]
         validators["platform_v1"].validate(legacy_portable)
@@ -1498,14 +1691,31 @@ def main() -> int:
         )
         legacy_lowest["schema"] = "denoize-dpdfnet-platform-evidence-v1"
         legacy_lowest["schema_version"] = 1
+        portable_direct_checks = {
+            check["id"]: check
+            for check in json.loads(
+                arguments.platform_evidence[0].read_text(encoding="utf-8")
+            )["checks"]
+            if check["id"]
+            in {
+                "stress-p99-9-ms",
+                "stress-maximum-ms",
+                "stress-deadline-misses",
+            }
+        }
+        legacy_lowest["checks"].extend(portable_direct_checks.values())
         for field in (
             "stress_realtime_paced",
             "deadline_clock",
             "compute_rtf_clock",
+            "direct_call_deadline_gate_eligible",
+            "wall_clock_worker_gate_eligible",
             "wall_p99_9_ms",
             "wall_maximum_ms",
             "wall_deadline_misses",
             "wall_summed_compute_rtf",
+            "worker_scheduling_counter_total",
+            "worker_processing_error_count",
         ):
             del legacy_lowest["measurement"][field]
         validators["platform_v1"].validate(legacy_lowest)

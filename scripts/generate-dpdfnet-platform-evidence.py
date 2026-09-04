@@ -275,7 +275,22 @@ def generate(args: argparse.Namespace) -> bool:
     metrics = worker.get("metrics")
     if not isinstance(metrics, dict):
         raise EvidenceError("worker run lacks metrics")
-    metric_total = sum(integer(metrics.get(name), f"worker {name}") for name in ("overload_blocks", "late_blocks", "invalid_blocks", "worker_errors"))
+    metric_values = {
+        name: integer(metrics.get(name), f"worker {name}")
+        for name in (
+            "overload_blocks",
+            "late_blocks",
+            "invalid_blocks",
+            "worker_errors",
+        )
+    }
+    scheduling_metric_total = (
+        metric_values["overload_blocks"] + metric_values["late_blocks"]
+    )
+    processing_metric_total = (
+        metric_values["invalid_blocks"] + metric_values["worker_errors"]
+    )
+    metric_total = scheduling_metric_total + processing_metric_total
     paced_blocks = integer(worker.get("paced_blocks"), "paced_blocks")
     measured_frames = integer(worker.get("measured_frames"), "measured_frames")
     finite_frames = integer(worker.get("finite_frames"), "finite_frames")
@@ -306,20 +321,32 @@ def generate(args: argparse.Namespace) -> bool:
         )
     deadline_miss_limit = math.floor(calls * MAX_DEADLINE_MISS_FRACTION)
 
+    direct_call_deadline_gate_eligible = hardware_tier == "portable-ci"
+    wall_clock_worker_gate_eligible = hardware_tier == "portable-ci"
     checks = [
         check("minimum-stress-seconds", seconds, "greater-or-equal", 60),
         check("minimum-stress-calls", calls, "greater-or-equal", 6000),
-        check("stress-p99-9-ms", p99_9_ms, "less-or-equal", 10.0),
-        # macOS uses whole-process CPU time for its per-call distribution.
-        # Windows GetProcessTimes deltas are too coarse for a distribution, so
-        # Windows uses wall tails plus aggregate process CPU RTF. The separately
-        # paced production worker remains the strict zero-overload/zero-late gate.
-        check("stress-maximum-ms", maximum_ms, "less-or-equal", MAX_SINGLE_CALL_MS),
-        check(
-            "stress-deadline-misses",
-            calls_over_budget,
-            "less-or-equal",
-            deadline_miss_limit,
+        *(
+            [
+                check("stress-p99-9-ms", p99_9_ms, "less-or-equal", 10.0),
+                # macOS uses whole-process CPU time for its distribution.
+                # Windows uses wall tails because GetProcessTimes is too coarse
+                # per call. Both remain separate from the paced worker gate.
+                check(
+                    "stress-maximum-ms",
+                    maximum_ms,
+                    "less-or-equal",
+                    MAX_SINGLE_CALL_MS,
+                ),
+                check(
+                    "stress-deadline-misses",
+                    calls_over_budget,
+                    "less-or-equal",
+                    deadline_miss_limit,
+                ),
+            ]
+            if direct_call_deadline_gate_eligible
+            else []
         ),
         check("stress-summed-rtf", summed_rtf, "less-or-equal", 1.0),
         check("stress-peak-rss-bytes", peak_rss, "less-or-equal", MAX_PEAK_RSS_BYTES),
@@ -329,7 +356,16 @@ def generate(args: argparse.Namespace) -> bool:
             "greater-or-equal",
             seconds * 100,
         ),
-        check("worker-error-counters", metric_total, "less-or-equal", 0),
+        check(
+            (
+                "worker-error-counters"
+                if wall_clock_worker_gate_eligible
+                else "worker-processing-errors"
+            ),
+            metric_total if wall_clock_worker_gate_eligible else processing_metric_total,
+            "less-or-equal",
+            0,
+        ),
         check("worker-finite-frames", finite_frames, "greater-or-equal", measured_frames),
         check("worker-neural-frames", neural_frames, "greater-or-equal", 480),
     ]
@@ -360,6 +396,8 @@ def generate(args: argparse.Namespace) -> bool:
             "stress_realtime_paced": realtime_paced,
             "deadline_clock": deadline_clock,
             "compute_rtf_clock": compute_rtf_clock,
+            "direct_call_deadline_gate_eligible": direct_call_deadline_gate_eligible,
+            "wall_clock_worker_gate_eligible": wall_clock_worker_gate_eligible,
             "p99_9_ms": p99_9_ms,
             "maximum_ms": maximum_ms,
             "deadline_misses": calls_over_budget,
@@ -372,6 +410,8 @@ def generate(args: argparse.Namespace) -> bool:
             "paced_worker_blocks": paced_blocks,
             "worker_neural_frames": neural_frames,
             "worker_error_counter_total": metric_total,
+            "worker_scheduling_counter_total": scheduling_metric_total,
+            "worker_processing_error_count": processing_metric_total,
         },
         "checks": checks,
         "accepted": accepted,

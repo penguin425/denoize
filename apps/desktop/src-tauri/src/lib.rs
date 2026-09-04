@@ -23,8 +23,9 @@ use denoize::{
     ResourceLimits, ResourcePermit, ResourceRequest, SgmseProfile, SignedExecutionReceipt,
     StreamEncodeLimits, StreamEncodeSpec, StreamPcmSpool, StreamingBackendSession,
     WatchCycleReport, WatchFolder, WatchFolderConfig, WatchFolderJob, WatchProcessError,
-    DAW_LATENCY_POLICY, DAW_PLUGIN_ID, NEURAL_DAW_LATENCY_POLICY, NEURAL_DAW_MODEL_ID,
-    NEURAL_DAW_MODEL_SHA256, NEURAL_DAW_PLUGIN_ID,
+    DAW_LATENCY_POLICY, DAW_PLUGIN_ID, NEURAL_DAW_BLOCK_POOL_SIZE, NEURAL_DAW_LATENCY_POLICY,
+    NEURAL_DAW_MODEL_ID, NEURAL_DAW_MODEL_SHA256, NEURAL_DAW_PLUGIN_ID,
+    NEURAL_DAW_QUEUE_BLOCKS,
 };
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -5472,8 +5473,8 @@ struct NeuralDawPluginInfo {
     port_configurations: [&'static str; 2],
     reference_port: &'static str,
     sample_formats: [&'static str; 2],
-    queue_blocks: u32,
-    block_pool: u32,
+    queue_blocks: usize,
+    block_pool: usize,
     overload_fallbacks: [&'static str; 3],
     realtime_allocations: u32,
 }
@@ -5535,8 +5536,8 @@ fn neural_daw_plugin_info(sample_rate: f64) -> DesktopResult<NeuralDawPluginInfo
         port_configurations: ["mono", "stereo"],
         reference_port: "reserved-independent-input",
         sample_formats: ["f32", "f64"],
-        queue_blocks: 16,
-        block_pool: 40,
+        queue_blocks: NEURAL_DAW_QUEUE_BLOCKS,
+        block_pool: NEURAL_DAW_BLOCK_POOL_SIZE,
         overload_fallbacks: ["delayed-dry", "last-safe-gain", "silence"],
         realtime_allocations: 0,
     })

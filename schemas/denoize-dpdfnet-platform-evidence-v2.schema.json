@@ -38,13 +38,15 @@
     "measurement": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["stress_seconds", "stress_calls", "stress_realtime_paced", "deadline_clock", "compute_rtf_clock", "p99_9_ms", "maximum_ms", "deadline_misses", "summed_compute_rtf", "wall_p99_9_ms", "wall_maximum_ms", "wall_deadline_misses", "wall_summed_compute_rtf", "peak_rss_bytes", "paced_worker_blocks", "worker_neural_frames", "worker_error_counter_total"],
+      "required": ["stress_seconds", "stress_calls", "stress_realtime_paced", "deadline_clock", "compute_rtf_clock", "direct_call_deadline_gate_eligible", "wall_clock_worker_gate_eligible", "p99_9_ms", "maximum_ms", "deadline_misses", "summed_compute_rtf", "wall_p99_9_ms", "wall_maximum_ms", "wall_deadline_misses", "wall_summed_compute_rtf", "peak_rss_bytes", "paced_worker_blocks", "worker_neural_frames", "worker_error_counter_total", "worker_scheduling_counter_total", "worker_processing_error_count"],
       "properties": {
         "stress_seconds": { "type": "integer", "minimum": 1, "maximum": 3600 },
         "stress_calls": { "type": "integer", "minimum": 100, "maximum": 360000 },
         "stress_realtime_paced": { "const": true },
         "deadline_clock": { "enum": ["monotonic-wall", "process-cpu"] },
         "compute_rtf_clock": { "enum": ["monotonic-wall", "process-cpu"] },
+        "direct_call_deadline_gate_eligible": { "type": "boolean" },
+        "wall_clock_worker_gate_eligible": { "type": "boolean" },
         "p99_9_ms": { "type": "number", "minimum": 0, "maximum": 10000 },
         "maximum_ms": { "type": "number", "minimum": 0, "maximum": 10000 },
         "deadline_misses": { "type": "integer", "minimum": 0, "maximum": 360000 },
@@ -56,10 +58,12 @@
         "peak_rss_bytes": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
         "paced_worker_blocks": { "type": "integer", "minimum": 1, "maximum": 10000000 },
         "worker_neural_frames": { "type": "integer", "minimum": 0, "maximum": 4800000000 },
-        "worker_error_counter_total": { "type": "integer", "minimum": 0, "maximum": 40000000 }
+        "worker_error_counter_total": { "type": "integer", "minimum": 0, "maximum": 40000000 },
+        "worker_scheduling_counter_total": { "type": "integer", "minimum": 0, "maximum": 20000000 },
+        "worker_processing_error_count": { "type": "integer", "minimum": 0, "maximum": 20000000 }
       }
     },
-    "checks": { "type": "array", "minItems": 11, "maxItems": 11, "items": { "$ref": "#/$defs/check" } },
+    "checks": { "type": "array", "minItems": 8, "maxItems": 11, "items": { "$ref": "#/$defs/check" } },
     "accepted": { "type": "boolean" }
   },
   "$defs": {

@@ -53,8 +53,10 @@ gates are in the [issue #221 evaluation](dpdfnet-gtcrn-poc.md).
 ## Scheduling contract
 
 At activation each neural descriptor fixes the finite host sample rate,
-mono/stereo layout, 10 ms scheduler block, 16-block input and result queues, 40
-preallocated audio blocks, model profile, and reported latency. The latency is:
+mono/stereo layout, 10 ms scheduler block, 24-block input and result queues, 56
+preallocated audio blocks, model profile, and reported latency. The queues span
+the complete declared latency so a recoverable scheduling pause cannot force a
+stream discontinuity before that deadline. The latency is:
 
 ```text
 chunk_frames   = ceil(sample_rate * 0.010)

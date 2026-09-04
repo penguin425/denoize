@@ -22,6 +22,8 @@ pub const NEURAL_HQ_DAW_MODEL_SHA256: &str =
     "7f0575a5cec0ba4ffd8f8bd657e06d007e4ccdd955d76faab922b9d3291dc14b";
 pub const NEURAL_DAW_CHUNK_MILLIS: u32 = 10;
 pub const NEURAL_DAW_LATENCY_CHUNKS: u32 = 24;
+pub const NEURAL_DAW_QUEUE_BLOCKS: usize = NEURAL_DAW_LATENCY_CHUNKS as usize;
+pub const NEURAL_DAW_BLOCK_POOL_SIZE: usize = NEURAL_DAW_QUEUE_BLOCKS * 2 + 8;
 pub const NEURAL_DAW_LATENCY_POLICY: &str = "fixed-24x10ms-worker-v1";
 pub const NEURAL_DAW_MAX_SAMPLE_RATE: u32 = crate::daw::DAW_MAX_SAMPLE_RATE;
 
@@ -1001,6 +1003,8 @@ mod tests {
 
     #[test]
     fn latency_is_a_closed_finite_rate_contract() {
+        assert_eq!(NEURAL_DAW_QUEUE_BLOCKS, NEURAL_DAW_LATENCY_CHUNKS as usize);
+        assert_eq!(NEURAL_DAW_BLOCK_POOL_SIZE, 56);
         assert_eq!(neural_daw_chunk_frames(44_100.0).unwrap(), 441);
         assert_eq!(neural_daw_latency_frames(44_100.0).unwrap(), 10_584);
         assert_eq!(neural_daw_latency_frames(48_000.0).unwrap(), 11_520);

@@ -144,8 +144,8 @@ Stage 28 first establishes one measurable deployment reference rather than
 claiming several wrappers at once. The v0.76.0 bundle exposes
 `org.penguin425.denoize.neural` beside the unchanged DSP effect, verifies the
 exact managed `gtcrn-dns3` graph before activation, and prepares/runs it on one
-permanent worker. The host callback owns only a preallocated 40-block pool,
-bounded 16-block lock-free queues, delayed-dry/last-safe-gain/silence fallback,
+permanent worker. The host callback owns only a preallocated 56-block pool,
+bounded 24-block lock-free queues, delayed-dry/last-safe-gain/silence fallback,
 and sample-accurate bypass/mix/gain selection. Its public latency is twenty-four
 ceil-rounded 10 ms chunks for every finite CLAP rate, including fractional
 rates. Absolute frame identity and reset generation reject late cross-session

@@ -266,7 +266,7 @@
         "latency_policy": { "const": "fixed-24x10ms-worker-v1" },
         "latency_frames": { "type": "integer", "minimum": 1 },
         "latency_millis": { "type": "number", "exclusiveMinimum": 0 },
-        "queue_blocks": { "const": 16 },
+        "queue_blocks": { "const": 24 },
         "overload_fallbacks": {
           "const": ["delayed-dry", "last-safe-gain", "silence"]
         },

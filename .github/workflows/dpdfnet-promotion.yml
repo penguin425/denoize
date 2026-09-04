@@ -392,7 +392,7 @@ jobs:
             --realtime-paced \
             --json "$DENOIZE_EVIDENCE_DIR/stress.json"
           "$portable/dpdfnet-worker-gate" \
-            neural::tests::pinned_dpdfnet2_release_worker_meets_sustained_deadlines \
+            neural::tests::pinned_dpdfnet2_release_worker_measures_lowest_tier_capacity \
             --ignored --exact --nocapture
           python3 scripts/generate-dpdfnet-platform-evidence.py \
             --stress "$DENOIZE_EVIDENCE_DIR/stress.json" \

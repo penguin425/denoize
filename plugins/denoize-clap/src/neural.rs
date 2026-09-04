@@ -17,10 +17,10 @@ use clack_plugin::stream::{InputStream, OutputStream};
 use crossbeam_queue::ArrayQueue;
 use denoize::{
     AcceleratorRuntime, Backend, BackendOptions, ChannelMode, DenoiserConfig, GtcrnModel,
-    NEURAL_DAW_LATENCY_CHUNKS, NEURAL_DAW_MAX_SAMPLE_RATE, NEURAL_DAW_MODEL_ID,
-    NEURAL_DAW_MODEL_SHA256, NEURAL_DAW_PLUGIN_ID, NeuralDawModel,
-    NeuralDawOverloadFallback as OverloadFallback, NeuralDawParameters as NeuralParameters,
-    NeuralDawPortConfiguration as NeuralPortConfiguration,
+    NEURAL_DAW_BLOCK_POOL_SIZE, NEURAL_DAW_LATENCY_CHUNKS, NEURAL_DAW_MAX_SAMPLE_RATE,
+    NEURAL_DAW_MODEL_ID, NEURAL_DAW_MODEL_SHA256, NEURAL_DAW_PLUGIN_ID, NEURAL_DAW_QUEUE_BLOCKS,
+    NeuralDawModel, NeuralDawOverloadFallback as OverloadFallback,
+    NeuralDawParameters as NeuralParameters, NeuralDawPortConfiguration as NeuralPortConfiguration,
     NeuralDawSessionState as NeuralSessionState, OnnxModelConfig, StreamingBackendSession,
     neural_daw_chunk_frames, select_accelerator_for_options,
 };
@@ -44,8 +44,11 @@ pub(crate) const NEURAL_HQ_PLUGIN_ID: &str = NEURAL_HQ_DAW_PLUGIN_ID;
 const STATE_LIMIT_BYTES: u64 = 64 * 1024;
 const MODEL_ID: &str = NEURAL_DAW_MODEL_ID;
 const LATENCY_CHUNKS: u32 = NEURAL_DAW_LATENCY_CHUNKS;
-const QUEUE_BLOCKS: usize = 16;
-const BLOCK_POOL_SIZE: usize = 40;
+// Keep a complete declared-latency window available to the worker. A shorter
+// input queue can turn a recoverable host scheduling pause into a dropped
+// block and recurrent-state discontinuity before the 240 ms deadline expires.
+const QUEUE_BLOCKS: usize = NEURAL_DAW_QUEUE_BLOCKS;
+const BLOCK_POOL_SIZE: usize = NEURAL_DAW_BLOCK_POOL_SIZE;
 const WORKER_WARMUP_EXTRA_BLOCKS: usize = QUEUE_BLOCKS + 8;
 const WORKER_POLL: Duration = Duration::from_micros(100);
 const MAX_SAMPLE_RATE: u32 = NEURAL_DAW_MAX_SAMPLE_RATE;
@@ -1045,6 +1048,7 @@ struct AudioBlock {
 struct ProcessedBlock {
     block: AudioBlock,
     valid: bool,
+    invalid_output: bool,
 }
 
 trait BlockProcessor: Send {
@@ -1634,7 +1638,11 @@ impl<'a> NeuralEngine<'a> {
             .is_some_and(|result| result.block.start_frame == due)
         {
             self.playback = self.ready.pop_front();
-            if self.playback.as_ref().is_some_and(|result| !result.valid) {
+            if self
+                .playback
+                .as_ref()
+                .is_some_and(|result| result.invalid_output)
+            {
                 self.metrics.invalid_blocks.fetch_add(1, Ordering::Relaxed);
             }
         } else {
@@ -1855,6 +1863,7 @@ fn worker_loop(
                     completed.push_back(ProcessedBlock {
                         block: pending_block,
                         valid: false,
+                        invalid_output: false,
                     });
                 }
                 failed = if let Err(error) = processor.reset() {
@@ -1870,6 +1879,7 @@ fn worker_loop(
                 completed.push_back(ProcessedBlock {
                     block,
                     valid: false,
+                    invalid_output: false,
                 });
                 return cycle_failure;
             }
@@ -1891,11 +1901,13 @@ fn worker_loop(
                     completed.push_back(ProcessedBlock {
                         block,
                         valid: false,
+                        invalid_output: false,
                     });
                     while let Some(pending_block) = pending.pop_front() {
                         completed.push_back(ProcessedBlock {
                             block: pending_block,
                             valid: false,
+                            invalid_output: false,
                         });
                     }
                     ready.iter_mut().for_each(VecDeque::clear);
@@ -1967,7 +1979,11 @@ fn complete_ready_blocks(
                 };
             }
         }
-        completed.push_back(ProcessedBlock { block, valid });
+        completed.push_back(ProcessedBlock {
+            block,
+            valid,
+            invalid_output: !valid,
+        });
     }
 }
 
@@ -2102,6 +2118,54 @@ mod tests {
         .unwrap();
         hq.validate_for_model(NeuralDawModel::Dpdfnet2).unwrap();
         assert!(hq.validate_for_model(NeuralDawModel::Gtcrn).is_err());
+    }
+
+    #[test]
+    fn worker_queues_cover_the_declared_latency_window() {
+        assert_eq!(QUEUE_BLOCKS, LATENCY_CHUNKS as usize);
+        assert_eq!(BLOCK_POOL_SIZE, QUEUE_BLOCKS * 2 + 8);
+    }
+
+    #[test]
+    fn lowest_tier_worker_gate_relaxes_only_scheduling_counters() {
+        let scheduling_only = WorkerMetrics {
+            overload_blocks: 3,
+            late_blocks: 2,
+            ..WorkerMetrics::default()
+        };
+        assert!(worker_metrics_pass(scheduling_only, false));
+        assert!(!worker_metrics_pass(scheduling_only, true));
+        assert!(!worker_metrics_pass(
+            WorkerMetrics {
+                invalid_blocks: 1,
+                ..WorkerMetrics::default()
+            },
+            false,
+        ));
+        assert!(!worker_metrics_pass(
+            WorkerMetrics {
+                worker_errors: 1,
+                ..WorkerMetrics::default()
+            },
+            false,
+        ));
+    }
+
+    #[test]
+    fn unsafe_worker_output_is_distinct_from_a_scheduling_fallback() {
+        let mut pending = VecDeque::from([AudioBlock {
+            generation: 1,
+            start_frame: 0,
+            frames: 1,
+            samples: vec![0.0].into_boxed_slice(),
+        }]);
+        let mut completed = VecDeque::new();
+        let mut ready = [VecDeque::from([MAX_OUTPUT_PEAK + 1.0])];
+        complete_ready_blocks(&mut pending, &mut completed, &mut ready, 1);
+
+        let result = completed.pop_front().unwrap();
+        assert!(!result.valid);
+        assert!(result.invalid_output);
     }
 
     #[test]
@@ -2465,17 +2529,24 @@ mod tests {
     #[test]
     #[ignore = "requires the pinned managed GTCRN model and cargo test --release"]
     fn pinned_gtcrn_release_worker_meets_sustained_deadlines() {
-        assert_pinned_release_worker(NeuralDawModel::Gtcrn);
+        assert_pinned_release_worker(NeuralDawModel::Gtcrn, true);
     }
 
     #[test]
     #[ignore = "requires the pinned managed DPDFNet model and cargo test --release"]
     #[cfg(feature = "experimental-dpdfnet-hq")]
     fn pinned_dpdfnet2_release_worker_meets_sustained_deadlines() {
-        assert_pinned_release_worker(NeuralDawModel::Dpdfnet2);
+        assert_pinned_release_worker(NeuralDawModel::Dpdfnet2, true);
     }
 
-    fn assert_pinned_release_worker(model: NeuralDawModel) {
+    #[test]
+    #[ignore = "requires the pinned managed DPDFNet model and cargo test --release"]
+    #[cfg(feature = "experimental-dpdfnet-hq")]
+    fn pinned_dpdfnet2_release_worker_measures_lowest_tier_capacity() {
+        assert_pinned_release_worker(NeuralDawModel::Dpdfnet2, false);
+    }
+
+    fn assert_pinned_release_worker(model: NeuralDawModel, require_zero_scheduling_counters: bool) {
         assert!(
             !cfg!(debug_assertions),
             "the sustained neural deadline gate must exercise the release profile"
@@ -2551,6 +2622,20 @@ mod tests {
             }
         }
         let measurement_wall_seconds = measurement_started.elapsed().as_secs_f64();
+        let worker_metrics = shared.worker_metrics();
+        // Preserve the complete run even when a following gate assertion
+        // fails, so rejected CI artifacts identify the actual counter rather
+        // than stopping at the first assertion without worker evidence.
+        write_worker_evidence(
+            model,
+            &engine,
+            frames,
+            finite,
+            neural_frames,
+            paced_blocks,
+            measurement_wall_seconds,
+            shared,
+        );
         assert_eq!(finite, frames);
         assert!(
             neural_frames >= engine.chunk_frames,
@@ -2563,20 +2648,16 @@ mod tests {
             engine.output_queue.len(),
             engine.ready.len(),
         );
-        assert_eq!(shared.worker_errors.load(Ordering::Relaxed), 0);
-        assert_eq!(shared.invalid_blocks.load(Ordering::Relaxed), 0);
-        assert_eq!(shared.overload_blocks.load(Ordering::Relaxed), 0);
-        assert_eq!(shared.late_blocks.load(Ordering::Relaxed), 0);
-        write_worker_evidence(
-            model,
-            &engine,
-            frames,
-            finite,
-            neural_frames,
-            paced_blocks,
-            measurement_wall_seconds,
-            shared,
+        assert!(
+            worker_metrics_pass(worker_metrics, require_zero_scheduling_counters),
+            "worker metrics did not pass this tier: {worker_metrics:?}"
         );
+    }
+
+    fn worker_metrics_pass(metrics: WorkerMetrics, require_zero_scheduling_counters: bool) -> bool {
+        metrics.worker_errors == 0
+            && metrics.invalid_blocks == 0
+            && (!require_zero_scheduling_counters || metrics == WorkerMetrics::default())
     }
 
     fn write_worker_evidence(
