@@ -250,6 +250,28 @@ Raw result digests from this run were:
 - matrix JSON: `75964595877130c906260fe00fed005d0e1a8ffa4011007eee49f3f441710566`
 - ViSQOL JSON: `fb4400ee4bd36f07177bbbd12f4f6499818cdd8ef1ff82792002ceb5fc437986`
 
+If the same fixture and model set is rerun from a later source commit, machine
+timings and local paths make the raw matrix digest change. Verify that all
+deterministic fields remain identical before reusing a blinded protocol that
+binds the earlier matrix:
+
+```console
+python3 scripts/verify-dpdfnet-objective-equivalence.py \
+  --reference-matrix old/matrix-result.json \
+  --reference-summary old/summary.json \
+  --candidate-matrix new/matrix-result.json \
+  --candidate-summary new/summary.json \
+  --output objective-equivalence.json
+```
+
+The verifier excludes only the fixture path, logical CPU count, model paths and
+load times, and per-case process time/RTF. Any fixture, model identity, case,
+audio-quality result, or other field difference is rejected. When the listening
+result and candidate summary bind different raw matrix digests,
+`generate-dpdfnet-promotion-evidence.py` requires this record through
+`--objective-equivalence`; it rejects the option when the matrices are already
+byte-identical.
+
 The formal paired-preference bundle contains twelve core trials and four
 hidden repeats across recorded noise, babble, source preservation, and
 synthetic noise. A secret HMAC key randomizes opaque trial IDs, A/B assignment,

@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-dpdfnet-objective-equivalence-v1.schema.json",
+  "title": "denoize DPDFNet objective-matrix equivalence v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "schema_version", "reference", "candidate", "fixture_fingerprint", "models", "case_count", "canonicalization", "equivalent"],
+  "properties": {
+    "schema": { "const": "denoize-dpdfnet-objective-equivalence-v1" },
+    "schema_version": { "const": 1 },
+    "reference": { "$ref": "#/$defs/binding" },
+    "candidate": { "$ref": "#/$defs/binding" },
+    "fixture_fingerprint": { "$ref": "#/$defs/sha256" },
+    "models": {
+      "const": {
+        "dpdfnet2-48khz-hr": "7f0575a5cec0ba4ffd8f8bd657e06d007e4ccdd955d76faab922b9d3291dc14b",
+        "dpdfnet8-48khz-hr": "7b3afbb260a08fe9af3d16e3bda992971be1e7e951d1dee7c2d235f5c43f5631",
+        "gtcrn-dns3": "b4718df6228e7bdf1a8a435cf98f838636eb2fd331acabf86ba87c5192ebcb87"
+      }
+    },
+    "case_count": { "type": "integer", "minimum": 1, "maximum": 1000000 },
+    "canonicalization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "excluded_fields", "sha256"],
+      "properties": {
+        "algorithm": { "const": "denoize-dpdfnet-objective-deterministic-v1" },
+        "excluded_fields": {
+          "const": [
+            "fixture_manifest",
+            "environment.logical_parallelism",
+            "models.*.path",
+            "models.*.load_ms",
+            "cases.*.{dpdfnet2_48khz_hr,dpdfnet8_48khz_hr,gtcrn}.process_ms",
+            "cases.*.{dpdfnet2_48khz_hr,dpdfnet8_48khz_hr,gtcrn}.rtf"
+          ]
+        },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "equivalent": { "const": true }
+  },
+  "$defs": {
+    "commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "jsonFile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "size_bytes", "sha256"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "maxLength": 255, "pattern": "^[^/\\\\]+\\.json$" },
+        "size_bytes": { "type": "integer", "minimum": 1, "maximum": 33554432 },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_commit", "matrix", "summary"],
+      "properties": {
+        "source_commit": { "$ref": "#/$defs/commit" },
+        "matrix": { "$ref": "#/$defs/jsonFile" },
+        "summary": { "$ref": "#/$defs/jsonFile" }
+      }
+    }
+  }
+}

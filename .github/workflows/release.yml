@@ -167,6 +167,7 @@ jobs:
           python3 -c 'compile(open("scripts/score-dpdfnet-blind-listening.py", encoding="utf-8").read(), "scripts/score-dpdfnet-blind-listening.py", "exec")'
           python3 -c 'compile(open("scripts/generate-dpdfnet-platform-evidence.py", encoding="utf-8").read(), "scripts/generate-dpdfnet-platform-evidence.py", "exec")'
           python3 -c 'compile(open("scripts/generate-dpdfnet-promotion-evidence.py", encoding="utf-8").read(), "scripts/generate-dpdfnet-promotion-evidence.py", "exec")'
+          python3 -c 'compile(open("scripts/verify-dpdfnet-objective-equivalence.py", encoding="utf-8").read(), "scripts/verify-dpdfnet-objective-equivalence.py", "exec")'
           python3 -c 'compile(open("scripts/fetch-dpdfnet-reporter-evidence.py", encoding="utf-8").read(), "scripts/fetch-dpdfnet-reporter-evidence.py", "exec")'
           python3 -c 'compile(open("scripts/test-dpdfnet-promotion-evidence.py", encoding="utf-8").read(), "scripts/test-dpdfnet-promotion-evidence.py", "exec")'
           python3 -c 'compile(open("scripts/test-target-speaker-schemas.py", encoding="utf-8").read(), "scripts/test-target-speaker-schemas.py", "exec")'

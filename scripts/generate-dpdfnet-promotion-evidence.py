@@ -18,8 +18,10 @@ from typing import Any
 
 
 MODEL_SHA256 = "7f0575a5cec0ba4ffd8f8bd657e06d007e4ccdd955d76faab922b9d3291dc14b"
+DPDFNET8_SHA256 = "7b3afbb260a08fe9af3d16e3bda992971be1e7e951d1dee7c2d235f5c43f5631"
 GTCRN_SHA256 = "b4718df6228e7bdf1a8a435cf98f838636eb2fd331acabf86ba87c5192ebcb87"
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 MAX_JSON_BYTES = 32 * 1024 * 1024
 MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
 SIGNER_WORKFLOW = "penguin425/denoize/.github/workflows/dpdfnet-promotion.yml"
@@ -32,6 +34,19 @@ REPORTER_V2_CHECKS = {
     "audible-continuity",
     "nvda-osara",
     "no-host-plugin-crashes",
+}
+OBJECTIVE_EQUIVALENCE_FIELDS = [
+    "fixture_manifest",
+    "environment.logical_parallelism",
+    "models.*.path",
+    "models.*.load_ms",
+    "cases.*.{dpdfnet2_48khz_hr,dpdfnet8_48khz_hr,gtcrn}.process_ms",
+    "cases.*.{dpdfnet2_48khz_hr,dpdfnet8_48khz_hr,gtcrn}.rtf",
+]
+OBJECTIVE_MODELS = {
+    "dpdfnet2-48khz-hr": MODEL_SHA256,
+    "dpdfnet8-48khz-hr": DPDFNET8_SHA256,
+    "gtcrn-dns3": GTCRN_SHA256,
 }
 
 
@@ -79,6 +94,152 @@ def nested(document: dict[str, Any], path: str) -> Any:
             raise PromotionError(f"evidence is missing {path}")
         value = value[component]
     return value
+
+
+def exact_keys(value: Any, expected: set[str], label: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != expected:
+        raise PromotionError(f"{label} has an unsupported field set")
+    return value
+
+
+def validate_json_file_record(value: Any, label: str) -> dict[str, Any]:
+    record = exact_keys(value, {"name", "size_bytes", "sha256"}, label)
+    name = record["name"]
+    size = record["size_bytes"]
+    digest = record["sha256"]
+    if (
+        not isinstance(name, str)
+        or not name
+        or "/" in name
+        or "\\" in name
+        or not name.endswith(".json")
+    ):
+        raise PromotionError(f"{label} has an invalid file name")
+    if (
+        isinstance(size, bool)
+        or not isinstance(size, int)
+        or not 1 <= size <= MAX_JSON_BYTES
+    ):
+        raise PromotionError(f"{label} has an invalid file size")
+    if not isinstance(digest, str) or not SHA256_RE.fullmatch(digest):
+        raise PromotionError(f"{label} has an invalid SHA-256")
+    return record
+
+
+def objective_equivalence_record(
+    summary: dict[str, Any],
+    summary_path: Path,
+    summary_payload: bytes,
+    listening: dict[str, Any],
+    equivalence_path: Path | None,
+    source_commit: str,
+) -> dict[str, Any] | None:
+    candidate_matrix_sha256 = summary.get("matrix_result_sha256")
+    reference_matrix_sha256 = listening.get("source_matrix_sha256")
+    if (
+        not isinstance(candidate_matrix_sha256, str)
+        or not SHA256_RE.fullmatch(candidate_matrix_sha256)
+        or not isinstance(reference_matrix_sha256, str)
+        or not SHA256_RE.fullmatch(reference_matrix_sha256)
+    ):
+        raise PromotionError("objective and listening matrix digests must be SHA-256")
+    if candidate_matrix_sha256 == reference_matrix_sha256:
+        if equivalence_path is not None:
+            raise PromotionError(
+                "objective equivalence must be omitted for byte-identical matrices"
+            )
+        return None
+    if equivalence_path is None:
+        raise PromotionError(
+            "objective evaluation and listening protocol bind different matrices without equivalence evidence"
+        )
+
+    document, payload = load(equivalence_path, "objective equivalence")
+    expected_top = {
+        "schema",
+        "schema_version",
+        "reference",
+        "candidate",
+        "fixture_fingerprint",
+        "models",
+        "case_count",
+        "canonicalization",
+        "equivalent",
+    }
+    exact_keys(document, expected_top, "objective equivalence")
+    if (
+        document.get("schema") != "denoize-dpdfnet-objective-equivalence-v1"
+        or document.get("schema_version") != 1
+        or document.get("equivalent") is not True
+    ):
+        raise PromotionError("unsupported objective equivalence contract")
+    if document.get("models") != OBJECTIVE_MODELS:
+        raise PromotionError("objective equivalence binds the wrong model identities")
+    if summary.get("models") != OBJECTIVE_MODELS:
+        raise PromotionError("objective evaluation has the wrong equivalence model set")
+    fixture_fingerprint = summary.get("fixture_fingerprint")
+    if (
+        not isinstance(fixture_fingerprint, str)
+        or not SHA256_RE.fullmatch(fixture_fingerprint)
+        or document.get("fixture_fingerprint") != fixture_fingerprint
+    ):
+        raise PromotionError("objective equivalence binds the wrong fixture fingerprint")
+    case_count = nested(summary, "quality.case_counts.total")
+    if (
+        isinstance(case_count, bool)
+        or not isinstance(case_count, int)
+        or document.get("case_count") != case_count
+    ):
+        raise PromotionError("objective equivalence binds the wrong case count")
+
+    canonicalization = exact_keys(
+        document.get("canonicalization"),
+        {"algorithm", "excluded_fields", "sha256"},
+        "objective equivalence canonicalization",
+    )
+    if (
+        canonicalization.get("algorithm")
+        != "denoize-dpdfnet-objective-deterministic-v1"
+        or canonicalization.get("excluded_fields") != OBJECTIVE_EQUIVALENCE_FIELDS
+        or not isinstance(canonicalization.get("sha256"), str)
+        or not SHA256_RE.fullmatch(canonicalization["sha256"])
+    ):
+        raise PromotionError("objective equivalence canonicalization differs")
+
+    reference = exact_keys(
+        document.get("reference"),
+        {"source_commit", "matrix", "summary"},
+        "objective equivalence reference",
+    )
+    candidate = exact_keys(
+        document.get("candidate"),
+        {"source_commit", "matrix", "summary"},
+        "objective equivalence candidate",
+    )
+    reference_commit = reference.get("source_commit")
+    if not isinstance(reference_commit, str) or not COMMIT_RE.fullmatch(reference_commit):
+        raise PromotionError("objective equivalence has an invalid reference commit")
+    if candidate.get("source_commit") != source_commit:
+        raise PromotionError("objective equivalence binds a different candidate commit")
+    reference_matrix = validate_json_file_record(
+        reference.get("matrix"), "objective equivalence reference matrix"
+    )
+    validate_json_file_record(
+        reference.get("summary"), "objective equivalence reference summary"
+    )
+    candidate_matrix = validate_json_file_record(
+        candidate.get("matrix"), "objective equivalence candidate matrix"
+    )
+    candidate_summary = validate_json_file_record(
+        candidate.get("summary"), "objective equivalence candidate summary"
+    )
+    if reference_matrix["sha256"] != reference_matrix_sha256:
+        raise PromotionError("objective equivalence does not bind the listening matrix")
+    if candidate_matrix["sha256"] != candidate_matrix_sha256:
+        raise PromotionError("objective equivalence does not bind the candidate matrix")
+    if candidate_summary != file_record(summary_path, summary_payload):
+        raise PromotionError("objective equivalence does not bind the candidate summary")
+    return file_record(equivalence_path, payload)
 
 
 def verify_attestation(subject: Path, bundle: Path, source_commit: str) -> dict[str, Any]:
@@ -242,8 +403,14 @@ def generate(args: argparse.Namespace) -> bool:
     reporter, reporter_payload = load(args.reporter_evidence, "issue-reporter evidence")
     if listening.get("schema") != "denoize-dpdfnet-blind-listening-result-v1":
         raise PromotionError("unsupported blinded-listening result")
-    if listening.get("source_matrix_sha256") != summary.get("matrix_result_sha256"):
-        raise PromotionError("objective evaluation and listening protocol bind different matrices")
+    objective_equivalence = objective_equivalence_record(
+        summary,
+        args.evaluation_summary,
+        summary_payload,
+        listening,
+        getattr(args, "objective_equivalence", None),
+        source_commit,
+    )
     if automated.get("schema") != "denoize-dpdfnet-reaper-automated-evidence-v1" or automated.get("source_commit") != source_commit:
         raise PromotionError("automated REAPER evidence binds the wrong schema or source")
     if nested(reporter, "payload.source_commit") != source_commit:
@@ -447,6 +614,11 @@ def generate(args: argparse.Namespace) -> bool:
             "blinded_listening": file_record(args.listening_result, listening_payload),
             "automated_reaper": file_record(args.reaper_automated, automated_payload),
             "issue_reporter": file_record(args.reporter_evidence, reporter_payload),
+            **(
+                {"objective_equivalence": objective_equivalence}
+                if objective_equivalence is not None
+                else {}
+            ),
         },
         "artifact": {
             **archive,
@@ -495,6 +667,7 @@ def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser()
     result.add_argument("--source-commit", required=True)
     result.add_argument("--evaluation-summary", type=Path, required=True)
+    result.add_argument("--objective-equivalence", type=Path)
     result.add_argument("--listening-result", type=Path, required=True)
     result.add_argument("--platform-evidence", type=Path, nargs="+", required=True)
     result.add_argument("--platform-attestation", type=Path, nargs="+", required=True)
