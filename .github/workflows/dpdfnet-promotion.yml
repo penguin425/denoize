@@ -63,7 +63,7 @@ jobs:
             target: x86_64-unknown-linux-gnu
             binary: target/x86_64-unknown-linux-gnu/release/libdenoize_clap.so
             archive: tar.gz
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             binary: target/aarch64-apple-darwin/release/libdenoize_clap.dylib
             archive: tar.gz
@@ -199,7 +199,7 @@ jobs:
           if [[ "$RUNNER_OS" == macOS ]]; then
             expected_cycles=$((seconds * 100))
             grep -Fx \
-              "DENOIZE_MACOS_TIME_CONSTRAINT period_ns=10000000 computation_ns=9000000 constraint_ns=10000000" \
+              "DENOIZE_MACOS_TIME_CONSTRAINT period_ns=10000000 computation_ns=8000000 constraint_ns=10000000" \
               "$DENOIZE_EVIDENCE_DIR/stress-run.log"
             grep -Fx \
               "DENOIZE_MACOS_AUDIO_WORK_INTERVAL started_cycles=$expected_cycles finished_cycles=$expected_cycles start_failures=0 finish_failures=0" \

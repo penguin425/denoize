@@ -602,7 +602,7 @@ def composite_fixtures(
             "aarch64-apple-darwin",
             "aarch64",
             "portable-ci",
-            "macos-14",
+            "macos-15",
             3,
         ),
         (

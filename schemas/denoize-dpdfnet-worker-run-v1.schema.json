@@ -58,7 +58,7 @@
         "target": { "type": "string", "pattern": "^[A-Za-z0-9_.-]{3,128}$" },
         "cpu_model": { "type": "string", "minLength": 1, "maxLength": 256 },
         "hardware_tier": { "enum": ["portable-ci", "lowest-supported"] },
-        "runner_label": { "enum": ["ubuntu-24.04", "macos-14", "windows-2025", "ubuntu-slim"] }
+        "runner_label": { "enum": ["ubuntu-24.04", "macos-14", "macos-15", "windows-2025", "ubuntu-slim"] }
       }
     }
   }

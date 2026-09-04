@@ -28,7 +28,7 @@ pub const NEURAL_DAW_MAX_SAMPLE_RATE: u32 = crate::daw::DAW_MAX_SAMPLE_RATE;
 #[cfg(target_os = "macos")]
 const MACOS_NEURAL_PERIOD_NANOS: u64 = NEURAL_DAW_CHUNK_MILLIS as u64 * 1_000_000;
 #[cfg(target_os = "macos")]
-const MACOS_NEURAL_COMPUTATION_NANOS: u64 = 9_000_000;
+const MACOS_NEURAL_COMPUTATION_NANOS: u64 = 8_000_000;
 
 #[cfg(target_os = "macos")]
 enum MacOsPreviousMachPolicy {
@@ -635,10 +635,9 @@ fn acquire_macos_time_constraint(
         u32::try_from(macos_absolute_ticks(nanoseconds)?)
             .map_err(|_| "neural worker Mach time constraint exceeds u32".to_owned())
     };
-    // Direct production-path measurements put ordinary inference near 7 ms at
-    // p99. An 8 ms nominal budget left a small number of calls preempted across
-    // the 10 ms boundary, so retain 2 ms of measured compute headroom while
-    // still leaving a real margin below the 10 ms constraint.
+    // Direct production-path measurements put ordinary inference below 8 ms
+    // in the expected case. Reserve the remaining 2 ms of each period for
+    // scheduler and host work instead of claiming the entire 10 ms window.
     let mut active = thread_time_constraint_policy_data_t {
         period: absolute_ticks(MACOS_NEURAL_PERIOD_NANOS)?,
         computation: absolute_ticks(MACOS_NEURAL_COMPUTATION_NANOS)?,

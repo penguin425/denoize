@@ -105,7 +105,7 @@ rules and `request_exec` waits for completion.
 
 On Windows, the named worker joins the `Pro Audio` Multimedia Class Scheduler
 Service task at its critical relative priority. On macOS it combines
-a Mach time constraint that advertises 9 ms of nominal computation in each 10
+a Mach time constraint that advertises 8 ms of nominal computation in each 10
 ms period with an Audio Work Interval around each inference cycle. The Mach
 policy is established before joining the workgroup; XNU treats it as the
 thread's real-time scheduling mode rather than combining it with pthread QoS.

@@ -120,7 +120,7 @@ def generate(args: argparse.Namespace) -> bool:
     if hardware_tier == "portable-ci":
         expected_runner = {
             "linux": "ubuntu-24.04",
-            "macos": "macos-14",
+            "macos": "macos-15",
             "windows": "windows-2025",
         }[operating_system]
         if runner_label != expected_runner:
