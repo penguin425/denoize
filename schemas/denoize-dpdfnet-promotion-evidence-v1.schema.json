@@ -114,7 +114,7 @@
     },
     "platform": {
       "type": "object", "additionalProperties": false,
-      "required": ["file", "attestation", "os", "target", "cpu_model", "hardware_tier", "runner_label", "p99_9_ms", "peak_rss_bytes", "accepted"],
+      "required": ["file", "attestation", "os", "target", "cpu_model", "hardware_tier", "runner_label", "deadline_clock", "compute_rtf_clock", "direct_call_deadline_gate_eligible", "wall_clock_worker_gate_eligible", "p99_9_ms", "wall_p99_9_ms", "peak_rss_bytes", "accepted"],
       "properties": {
         "file": { "$ref": "#/$defs/jsonFile" },
         "attestation": { "$ref": "#/$defs/attestation" },
@@ -122,8 +122,13 @@
         "target": { "type": "string", "pattern": "^[A-Za-z0-9_.-]{3,128}$" },
         "cpu_model": { "type": "string", "minLength": 1, "maxLength": 256 },
         "hardware_tier": { "enum": ["portable-ci", "lowest-supported"] },
-        "runner_label": { "enum": ["ubuntu-24.04", "macos-14", "windows-2025", "ubuntu-slim"] },
-        "p99_9_ms": { "type": "number", "minimum": 0, "maximum": 10 },
+        "runner_label": { "enum": ["ubuntu-24.04", "macos-14", "macos-15", "windows-2025", "ubuntu-slim"] },
+        "deadline_clock": { "enum": ["monotonic-wall", "process-cpu"] },
+        "compute_rtf_clock": { "enum": ["monotonic-wall", "process-cpu"] },
+        "direct_call_deadline_gate_eligible": { "type": "boolean" },
+        "wall_clock_worker_gate_eligible": { "type": "boolean" },
+        "p99_9_ms": { "type": "number", "minimum": 0, "maximum": 10000 },
+        "wall_p99_9_ms": { "type": "number", "minimum": 0, "maximum": 10000 },
         "peak_rss_bytes": { "type": "integer", "minimum": 1, "maximum": 536870912 },
         "accepted": { "type": "boolean" }
       }

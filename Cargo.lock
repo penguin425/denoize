@@ -1106,6 +1106,7 @@ dependencies = [
  "kaldi-native-fbank",
  "libc",
  "lofty",
+ "mach2",
  "metal",
  "minisign",
  "minisign-verify",

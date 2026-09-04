@@ -31,8 +31,8 @@
       "additionalProperties": false,
       "required": ["overload_blocks", "late_blocks", "invalid_blocks", "worker_errors"],
       "properties": {
-        "overload_blocks": { "const": 0 },
-        "late_blocks": { "const": 0 },
+        "overload_blocks": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "late_blocks": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
         "invalid_blocks": { "const": 0 },
         "worker_errors": { "const": 0 }
       }
@@ -42,9 +42,9 @@
       "additionalProperties": false,
       "required": ["input", "output", "ready"],
       "properties": {
-        "input": { "type": "integer", "minimum": 0, "maximum": 40 },
-        "output": { "type": "integer", "minimum": 0, "maximum": 40 },
-        "ready": { "type": "integer", "minimum": 0, "maximum": 40 }
+        "input": { "type": "integer", "minimum": 0, "maximum": 56 },
+        "output": { "type": "integer", "minimum": 0, "maximum": 56 },
+        "ready": { "type": "integer", "minimum": 0, "maximum": 56 }
       }
     },
     "environment": {
@@ -58,8 +58,31 @@
         "target": { "type": "string", "pattern": "^[A-Za-z0-9_.-]{3,128}$" },
         "cpu_model": { "type": "string", "minLength": 1, "maxLength": 256 },
         "hardware_tier": { "enum": ["portable-ci", "lowest-supported"] },
-        "runner_label": { "enum": ["ubuntu-24.04", "macos-14", "windows-2025", "ubuntu-slim"] }
+        "runner_label": { "enum": ["ubuntu-24.04", "macos-14", "macos-15", "windows-2025", "ubuntu-slim"] }
       }
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "environment": {
+            "properties": { "hardware_tier": { "const": "portable-ci" } },
+            "required": ["hardware_tier"]
+          }
+        },
+        "required": ["environment"]
+      },
+      "then": {
+        "properties": {
+          "metrics": {
+            "properties": {
+              "overload_blocks": { "const": 0 },
+              "late_blocks": { "const": 0 }
+            }
+          }
+        }
+      }
+    }
+  ]
 }

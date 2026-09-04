@@ -63,7 +63,7 @@ jobs:
             target: x86_64-unknown-linux-gnu
             binary: target/x86_64-unknown-linux-gnu/release/libdenoize_clap.so
             archive: tar.gz
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             binary: target/aarch64-apple-darwin/release/libdenoize_clap.dylib
             archive: tar.gz
@@ -184,6 +184,7 @@ jobs:
       - name: Measure production DPDFNet DAW path
         shell: bash
         env:
+          DENOIZE_MACOS_SCHEDULING_EVIDENCE: "1"
           RAYON_NUM_THREADS: "1"
           OMP_NUM_THREADS: "1"
         run: |
@@ -192,12 +193,24 @@ jobs:
             --features dpdfnet,gtcrn --example dpdfnet_gtcrn_stress -- \
             --model dpdfnet-daw --model-path "$DPDFNET_MODEL" \
             --seconds "$seconds" --parallel 1 \
-            --json "$DENOIZE_EVIDENCE_DIR/stress.json"
+            --realtime-paced \
+            --json "$DENOIZE_EVIDENCE_DIR/stress.json" \
+            2>&1 | tee "$DENOIZE_EVIDENCE_DIR/stress-run.log"
+          if [[ "$RUNNER_OS" == macOS ]]; then
+            expected_cycles=$((seconds * 100))
+            grep -Fx \
+              "DENOIZE_MACOS_TIME_CONSTRAINT period_ns=10000000 computation_ns=8000000 constraint_ns=10000000" \
+              "$DENOIZE_EVIDENCE_DIR/stress-run.log"
+            grep -Fx \
+              "DENOIZE_MACOS_AUDIO_WORK_INTERVAL started_cycles=$expected_cycles finished_cycles=$expected_cycles start_failures=0 finish_failures=0" \
+              "$DENOIZE_EVIDENCE_DIR/stress-run.log"
+          fi
 
       - name: Exercise paced experimental CLAP worker
         shell: bash
         env:
           DENOIZE_NEURAL_WORKER_EVIDENCE: ${{ runner.temp }}/dpdfnet-evidence/worker.json
+          DENOIZE_NEURAL_WORKER_SECONDS: ${{ inputs.stress_seconds || '60' }}
           RAYON_NUM_THREADS: "1"
           OMP_NUM_THREADS: "1"
         run: |
@@ -367,6 +380,7 @@ jobs:
         shell: bash
         env:
           DENOIZE_NEURAL_WORKER_EVIDENCE: ${{ runner.temp }}/dpdfnet-lowest-supported/worker.json
+          DENOIZE_NEURAL_WORKER_SECONDS: ${{ inputs.stress_seconds || '60' }}
           RAYON_NUM_THREADS: "1"
           OMP_NUM_THREADS: "1"
         run: |
@@ -375,14 +389,25 @@ jobs:
           "$portable/dpdfnet-stress-gate" \
             --model dpdfnet-daw --model-path "$DPDFNET_MODEL" \
             --seconds "${{ inputs.stress_seconds || '60' }}" --parallel 1 \
+            --realtime-paced \
             --json "$DENOIZE_EVIDENCE_DIR/stress.json"
           "$portable/dpdfnet-worker-gate" \
-            neural::tests::pinned_dpdfnet2_release_worker_meets_sustained_deadlines \
+            neural::tests::pinned_dpdfnet2_release_worker_measures_lowest_tier_capacity \
             --ignored --exact --nocapture
           python3 scripts/generate-dpdfnet-platform-evidence.py \
             --stress "$DENOIZE_EVIDENCE_DIR/stress.json" \
             --worker "$DENOIZE_EVIDENCE_DIR/worker.json" \
             --output "$DENOIZE_EVIDENCE_DIR/platform.json"
+
+      - name: Preserve rejected lowest-supported diagnostics
+        if: failure()
+        # actions/upload-artifact v6.
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: dpdfnet-rejected-lowest-supported-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/dpdfnet-lowest-supported
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Attest lowest-supported measurement
         id: attest-lowest

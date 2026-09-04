@@ -32,7 +32,8 @@ SCHEMAS = {
     "worker": ROOT / "schemas/denoize-dpdfnet-worker-run-v1.schema.json",
     "clap_host": ROOT / "schemas/denoize-dpdfnet-clap-host-run-v1.schema.json",
     "clap_host_v2": ROOT / "schemas/denoize-dpdfnet-clap-host-run-v2.schema.json",
-    "platform": ROOT / "schemas/denoize-dpdfnet-platform-evidence-v1.schema.json",
+    "platform_v1": ROOT / "schemas/denoize-dpdfnet-platform-evidence-v1.schema.json",
+    "platform": ROOT / "schemas/denoize-dpdfnet-platform-evidence-v2.schema.json",
     "reaper": ROOT / "schemas/denoize-dpdfnet-reaper-automated-evidence-v1.schema.json",
     "reporter_v1": ROOT / "schemas/denoize-dpdfnet-reporter-evidence-v1.schema.json",
     "reporter_v2": ROOT / "schemas/denoize-dpdfnet-reporter-evidence-v2.schema.json",
@@ -138,6 +139,8 @@ def platform_fixture(root: Path) -> tuple[Path, Path]:
         "state_size": 56_436,
         "parallel_streams": 1,
         "requested_seconds_per_stream": 60,
+        "realtime_paced": True,
+        "measured_audio_seconds": 60.0,
         "calls": 6_000,
         "timing": {
             "p99_9_ms": 8.0,
@@ -178,11 +181,11 @@ def platform_fixture(root: Path) -> tuple[Path, Path]:
         "channels": 1,
         "chunk_frames": 480,
         "latency_frames": 11_520,
-        "paced_blocks": 100,
-        "measured_frames": 59_520,
-        "finite_frames": 59_520,
-        "neural_frames": 48_000,
-        "measurement_wall_seconds": 1.25,
+        "paced_blocks": 6_000,
+        "measured_frames": 2_891_520,
+        "finite_frames": 2_891_520,
+        "neural_frames": 2_880_000,
+        "measurement_wall_seconds": 60.25,
         "metrics": {
             "overload_blocks": 0,
             "late_blocks": 0,
@@ -600,7 +603,7 @@ def composite_fixtures(
             "aarch64-apple-darwin",
             "aarch64",
             "portable-ci",
-            "macos-14",
+            "macos-15",
             3,
         ),
         (
@@ -641,6 +644,36 @@ def composite_fixtures(
                 "logical_cpus": logical_cpus,
             }
         )
+        document["measurement"]["stress_realtime_paced"] = True
+        document["measurement"]["deadline_clock"] = (
+            "process-cpu" if operating_system == "macos" else "monotonic-wall"
+        )
+        document["measurement"]["compute_rtf_clock"] = (
+            "process-cpu"
+            if operating_system in {"macos", "windows"}
+            else "monotonic-wall"
+        )
+        document["measurement"]["direct_call_deadline_gate_eligible"] = False
+        document["measurement"]["wall_clock_worker_gate_eligible"] = (
+            tier == "portable-ci"
+        )
+        document["checks"] = [
+            check
+            for check in document["checks"]
+            if check["id"]
+            not in {
+                "stress-p99-9-ms",
+                "stress-maximum-ms",
+                "stress-deadline-misses",
+            }
+        ]
+        if tier == "lowest-supported":
+            worker_check = next(
+                check
+                for check in document["checks"]
+                if check["id"] == "worker-error-counters"
+            )
+            worker_check["id"] = "worker-processing-errors"
         validators["platform"].validate(document)
         path = root / f"platform-{index}.json"
         path.write_text(json.dumps(document) + "\n", encoding="utf-8")
@@ -895,7 +928,122 @@ def main() -> int:
         platform = json.loads(platform_result.read_text(encoding="utf-8"))
         validators["platform"].validate(platform)
         assert platform["accepted"] is True
-        assert len(platform["checks"]) == 11
+        assert len(platform["checks"]) == 8
+        assert (
+            platform["measurement"]["direct_call_deadline_gate_eligible"]
+            is False
+        )
+        assert platform["measurement"]["wall_clock_worker_gate_eligible"] is True
+        assert {
+            "stress-p99-9-ms",
+            "stress-maximum-ms",
+            "stress-deadline-misses",
+        }.isdisjoint(check["id"] for check in platform["checks"])
+
+        unpaced_stress = json.loads(stress_path.read_text(encoding="utf-8"))
+        unpaced_stress["realtime_paced"] = False
+        unpaced_stress_path = platform_root / "unpaced-stress.json"
+        unpaced_stress_path.write_text(
+            json.dumps(unpaced_stress) + "\n", encoding="utf-8"
+        )
+        unpaced_result = run(
+            [
+                sys.executable,
+                str(PLATFORM),
+                "--stress",
+                str(unpaced_stress_path),
+                "--worker",
+                str(worker_path),
+                "--output",
+                str(platform_root / "unpaced-platform.json"),
+            ],
+            success=False,
+        )
+        assert "promotion stress evidence must be real-time paced" in unpaced_result.stderr
+
+        fast_worker = json.loads(worker_path.read_text(encoding="utf-8"))
+        fast_worker["measurement_wall_seconds"] = 50.0
+        fast_worker_path = platform_root / "fast-worker.json"
+        fast_worker_path.write_text(
+            json.dumps(fast_worker) + "\n", encoding="utf-8"
+        )
+        fast_worker_result = run(
+            [
+                sys.executable,
+                str(PLATFORM),
+                "--stress",
+                str(stress_path),
+                "--worker",
+                str(fast_worker_path),
+                "--output",
+                str(platform_root / "fast-worker-platform.json"),
+            ],
+            success=False,
+        )
+        assert "completed too quickly" in fast_worker_result.stderr
+
+        slow_worker = json.loads(worker_path.read_text(encoding="utf-8"))
+        slow_worker["measurement_wall_seconds"] = 204.0
+        slow_worker_path = platform_root / "slow-worker.json"
+        slow_worker_path.write_text(
+            json.dumps(slow_worker) + "\n", encoding="utf-8"
+        )
+        slow_worker_result = run(
+            [
+                sys.executable,
+                str(PLATFORM),
+                "--stress",
+                str(stress_path),
+                "--worker",
+                str(slow_worker_path),
+                "--output",
+                str(platform_root / "slow-worker-platform.json"),
+            ],
+            success=False,
+        )
+        assert "completed too slowly" in slow_worker_result.stderr
+
+        short_worker = json.loads(worker_path.read_text(encoding="utf-8"))
+        short_worker["paced_blocks"] = 100
+        short_worker["measured_frames"] = 59_520
+        short_worker["finite_frames"] = 59_520
+        short_worker["neural_frames"] = 48_000
+        short_worker["measurement_wall_seconds"] = 1.25
+        short_worker_path = platform_root / "short-worker.json"
+        short_worker_path.write_text(
+            json.dumps(short_worker) + "\n", encoding="utf-8"
+        )
+        short_worker_platform_path = platform_root / "short-worker-platform.json"
+        run(
+            [
+                sys.executable,
+                str(PLATFORM),
+                "--stress",
+                str(stress_path),
+                "--worker",
+                str(short_worker_path),
+                "--output",
+                str(short_worker_platform_path),
+                "--allow-rejected",
+            ]
+        )
+        short_worker_platform = json.loads(
+            short_worker_platform_path.read_text(encoding="utf-8")
+        )
+        validators["platform"].validate(short_worker_platform)
+        assert short_worker_platform["accepted"] is False
+        short_worker_check = next(
+            check
+            for check in short_worker_platform["checks"]
+            if check["id"] == "minimum-paced-worker-blocks"
+        )
+        assert short_worker_check == {
+            "id": "minimum-paced-worker-blocks",
+            "observed": 100,
+            "operator": "greater-or-equal",
+            "limit": 6_000,
+            "passed": False,
+        }
 
         preempted_stress = json.loads(stress_path.read_text(encoding="utf-8"))
         preempted_stress["timing"].update(
@@ -928,9 +1076,310 @@ def main() -> int:
         )
         validators["platform"].validate(preempted_platform)
         assert preempted_platform["accepted"] is True
-        by_id = {item["id"]: item for item in preempted_platform["checks"]}
-        assert by_id["stress-maximum-ms"]["limit"] == 20.0
-        assert by_id["stress-deadline-misses"]["limit"] == 6
+        assert preempted_platform["measurement"]["maximum_ms"] == 13.000958
+        assert preempted_platform["measurement"]["deadline_misses"] == 1
+        assert {
+            "stress-p99-9-ms",
+            "stress-maximum-ms",
+            "stress-deadline-misses",
+        }.isdisjoint(check["id"] for check in preempted_platform["checks"])
+
+        mac_stress = json.loads(stress_path.read_text(encoding="utf-8"))
+        mac_stress["environment"].update(
+            {
+                "os": "macos",
+                "arch": "aarch64",
+                "target": "aarch64-apple-darwin",
+                "os_version": "macOS-15.7.9-fixture",
+                "cpu_model": "Apple M1 (Virtual)",
+                "runner_label": "macos-15",
+                "logical_parallelism": 3,
+            }
+        )
+        mac_stress["timing"].update(
+            {
+                "p99_9_ms": 11.37075,
+                "maximum_ms": 16.252792,
+                "calls_over_budget": 17,
+                "calls_over_budget_fraction": 17 / 6000,
+                "summed_compute_rtf": 0.39796,
+                "process_cpu": {
+                    "clock": "CLOCK_PROCESS_CPUTIME_ID",
+                    "sample_count": 6_000,
+                    "minimum_nonzero_delta_ms": 0.001,
+                    "per_call_distribution_gate_eligible": True,
+                    "total_run_cpu_ms": 28_914.036,
+                    "budget_ms": 10.0,
+                    "p99_9_ms": 13.192,
+                    "maximum_ms": 16.923,
+                    "calls_over_budget": 104,
+                    "summed_compute_rtf": 0.4819006,
+                },
+            }
+        )
+        mac_worker = json.loads(worker_path.read_text(encoding="utf-8"))
+        mac_worker["environment"].update(
+            {
+                "os": "macos",
+                "arch": "aarch64",
+                "target": "aarch64-apple-darwin",
+                "cpu_model": "Apple M1 (Virtual)",
+                "runner_label": "macos-15",
+                "logical_parallelism": 3,
+            }
+        )
+        mac_stress_path = platform_root / "mac-stress.json"
+        mac_worker_path = platform_root / "mac-worker.json"
+        mac_stress_path.write_text(
+            json.dumps(mac_stress) + "\n", encoding="utf-8"
+        )
+        mac_worker_path.write_text(
+            json.dumps(mac_worker) + "\n", encoding="utf-8"
+        )
+        mac_platform_path = platform_root / "mac-platform.json"
+        run(
+            [
+                sys.executable,
+                str(PLATFORM),
+                "--stress",
+                str(mac_stress_path),
+                "--worker",
+                str(mac_worker_path),
+                "--output",
+                str(mac_platform_path),
+            ]
+        )
+        mac_platform = json.loads(mac_platform_path.read_text(encoding="utf-8"))
+        validators["platform"].validate(mac_platform)
+        assert mac_platform["accepted"] is True
+        assert mac_platform["measurement"]["deadline_clock"] == "process-cpu"
+        assert mac_platform["measurement"]["compute_rtf_clock"] == "process-cpu"
+        assert mac_platform["measurement"]["p99_9_ms"] == 13.192
+        assert mac_platform["measurement"]["maximum_ms"] == 16.923
+        assert mac_platform["measurement"]["deadline_misses"] == 104
+        assert mac_platform["measurement"]["wall_p99_9_ms"] == 11.37075
+        assert (
+            mac_platform["measurement"]["direct_call_deadline_gate_eligible"]
+            is False
+        )
+        assert (
+            mac_platform["measurement"]["wall_clock_worker_gate_eligible"]
+            is True
+        )
+        assert {
+            "stress-p99-9-ms",
+            "stress-maximum-ms",
+            "stress-deadline-misses",
+        }.isdisjoint(check["id"] for check in mac_platform["checks"])
+        assert all(check["passed"] is True for check in mac_platform["checks"])
+
+        mac_without_cpu = json.loads(json.dumps(mac_stress))
+        del mac_without_cpu["timing"]["process_cpu"]
+        mac_without_cpu_path = platform_root / "mac-without-cpu-stress.json"
+        mac_without_cpu_path.write_text(
+            json.dumps(mac_without_cpu) + "\n", encoding="utf-8"
+        )
+        missing_cpu = run(
+            [
+                sys.executable,
+                str(PLATFORM),
+                "--stress",
+                str(mac_without_cpu_path),
+                "--worker",
+                str(mac_worker_path),
+                "--output",
+                str(platform_root / "mac-without-cpu-platform.json"),
+            ],
+            success=False,
+        )
+        assert "macOS stress run lacks process CPU timing" in missing_cpu.stderr
+
+        windows_stress = json.loads(stress_path.read_text(encoding="utf-8"))
+        windows_stress["environment"].update(
+            {
+                "os": "windows",
+                "arch": "x86_64",
+                "target": "x86_64-pc-windows-msvc",
+                "os_version": "Microsoft Windows NT 10.0.26100.0",
+                "cpu_model": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+                "runner_label": "windows-2025",
+                "logical_parallelism": 4,
+            }
+        )
+        windows_stress["timing"].update(
+            {
+                "p99_9_ms": 9.1723,
+                "maximum_ms": 12.0235,
+                "calls_over_budget": 1,
+                "calls_over_budget_fraction": 1 / 6000,
+                "summed_compute_rtf": 0.55760228,
+                "process_cpu": {
+                    "clock": "GetProcessTimes",
+                    "sample_count": 6_000,
+                    "minimum_nonzero_delta_ms": 15.625,
+                    "per_call_distribution_gate_eligible": False,
+                    "total_run_cpu_ms": 30_625.0,
+                    "budget_ms": 10.0,
+                    "p99_9_ms": 15.625,
+                    "maximum_ms": 15.625,
+                    "calls_over_budget": 1_960,
+                    "summed_compute_rtf": 0.5104166666666666,
+                },
+            }
+        )
+        windows_worker = json.loads(worker_path.read_text(encoding="utf-8"))
+        windows_worker["environment"].update(
+            {
+                "os": "windows",
+                "arch": "x86_64",
+                "target": "x86_64-pc-windows-msvc",
+                "cpu_model": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+                "runner_label": "windows-2025",
+                "logical_parallelism": 4,
+            }
+        )
+        windows_stress_path = platform_root / "windows-stress.json"
+        windows_worker_path = platform_root / "windows-worker.json"
+        windows_stress_path.write_text(
+            json.dumps(windows_stress) + "\n", encoding="utf-8"
+        )
+        windows_worker_path.write_text(
+            json.dumps(windows_worker) + "\n", encoding="utf-8"
+        )
+        windows_platform_path = platform_root / "windows-platform.json"
+        run(
+            [
+                sys.executable,
+                str(PLATFORM),
+                "--stress",
+                str(windows_stress_path),
+                "--worker",
+                str(windows_worker_path),
+                "--output",
+                str(windows_platform_path),
+            ]
+        )
+        windows_platform = json.loads(
+            windows_platform_path.read_text(encoding="utf-8")
+        )
+        validators["platform"].validate(windows_platform)
+        assert windows_platform["accepted"] is True
+        assert windows_platform["measurement"]["deadline_clock"] == "monotonic-wall"
+        assert windows_platform["measurement"]["compute_rtf_clock"] == "process-cpu"
+        assert windows_platform["measurement"]["p99_9_ms"] == 9.1723
+        assert windows_platform["measurement"]["wall_p99_9_ms"] == 9.1723
+        assert windows_platform["measurement"]["summed_compute_rtf"] == 0.5104166666666666
+        assert all(check["passed"] is True for check in windows_platform["checks"])
+
+        windows_without_cpu = json.loads(json.dumps(windows_stress))
+        del windows_without_cpu["timing"]["process_cpu"]
+        windows_without_cpu_path = platform_root / "windows-without-cpu-stress.json"
+        windows_without_cpu_path.write_text(
+            json.dumps(windows_without_cpu) + "\n", encoding="utf-8"
+        )
+        missing_windows_cpu = run(
+            [
+                sys.executable,
+                str(PLATFORM),
+                "--stress",
+                str(windows_without_cpu_path),
+                "--worker",
+                str(windows_worker_path),
+                "--output",
+                str(platform_root / "windows-without-cpu-platform.json"),
+            ],
+            success=False,
+        )
+        assert (
+            "Windows stress run lacks process CPU timing"
+            in missing_windows_cpu.stderr
+        )
+
+        windows_wrong_clock = json.loads(json.dumps(windows_stress))
+        windows_wrong_clock["timing"]["process_cpu"]["clock"] = (
+            "CLOCK_PROCESS_CPUTIME_ID"
+        )
+        windows_wrong_clock_path = platform_root / "windows-wrong-clock-stress.json"
+        windows_wrong_clock_path.write_text(
+            json.dumps(windows_wrong_clock) + "\n", encoding="utf-8"
+        )
+        wrong_windows_clock = run(
+            [
+                sys.executable,
+                str(PLATFORM),
+                "--stress",
+                str(windows_wrong_clock_path),
+                "--worker",
+                str(windows_worker_path),
+                "--output",
+                str(platform_root / "windows-wrong-clock-platform.json"),
+            ],
+            success=False,
+        )
+        assert (
+            "Windows stress run used an unsupported process CPU clock"
+            in wrong_windows_clock.stderr
+        )
+
+        windows_wrong_distribution = json.loads(json.dumps(windows_stress))
+        windows_wrong_distribution["timing"]["process_cpu"][
+            "per_call_distribution_gate_eligible"
+        ] = True
+        windows_wrong_distribution_path = (
+            platform_root / "windows-wrong-distribution-stress.json"
+        )
+        windows_wrong_distribution_path.write_text(
+            json.dumps(windows_wrong_distribution) + "\n", encoding="utf-8"
+        )
+        wrong_windows_distribution = run(
+            [
+                sys.executable,
+                str(PLATFORM),
+                "--stress",
+                str(windows_wrong_distribution_path),
+                "--worker",
+                str(windows_worker_path),
+                "--output",
+                str(platform_root / "windows-wrong-distribution-platform.json"),
+            ],
+            success=False,
+        )
+        assert (
+            "Windows process CPU distribution eligibility is invalid"
+            in wrong_windows_distribution.stderr
+        )
+
+        windows_slow_compute = json.loads(json.dumps(windows_stress))
+        windows_slow_compute["timing"]["process_cpu"]["summed_compute_rtf"] = 1.01
+        windows_slow_compute["timing"]["process_cpu"]["total_run_cpu_ms"] = 60_600.0
+        windows_slow_compute_path = platform_root / "windows-slow-compute-stress.json"
+        windows_slow_compute_path.write_text(
+            json.dumps(windows_slow_compute) + "\n", encoding="utf-8"
+        )
+        windows_slow_compute_platform_path = (
+            platform_root / "windows-slow-compute-platform.json"
+        )
+        run(
+            [
+                sys.executable,
+                str(PLATFORM),
+                "--stress",
+                str(windows_slow_compute_path),
+                "--worker",
+                str(windows_worker_path),
+                "--output",
+                str(windows_slow_compute_platform_path),
+            ],
+            success=False,
+        )
+        windows_slow_compute_platform = json.loads(
+            windows_slow_compute_platform_path.read_text(encoding="utf-8")
+        )
+        assert windows_slow_compute_platform["accepted"] is False
+        assert {
+            check["id"]: check["passed"]
+            for check in windows_slow_compute_platform["checks"]
+        }["stress-summed-rtf"] is False
 
         lowest_stress = json.loads(stress_path.read_text(encoding="utf-8"))
         lowest_stress["environment"].update(
@@ -938,6 +1387,16 @@ def main() -> int:
                 "logical_parallelism": 1,
                 "hardware_tier": "lowest-supported",
                 "runner_label": "ubuntu-slim",
+            }
+        )
+        lowest_stress["realtime_paced"] = True
+        lowest_stress["timing"].update(
+            {
+                "p99_9_ms": 21.453856,
+                "maximum_ms": 28.027151,
+                "calls_over_budget": 156,
+                "calls_over_budget_fraction": 156 / 6_000,
+                "summed_compute_rtf": 0.481972666,
             }
         )
         lowest_worker = json.loads(worker_path.read_text(encoding="utf-8"))
@@ -976,6 +1435,189 @@ def main() -> int:
         assert lowest_platform["accepted"] is True
         assert lowest_platform["platform"]["logical_cpus"] == 1
         assert lowest_platform["platform"]["runner_label"] == "ubuntu-slim"
+        assert lowest_platform["measurement"]["stress_realtime_paced"] is True
+        assert (
+            lowest_platform["measurement"]["direct_call_deadline_gate_eligible"]
+            is False
+        )
+        assert (
+            lowest_platform["measurement"]["wall_clock_worker_gate_eligible"]
+            is False
+        )
+        assert lowest_platform["measurement"]["p99_9_ms"] == 21.453856
+        assert len(lowest_platform["checks"]) == 8
+        assert {
+            "stress-p99-9-ms",
+            "stress-maximum-ms",
+            "stress-deadline-misses",
+        }.isdisjoint(check["id"] for check in lowest_platform["checks"])
+
+        overloaded_lowest_worker = json.loads(json.dumps(lowest_worker))
+        overloaded_lowest_worker["metrics"]["overload_blocks"] = 1
+        validators["worker"].validate(overloaded_lowest_worker)
+        overloaded_lowest_worker_path = platform_root / "overloaded-lowest-worker.json"
+        overloaded_lowest_worker_path.write_text(
+            json.dumps(overloaded_lowest_worker) + "\n", encoding="utf-8"
+        )
+        overloaded_lowest_platform_path = (
+            platform_root / "overloaded-lowest-platform.json"
+        )
+        run(
+            [
+                sys.executable,
+                str(PLATFORM),
+                "--stress",
+                str(lowest_stress_path),
+                "--worker",
+                str(overloaded_lowest_worker_path),
+                "--output",
+                str(overloaded_lowest_platform_path),
+                "--allow-rejected",
+            ]
+        )
+        overloaded_lowest_platform = json.loads(
+            overloaded_lowest_platform_path.read_text(encoding="utf-8")
+        )
+        validators["platform"].validate(overloaded_lowest_platform)
+        assert overloaded_lowest_platform["accepted"] is True
+        assert (
+            overloaded_lowest_platform["measurement"][
+                "worker_scheduling_counter_total"
+            ]
+            == 1
+        )
+        assert (
+            overloaded_lowest_platform["measurement"][
+                "worker_processing_error_count"
+            ]
+            == 0
+        )
+        assert {
+            check["id"]: check["passed"]
+            for check in overloaded_lowest_platform["checks"]
+        }["worker-processing-errors"] is True
+
+        overloaded_portable_worker = json.loads(
+            worker_path.read_text(encoding="utf-8")
+        )
+        overloaded_portable_worker["metrics"]["overload_blocks"] = 1
+        assert validators["worker"].is_valid(overloaded_portable_worker) is False
+        overloaded_portable_worker_path = (
+            platform_root / "overloaded-portable-worker.json"
+        )
+        overloaded_portable_worker_path.write_text(
+            json.dumps(overloaded_portable_worker) + "\n", encoding="utf-8"
+        )
+        overloaded_portable_platform_path = (
+            platform_root / "overloaded-portable-platform.json"
+        )
+        run(
+            [
+                sys.executable,
+                str(PLATFORM),
+                "--stress",
+                str(stress_path),
+                "--worker",
+                str(overloaded_portable_worker_path),
+                "--output",
+                str(overloaded_portable_platform_path),
+                "--allow-rejected",
+            ]
+        )
+        overloaded_portable_platform = json.loads(
+            overloaded_portable_platform_path.read_text(encoding="utf-8")
+        )
+        validators["platform"].validate(overloaded_portable_platform)
+        assert overloaded_portable_platform["accepted"] is False
+        assert {
+            check["id"]: check["passed"]
+            for check in overloaded_portable_platform["checks"]
+        }["worker-error-counters"] is False
+
+        failed_lowest_worker = json.loads(json.dumps(lowest_worker))
+        failed_lowest_worker["metrics"]["worker_errors"] = 1
+        failed_lowest_worker_path = platform_root / "failed-lowest-worker.json"
+        failed_lowest_worker_path.write_text(
+            json.dumps(failed_lowest_worker) + "\n", encoding="utf-8"
+        )
+        failed_lowest_platform_path = platform_root / "failed-lowest-platform.json"
+        run(
+            [
+                sys.executable,
+                str(PLATFORM),
+                "--stress",
+                str(lowest_stress_path),
+                "--worker",
+                str(failed_lowest_worker_path),
+                "--output",
+                str(failed_lowest_platform_path),
+                "--allow-rejected",
+            ]
+        )
+        failed_lowest_platform = json.loads(
+            failed_lowest_platform_path.read_text(encoding="utf-8")
+        )
+        validators["platform"].validate(failed_lowest_platform)
+        assert failed_lowest_platform["accepted"] is False
+        assert {
+            check["id"]: check["passed"]
+            for check in failed_lowest_platform["checks"]
+        }["worker-processing-errors"] is False
+
+        over_capacity_lowest_stress = json.loads(json.dumps(lowest_stress))
+        over_capacity_lowest_stress["timing"]["summed_compute_rtf"] = 1.01
+        over_capacity_lowest_stress_path = (
+            platform_root / "over-capacity-lowest-stress.json"
+        )
+        over_capacity_lowest_stress_path.write_text(
+            json.dumps(over_capacity_lowest_stress) + "\n", encoding="utf-8"
+        )
+        over_capacity_lowest_platform_path = (
+            platform_root / "over-capacity-lowest-platform.json"
+        )
+        run(
+            [
+                sys.executable,
+                str(PLATFORM),
+                "--stress",
+                str(over_capacity_lowest_stress_path),
+                "--worker",
+                str(lowest_worker_path),
+                "--output",
+                str(over_capacity_lowest_platform_path),
+                "--allow-rejected",
+            ]
+        )
+        over_capacity_lowest_platform = json.loads(
+            over_capacity_lowest_platform_path.read_text(encoding="utf-8")
+        )
+        validators["platform"].validate(over_capacity_lowest_platform)
+        assert over_capacity_lowest_platform["accepted"] is False
+        assert {
+            check["id"]: check["passed"]
+            for check in over_capacity_lowest_platform["checks"]
+        }["stress-summed-rtf"] is False
+
+        unpaced_lowest = json.loads(json.dumps(lowest_stress))
+        unpaced_lowest["realtime_paced"] = False
+        unpaced_lowest_path = platform_root / "unpaced-lowest-stress.json"
+        unpaced_lowest_path.write_text(
+            json.dumps(unpaced_lowest) + "\n", encoding="utf-8"
+        )
+        unpaced_lowest_result = run(
+            [
+                sys.executable,
+                str(PLATFORM),
+                "--stress",
+                str(unpaced_lowest_path),
+                "--worker",
+                str(lowest_worker_path),
+                "--output",
+                str(platform_root / "unpaced-lowest-platform.json"),
+            ],
+            success=False,
+        )
+        assert "must be real-time paced" in unpaced_lowest_result.stderr
 
         false_lowest = json.loads(json.dumps(lowest_stress))
         false_lowest["environment"]["logical_parallelism"] = 2
@@ -998,27 +1640,39 @@ def main() -> int:
         )
         assert "one logical CPU" in false_lowest_result.stderr
 
-        rejected_stress = json.loads(stress_path.read_text(encoding="utf-8"))
-        rejected_stress["timing"]["p99_9_ms"] = 11.0
-        rejected_stress_path = platform_root / "rejected-stress.json"
-        rejected_stress_path.write_text(json.dumps(rejected_stress) + "\n", encoding="utf-8")
-        rejected_platform_path = platform_root / "rejected-platform.json"
+        high_tail_stress = json.loads(stress_path.read_text(encoding="utf-8"))
+        high_tail_stress["timing"].update(
+            {
+                "p99_9_ms": 11.0,
+                "maximum_ms": 12.0,
+                "calls_over_budget": 12,
+            }
+        )
+        high_tail_stress_path = platform_root / "high-tail-stress.json"
+        high_tail_stress_path.write_text(
+            json.dumps(high_tail_stress) + "\n", encoding="utf-8"
+        )
+        high_tail_platform_path = platform_root / "high-tail-platform.json"
         run(
             [
                 sys.executable,
                 str(PLATFORM),
                 "--stress",
-                str(rejected_stress_path),
+                str(high_tail_stress_path),
                 "--worker",
                 str(worker_path),
                 "--output",
-                str(rejected_platform_path),
-                "--allow-rejected",
+                str(high_tail_platform_path),
             ]
         )
-        rejected_platform = json.loads(rejected_platform_path.read_text(encoding="utf-8"))
-        validators["platform"].validate(rejected_platform)
-        assert rejected_platform["accepted"] is False
+        high_tail_platform = json.loads(
+            high_tail_platform_path.read_text(encoding="utf-8")
+        )
+        validators["platform"].validate(high_tail_platform)
+        assert high_tail_platform["accepted"] is True
+        assert high_tail_platform["measurement"]["p99_9_ms"] == 11.0
+        assert high_tail_platform["measurement"]["maximum_ms"] == 12.0
+        assert high_tail_platform["measurement"]["deadline_misses"] == 12
 
         promotion_root = root / "promotion"
         promotion_root.mkdir()
@@ -1039,6 +1693,211 @@ def main() -> int:
             entry["hardware_tier"] == "lowest-supported"
             for entry in promotion["platforms"]
         ) == 1
+
+        false_portable_direct_eligibility = json.loads(
+            arguments.platform_evidence[0].read_text(encoding="utf-8")
+        )
+        false_portable_direct_eligibility["measurement"][
+            "direct_call_deadline_gate_eligible"
+        ] = True
+        false_portable_direct_eligibility_path = (
+            promotion_root / "platform-portable-false-direct-eligibility.json"
+        )
+        false_portable_direct_eligibility_path.write_text(
+            json.dumps(false_portable_direct_eligibility) + "\n",
+            encoding="utf-8",
+        )
+        false_direct_eligibility = SimpleNamespace(**vars(arguments))
+        false_direct_eligibility.platform_evidence = [
+            false_portable_direct_eligibility_path,
+            *arguments.platform_evidence[1:],
+        ]
+        false_direct_eligibility.output = (
+            promotion_root / "promotion-false-direct-eligibility.json"
+        )
+        try:
+            module.generate(false_direct_eligibility)
+        except module.PromotionError as error:
+            assert "direct-call deadline eligibility" in str(error)
+        else:
+            raise AssertionError("false direct-call eligibility unexpectedly passed")
+
+        direct_check_v2 = json.loads(
+            arguments.platform_evidence[0].read_text(encoding="utf-8")
+        )
+        direct_check_v2["checks"].append(
+            {
+                "id": "stress-p99-9-ms",
+                "observed": 8.0,
+                "operator": "less-or-equal",
+                "limit": 10.0,
+                "passed": True,
+            }
+        )
+        direct_check_v2_path = promotion_root / "platform-portable-direct-check.json"
+        direct_check_v2_path.write_text(
+            json.dumps(direct_check_v2) + "\n", encoding="utf-8"
+        )
+        unexpected_direct_check = SimpleNamespace(**vars(arguments))
+        unexpected_direct_check.platform_evidence = [
+            direct_check_v2_path,
+            *arguments.platform_evidence[1:],
+        ]
+        unexpected_direct_check.output = (
+            promotion_root / "promotion-unexpected-direct-check.json"
+        )
+        try:
+            module.generate(unexpected_direct_check)
+        except module.PromotionError as error:
+            assert "unexpectedly applies the direct-call gate" in str(error)
+        else:
+            raise AssertionError("v2 direct-call check unexpectedly passed")
+
+        false_lowest_worker_eligibility = json.loads(
+            arguments.platform_evidence[3].read_text(encoding="utf-8")
+        )
+        false_lowest_worker_eligibility["measurement"][
+            "wall_clock_worker_gate_eligible"
+        ] = True
+        false_lowest_worker_eligibility_path = (
+            promotion_root / "platform-lowest-false-worker-eligibility.json"
+        )
+        false_lowest_worker_eligibility_path.write_text(
+            json.dumps(false_lowest_worker_eligibility) + "\n", encoding="utf-8"
+        )
+        false_worker_eligibility = SimpleNamespace(**vars(arguments))
+        false_worker_eligibility.platform_evidence = [
+            *arguments.platform_evidence[:3],
+            false_lowest_worker_eligibility_path,
+        ]
+        false_worker_eligibility.output = (
+            promotion_root / "promotion-false-worker-eligibility.json"
+        )
+        try:
+            module.generate(false_worker_eligibility)
+        except module.PromotionError as error:
+            assert "wall-clock worker eligibility" in str(error)
+        else:
+            raise AssertionError("false worker eligibility unexpectedly passed")
+
+        legacy_direct_checks = [
+            {
+                "id": "stress-p99-9-ms",
+                "observed": 8.0,
+                "operator": "less-or-equal",
+                "limit": 10.0,
+                "passed": True,
+            },
+            {
+                "id": "stress-maximum-ms",
+                "observed": 9.0,
+                "operator": "less-or-equal",
+                "limit": 20.0,
+                "passed": True,
+            },
+            {
+                "id": "stress-deadline-misses",
+                "observed": 0,
+                "operator": "less-or-equal",
+                "limit": 6,
+                "passed": True,
+            },
+        ]
+        legacy_portable = json.loads(
+            arguments.platform_evidence[0].read_text(encoding="utf-8")
+        )
+        legacy_portable["schema"] = "denoize-dpdfnet-platform-evidence-v1"
+        legacy_portable["schema_version"] = 1
+        legacy_portable["checks"].extend(json.loads(json.dumps(legacy_direct_checks)))
+        for field in (
+            "stress_realtime_paced",
+            "deadline_clock",
+            "compute_rtf_clock",
+            "direct_call_deadline_gate_eligible",
+            "wall_clock_worker_gate_eligible",
+            "wall_p99_9_ms",
+            "wall_maximum_ms",
+            "wall_deadline_misses",
+            "wall_summed_compute_rtf",
+            "worker_scheduling_counter_total",
+            "worker_processing_error_count",
+        ):
+            del legacy_portable["measurement"][field]
+        validators["platform_v1"].validate(legacy_portable)
+        legacy_portable_path = promotion_root / "platform-portable-v1.json"
+        legacy_portable_path.write_text(
+            json.dumps(legacy_portable) + "\n", encoding="utf-8"
+        )
+        mixed_versions = SimpleNamespace(**vars(arguments))
+        mixed_versions.platform_evidence = [
+            legacy_portable_path,
+            *arguments.platform_evidence[1:],
+        ]
+        mixed_versions.output = promotion_root / "promotion-mixed-platform-versions.json"
+        assert module.generate(mixed_versions) is True
+        validators["promotion"].validate(
+            json.loads(mixed_versions.output.read_text(encoding="utf-8"))
+        )
+
+        legacy_lowest = json.loads(
+            arguments.platform_evidence[3].read_text(encoding="utf-8")
+        )
+        legacy_lowest["schema"] = "denoize-dpdfnet-platform-evidence-v1"
+        legacy_lowest["schema_version"] = 1
+        legacy_lowest["checks"].extend(json.loads(json.dumps(legacy_direct_checks)))
+        for field in (
+            "stress_realtime_paced",
+            "deadline_clock",
+            "compute_rtf_clock",
+            "direct_call_deadline_gate_eligible",
+            "wall_clock_worker_gate_eligible",
+            "wall_p99_9_ms",
+            "wall_maximum_ms",
+            "wall_deadline_misses",
+            "wall_summed_compute_rtf",
+            "worker_scheduling_counter_total",
+            "worker_processing_error_count",
+        ):
+            del legacy_lowest["measurement"][field]
+        validators["platform_v1"].validate(legacy_lowest)
+        legacy_lowest_path = promotion_root / "platform-lowest-v1.json"
+        legacy_lowest_path.write_text(
+            json.dumps(legacy_lowest) + "\n", encoding="utf-8"
+        )
+        v1_lowest = SimpleNamespace(**vars(arguments))
+        v1_lowest.platform_evidence = [
+            *arguments.platform_evidence[:3],
+            legacy_lowest_path,
+        ]
+        v1_lowest.output = promotion_root / "promotion-v1-lowest.json"
+        try:
+            module.generate(v1_lowest)
+        except module.PromotionError as error:
+            assert "real-time-paced v2 schema" in str(error)
+        else:
+            raise AssertionError("v1 lowest-supported evidence unexpectedly passed")
+
+        falsely_paced_lowest = json.loads(
+            arguments.platform_evidence[3].read_text(encoding="utf-8")
+        )
+        falsely_paced_lowest["measurement"]["stress_realtime_paced"] = False
+        assert validators["platform"].is_valid(falsely_paced_lowest) is False
+        falsely_paced_lowest_path = promotion_root / "platform-lowest-unpaced-v2.json"
+        falsely_paced_lowest_path.write_text(
+            json.dumps(falsely_paced_lowest) + "\n", encoding="utf-8"
+        )
+        unpaced_v2_lowest = SimpleNamespace(**vars(arguments))
+        unpaced_v2_lowest.platform_evidence = [
+            *arguments.platform_evidence[:3],
+            falsely_paced_lowest_path,
+        ]
+        unpaced_v2_lowest.output = promotion_root / "promotion-unpaced-v2-lowest.json"
+        try:
+            module.generate(unpaced_v2_lowest)
+        except module.PromotionError as error:
+            assert "must record real-time pacing" in str(error)
+        else:
+            raise AssertionError("unpaced v2 lowest-supported evidence unexpectedly passed")
 
         no_lowest = SimpleNamespace(**vars(arguments))
         no_lowest.platform_evidence = arguments.platform_evidence[:3]

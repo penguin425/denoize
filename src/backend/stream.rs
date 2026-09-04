@@ -1,6 +1,5 @@
 //! Stateful backend session shared by bounded file and realtime processing.
 
-use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::marker::PhantomData;
 
@@ -43,6 +42,40 @@ enum StreamingBackend {
     Gtcrn(Box<super::gtcrn::StreamingProcessor>),
     #[cfg(feature = "dpdfnet")]
     Dpdfnet(Box<super::dpdfnet::StreamingProcessor>),
+}
+
+impl StreamingBackend {
+    fn process_block(&mut self, input: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, String> {
+        match self {
+            Self::Classical(processor) => processor.process_block(input),
+            #[cfg(feature = "rnnoise")]
+            Self::Rnnoise(processor) => processor.process_block(input),
+            #[cfg(feature = "deepfilter")]
+            Self::DeepFilter(processor) => processor.process_block(input),
+            #[cfg(feature = "mossformer2")]
+            Self::Mossformer2(processor) => processor.process_block(input),
+            #[cfg(feature = "gtcrn")]
+            Self::Gtcrn(processor) => processor.process_block(input),
+            #[cfg(feature = "dpdfnet")]
+            Self::Dpdfnet(processor) => processor.process_block(input),
+        }
+    }
+
+    fn process_owned_block(&mut self, input: Vec<Vec<f64>>) -> Result<Vec<Vec<f64>>, String> {
+        match self {
+            #[cfg(feature = "dpdfnet")]
+            Self::Dpdfnet(processor) => processor.process_owned_block(input),
+            Self::Classical(processor) => processor.process_block(&input),
+            #[cfg(feature = "rnnoise")]
+            Self::Rnnoise(processor) => processor.process_block(&input),
+            #[cfg(feature = "deepfilter")]
+            Self::DeepFilter(processor) => processor.process_block(&input),
+            #[cfg(feature = "mossformer2")]
+            Self::Mossformer2(processor) => processor.process_block(&input),
+            #[cfg(feature = "gtcrn")]
+            Self::Gtcrn(processor) => processor.process_block(&input),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -688,8 +721,8 @@ impl StreamingBackendSession {
         if let Some(vad) = &mut self.vad {
             vad.push_input(channels)?;
         }
-        let backend_input = match self.channel_mode {
-            ChannelMode::Independent => Cow::Borrowed(channels),
+        let processed = match self.channel_mode {
+            ChannelMode::Independent => self.processor.process_block(channels),
             ChannelMode::StereoLinked => {
                 let frames = channels[0].len();
                 self.linked_original.try_reserve(frames).map_err(|_| {
@@ -704,25 +737,17 @@ impl StreamingBackendSession {
                     mid.push((left + right) * 0.5);
                     self.linked_original.push_back((left, right));
                 }
-                Cow::Owned(vec![mid])
+                let mut input = Vec::new();
+                input.try_reserve_exact(2).map_err(|_| {
+                    ConfigError::allocation_failed("linked stream input channels").to_string()
+                })?;
+                input.push(mid);
+                self.processor.process_owned_block(input)
             }
             ChannelMode::MidSide => {
                 let (mid, side) = super::encode_mid_side(&channels[0], &channels[1])?;
-                Cow::Owned(vec![mid, side])
+                self.processor.process_owned_block(vec![mid, side])
             }
-        };
-        let processed = match &mut self.processor {
-            StreamingBackend::Classical(processor) => processor.process_block(&backend_input),
-            #[cfg(feature = "rnnoise")]
-            StreamingBackend::Rnnoise(processor) => processor.process_block(&backend_input),
-            #[cfg(feature = "deepfilter")]
-            StreamingBackend::DeepFilter(processor) => processor.process_block(&backend_input),
-            #[cfg(feature = "mossformer2")]
-            StreamingBackend::Mossformer2(processor) => processor.process_block(&backend_input),
-            #[cfg(feature = "gtcrn")]
-            StreamingBackend::Gtcrn(processor) => processor.process_block(&backend_input),
-            #[cfg(feature = "dpdfnet")]
-            StreamingBackend::Dpdfnet(processor) => processor.process_block(&backend_input),
         }?;
         let processed = self.restore_channel_mode(processed)?;
         if let Some(vad) = &mut self.vad {
@@ -746,29 +771,31 @@ impl StreamingBackendSession {
                 if processed.len() != 1 {
                     return Err("linked streaming backend must return one channel".into());
                 }
-                let enhanced = processed.pop().unwrap_or_default();
-                if enhanced.len() > self.linked_original.len() {
+                let left = processed.first_mut().ok_or_else(|| {
+                    "linked streaming backend must return one channel".to_string()
+                })?;
+                if left.len() > self.linked_original.len() {
                     return Err("linked streaming backend returned unaligned frames".into());
                 }
-                let mut left = Vec::new();
                 let mut right = Vec::new();
-                left.try_reserve_exact(enhanced.len()).map_err(|_| {
+                right.try_reserve_exact(left.len()).map_err(|_| {
                     ConfigError::allocation_failed("linked stream output").to_string()
                 })?;
-                right.try_reserve_exact(enhanced.len()).map_err(|_| {
-                    ConfigError::allocation_failed("linked stream output").to_string()
-                })?;
-                for clean in enhanced {
+                for clean in left {
                     let (original_left, original_right) = self
                         .linked_original
                         .pop_front()
                         .ok_or_else(|| "linked streaming alignment queue underflow".to_string())?;
                     let original_mid = (original_left + original_right) * 0.5;
-                    let correction = clean - original_mid;
-                    left.push(crate::audio::sanitize_sample(original_left + correction));
+                    let correction = *clean - original_mid;
+                    *clean = crate::audio::sanitize_sample(original_left + correction);
                     right.push(crate::audio::sanitize_sample(original_right + correction));
                 }
-                Ok(vec![left, right])
+                processed.try_reserve(1).map_err(|_| {
+                    ConfigError::allocation_failed("linked stream output channels").to_string()
+                })?;
+                processed.push(right);
+                Ok(processed)
             }
             ChannelMode::MidSide => {
                 if processed.len() != 2 {
@@ -897,6 +924,44 @@ mod tests {
     }
 
     #[test]
+    fn stereo_linked_restore_reuses_enhanced_output_and_preserves_side() {
+        let mut config = DenoiserConfig::default(48_000);
+        config.profile_ms = -1.0;
+        let options = BackendOptions {
+            channel_mode: ChannelMode::StereoLinked,
+            ..BackendOptions::default()
+        };
+        let mut session =
+            StreamingBackendSession::new(Backend::Classical, 48_000, 2, config, options).unwrap();
+        let original = [(0.25, -0.15), (-0.4, 0.2), (0.8, 0.3)];
+        session.linked_original.extend(original);
+
+        let enhanced = vec![0.2, -0.05, 0.4];
+        let enhanced_ptr = enhanced.as_ptr();
+        let mut enhanced_channels = Vec::with_capacity(2);
+        enhanced_channels.push(enhanced);
+        let channels_ptr = enhanced_channels.as_ptr();
+        let output = session.restore_channel_mode(enhanced_channels).unwrap();
+
+        assert_eq!(output.len(), 2);
+        assert_eq!(output.as_ptr(), channels_ptr);
+        assert_eq!(output[0].as_ptr(), enhanced_ptr);
+        assert!(session.linked_original.is_empty());
+        let expected = [[0.4, -0.35, 0.65], [0.0, 0.25, 0.15]];
+        for (actual, expected) in output.iter().zip(expected) {
+            assert_eq!(actual.len(), expected.len());
+            for (&actual, expected) in actual.iter().zip(expected) {
+                assert!((actual - expected).abs() < 1e-12);
+            }
+        }
+        for frame in 0..original.len() {
+            let original_side = original[frame].0 - original[frame].1;
+            let restored_side = output[0][frame] - output[1][frame];
+            assert!((restored_side - original_side).abs() < 1e-12);
+        }
+    }
+
+    #[test]
     fn classical_streaming_vad_preserves_delayed_presentation_length() {
         let mut config = DenoiserConfig::default(48_000);
         config.profile_ms = -1.0;
@@ -935,6 +1000,13 @@ mod tests {
     #[cfg(feature = "deepfilter")]
     #[test]
     fn deepfilter_build_keeps_public_streaming_sessions_sendable() {
+        fn assert_send<T: Send>() {}
+        assert_send::<StreamingBackendSession>();
+    }
+
+    #[cfg(feature = "dpdfnet")]
+    #[test]
+    fn dpdfnet_build_keeps_public_streaming_sessions_sendable() {
         fn assert_send<T: Send>() {}
         assert_send::<StreamingBackendSession>();
     }

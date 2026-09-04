@@ -42,7 +42,7 @@ use denoize::{
     StreamSpoolLimits, StreamingBackendSession, WatchCycleReport, WatchFolder, WatchFolderConfig,
     WatchFolderJob, WatchProcessError, WindowType, DAW_FIXED_LATENCY_MILLIS, DAW_LATENCY_POLICY,
     DAW_PLUGIN_ID, NEURAL_DAW_LATENCY_POLICY, NEURAL_DAW_MODEL_ID, NEURAL_DAW_MODEL_SHA256,
-    NEURAL_DAW_PLUGIN_ID, WATCH_CYCLE_SCHEMA,
+    NEURAL_DAW_PLUGIN_ID, NEURAL_DAW_QUEUE_BLOCKS, WATCH_CYCLE_SCHEMA,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as ShaDigest, Sha256};
@@ -3249,7 +3249,7 @@ fn run_neural_plugin_info(args: &[String]) -> Result<(), String> {
         "latency_policy": NEURAL_DAW_LATENCY_POLICY,
         "latency_frames": latency_frames,
         "latency_millis": latency_millis,
-        "queue_blocks": 16,
+        "queue_blocks": NEURAL_DAW_QUEUE_BLOCKS,
         "overload_fallbacks": ["delayed-dry", "last-safe-gain", "silence"],
         "realtime_contract": {
             "allocations": 0,

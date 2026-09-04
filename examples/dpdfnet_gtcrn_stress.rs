@@ -10,10 +10,11 @@ use sha2::{Digest as _, Sha256};
 use std::env;
 use std::path::PathBuf;
 use std::sync::{Arc, Barrier};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const DAW_SAMPLE_RATE: u32 = 48_000;
 const DAW_BLOCK_FRAMES: usize = 480;
+const DAW_WORKER_POLL: Duration = Duration::from_micros(100);
 const WARMUP_CALLS: usize = 100;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,12 +55,15 @@ struct Args {
     model_path: PathBuf,
     seconds: usize,
     parallel: usize,
+    realtime_paced: bool,
     json: PathBuf,
 }
 
 #[derive(Debug)]
 struct ThreadResult {
     durations_ms: Vec<f64>,
+    process_cpu_durations_ms: Option<Vec<f64>>,
+    process_cpu_total_ms: Option<f64>,
     audio_seconds: f64,
     wall_seconds: f64,
     checksum: f64,
@@ -111,10 +115,18 @@ fn run() -> Result<(), String> {
                         args.model_path.clone(),
                         args.seconds,
                         args.parallel,
+                        args.realtime_paced,
                     )?,
-                    "one 48-kHz stereo-linked 480-frame host block through the production arbitrary-block adapter",
+                    if args.realtime_paced {
+                        "one real-time-paced 48-kHz stereo-linked 480-frame host block through the production arbitrary-block adapter"
+                    } else {
+                        "one unpaced 48-kHz stereo-linked 480-frame host block through the production arbitrary-block adapter"
+                    },
                 )
             } else {
+                if args.realtime_paced {
+                    return Err("--realtime-paced requires --model dpdfnet-daw".into());
+                }
                 (
                     run_dpdfnet_threads(model, args.seconds, args.parallel)?,
                     "one native 480-sample/10-ms inference hop",
@@ -199,6 +211,69 @@ fn finish(
         .iter()
         .map(|thread| thread.audio_seconds)
         .sum::<f64>();
+    let mut process_cpu_durations: Vec<f64> = threads
+        .iter()
+        .flat_map(|thread| {
+            thread
+                .process_cpu_durations_ms
+                .iter()
+                .flat_map(|durations| durations.iter().copied())
+        })
+        .collect();
+    if !process_cpu_durations.is_empty() && process_cpu_durations.len() != durations.len() {
+        return Err("process CPU timing sample count does not match wall timing".into());
+    }
+    let process_cpu_totals: Vec<f64> = threads
+        .iter()
+        .filter_map(|thread| thread.process_cpu_total_ms)
+        .collect();
+    if !process_cpu_durations.is_empty() && process_cpu_totals.len() != threads.len() {
+        return Err("process CPU total count does not match timed threads".into());
+    }
+    process_cpu_durations.sort_by(f64::total_cmp);
+    let process_cpu_timing = if process_cpu_durations.is_empty() {
+        Value::Null
+    } else {
+        let cpu_sum = process_cpu_durations.iter().sum::<f64>();
+        let cpu_total = process_cpu_totals.iter().sum::<f64>();
+        let cpu_mean = cpu_sum / process_cpu_durations.len() as f64;
+        let cpu_variance = process_cpu_durations
+            .iter()
+            .map(|duration| (duration - cpu_mean).powi(2))
+            .sum::<f64>()
+            / process_cpu_durations.len() as f64;
+        let minimum_nonzero_delta_ms = process_cpu_durations
+            .iter()
+            .copied()
+            .filter(|duration| *duration > 0.0)
+            .min_by(f64::total_cmp);
+        json!({
+            "clock": process_cpu_clock_name(),
+            "sample_count": process_cpu_durations.len(),
+            "sampled_call_cpu_ms": cpu_sum,
+            "total_run_cpu_ms": cpu_total,
+            "minimum_nonzero_delta_ms": minimum_nonzero_delta_ms,
+            "per_call_distribution_gate_eligible": !cfg!(target_os = "windows"),
+            "mean_ms": cpu_mean,
+            "standard_deviation_ms": cpu_variance.sqrt(),
+            "p50_ms": percentile(&process_cpu_durations, 0.50),
+            "p95_ms": percentile(&process_cpu_durations, 0.95),
+            "p99_ms": percentile(&process_cpu_durations, 0.99),
+            "p99_9_ms": percentile(&process_cpu_durations, 0.999),
+            "maximum_ms": process_cpu_durations[process_cpu_durations.len() - 1],
+            "budget_ms": budget_ms,
+            "calls_over_budget": process_cpu_durations
+                .iter()
+                .filter(|duration| **duration > budget_ms)
+                .count(),
+            "calls_over_budget_fraction": process_cpu_durations
+                .iter()
+                .filter(|duration| **duration > budget_ms)
+                .count() as f64
+                / process_cpu_durations.len() as f64,
+            "summed_compute_rtf": cpu_total / 1_000.0 / total_audio_seconds,
+        })
+    };
     let total_processing_seconds = sum / 1_000.0;
     let concurrent_wall_seconds = threads
         .iter()
@@ -215,6 +290,7 @@ fn finish(
         "state_size": state_size,
         "parallel_streams": args.parallel,
         "requested_seconds_per_stream": args.seconds,
+        "realtime_paced": args.realtime_paced,
         "measured_audio_seconds": total_audio_seconds,
         "calls": durations.len(),
         "load_ms": load_ms,
@@ -233,6 +309,7 @@ fn finish(
             "summed_compute_rtf": total_processing_seconds / total_audio_seconds,
             "concurrent_wall_seconds": concurrent_wall_seconds,
             "aggregate_realtime_throughput_x": total_audio_seconds / concurrent_wall_seconds.max(1.0e-20),
+            "process_cpu": process_cpu_timing,
         },
         "memory": {
             "rss_before_model_load_bytes": rss_before_load,
@@ -295,6 +372,8 @@ fn run_dpdfnet_threads(
         }
         Ok(ThreadResult {
             durations_ms,
+            process_cpu_durations_ms: None,
+            process_cpu_total_ms: None,
             audio_seconds: calls as f64 * dpdfnet::HOP_SIZE as f64 / dpdfnet::SAMPLE_RATE as f64,
             wall_seconds: wall_started.elapsed().as_secs_f64(),
             checksum,
@@ -333,6 +412,8 @@ fn run_gtcrn_threads(
         }
         Ok(ThreadResult {
             durations_ms,
+            process_cpu_durations_ms: None,
+            process_cpu_total_ms: None,
             audio_seconds: calls as f64 * gtcrn::HOP_SIZE as f64 / gtcrn::SAMPLE_RATE as f64,
             wall_seconds: wall_started.elapsed().as_secs_f64(),
             checksum,
@@ -392,6 +473,8 @@ fn run_gtcrn_daw_threads(
         }
         Ok(ThreadResult {
             durations_ms,
+            process_cpu_durations_ms: None,
+            process_cpu_total_ms: None,
             audio_seconds: calls as f64 * DAW_BLOCK_FRAMES as f64 / DAW_SAMPLE_RATE as f64,
             wall_seconds: wall_started.elapsed().as_secs_f64(),
             checksum,
@@ -404,6 +487,7 @@ fn run_dpdfnet_daw_threads(
     model_path: PathBuf,
     seconds: usize,
     parallel: usize,
+    realtime_paced: bool,
 ) -> Result<Vec<ThreadResult>, String> {
     let calls = seconds
         .checked_mul(100)
@@ -428,18 +512,65 @@ fn run_dpdfnet_daw_threads(
             &model,
         )?;
         let input = daw_input(thread_index);
-        for _ in 0..WARMUP_CALLS {
-            stream.process_block(&input)?;
+        // The released worker receives an unmeasured pre-roll before host
+        // evidence begins. Exercise the platform scheduler during this same
+        // window so its workgroup and performance controller are established
+        // before the direct timing samples begin.
+        let mut priority_guard = denoize::neural_daw::NeuralDawWorkerPriorityGuard::acquire()?;
+        let warmup_started = Instant::now();
+        for index in 0..WARMUP_CALLS {
+            if realtime_paced {
+                let due =
+                    warmup_started + Duration::from_micros((index as u64).saturating_mul(10_000));
+                while let Some(delay) = due.checked_duration_since(Instant::now()) {
+                    std::thread::park_timeout(delay.min(DAW_WORKER_POLL));
+                }
+            }
+            priority_guard.run_inference_cycle(|| stream.process_block(&input))?;
         }
         stream.reset()?;
+        priority_guard.begin_inference_cycle_measurement();
+        // Exercise direct production calls under the same thread-bound
+        // platform scheduling class for the complete measurement.
         barrier.wait();
+        let measure_process_cpu = parallel == 1 && cfg!(any(unix, target_os = "windows"));
+        let process_cpu_run_started = if measure_process_cpu {
+            Some(process_cpu_time()?)
+        } else {
+            None
+        };
         let wall_started = Instant::now();
         let mut durations_ms = Vec::with_capacity(calls);
+        let mut process_cpu_durations_ms = measure_process_cpu.then(|| Vec::with_capacity(calls));
         let mut checksum = 0.0;
         for index in 0..calls {
+            if realtime_paced {
+                let due =
+                    wall_started + Duration::from_micros((index as u64).saturating_mul(10_000));
+                // Match the released worker's bounded idle polling. A single
+                // full-period sleep adds scheduler wake-up latency that the
+                // production worker does not incur because it checks its
+                // input queue every 100 microseconds.
+                while let Some(delay) = due.checked_duration_since(Instant::now()) {
+                    std::thread::park_timeout(delay.min(DAW_WORKER_POLL));
+                }
+            }
+            let process_cpu_started = if process_cpu_durations_ms.is_some() {
+                Some(process_cpu_time()?)
+            } else {
+                None
+            };
             let started = Instant::now();
-            let output = stream.process_block(&input)?;
+            let output = priority_guard.run_inference_cycle(|| stream.process_block(&input))?;
             durations_ms.push(milliseconds(started.elapsed()));
+            if let (Some(durations), Some(process_cpu_started)) =
+                (&mut process_cpu_durations_ms, process_cpu_started)
+            {
+                let elapsed = process_cpu_time()?
+                    .checked_sub(process_cpu_started)
+                    .ok_or_else(|| "process CPU clock moved backwards".to_owned())?;
+                durations.push(milliseconds(elapsed));
+            }
             checksum += output
                 .first()
                 .and_then(|channel| channel.get(index % channel.len().max(1)))
@@ -449,8 +580,18 @@ fn run_dpdfnet_daw_threads(
                 return Err("DPDFNet DAW path produced a non-finite stress sample".into());
             }
         }
+        let process_cpu_total_ms = process_cpu_run_started
+            .map(|started| {
+                process_cpu_time()?
+                    .checked_sub(started)
+                    .map(milliseconds)
+                    .ok_or_else(|| "process CPU clock moved backwards".to_owned())
+            })
+            .transpose()?;
         Ok(ThreadResult {
             durations_ms,
+            process_cpu_durations_ms,
+            process_cpu_total_ms,
             audio_seconds: calls as f64 * DAW_BLOCK_FRAMES as f64 / DAW_SAMPLE_RATE as f64,
             wall_seconds: wall_started.elapsed().as_secs_f64(),
             checksum,
@@ -657,6 +798,93 @@ fn optional_difference(after: Option<u64>, before: Option<u64>) -> Option<u64> {
     Some(after?.saturating_sub(before?))
 }
 
+#[cfg(unix)]
+fn process_cpu_time() -> Result<Duration, String> {
+    let mut timestamp = std::mem::MaybeUninit::<libc::timespec>::uninit();
+    // SAFETY: clock_gettime initializes the provided timespec on success.
+    if unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, timestamp.as_mut_ptr()) } != 0 {
+        return Err(format!(
+            "read process CPU clock: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: the successful call above initialized the value.
+    let timestamp = unsafe { timestamp.assume_init() };
+    let seconds = u64::try_from(timestamp.tv_sec)
+        .map_err(|_| "process CPU clock returned negative seconds".to_owned())?;
+    let nanoseconds = u32::try_from(timestamp.tv_nsec)
+        .map_err(|_| "process CPU clock returned negative nanoseconds".to_owned())?;
+    if nanoseconds >= 1_000_000_000 {
+        return Err("process CPU clock returned invalid nanoseconds".into());
+    }
+    Ok(Duration::new(seconds, nanoseconds))
+}
+
+#[cfg(target_os = "windows")]
+fn process_cpu_time() -> Result<Duration, String> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+
+    let mut creation = std::mem::MaybeUninit::<FILETIME>::uninit();
+    let mut exit = std::mem::MaybeUninit::<FILETIME>::uninit();
+    let mut kernel = std::mem::MaybeUninit::<FILETIME>::uninit();
+    let mut user = std::mem::MaybeUninit::<FILETIME>::uninit();
+    // SAFETY: GetCurrentProcess returns a valid pseudo-handle, and
+    // GetProcessTimes initializes all four writable FILETIME values on success.
+    if unsafe {
+        GetProcessTimes(
+            GetCurrentProcess(),
+            creation.as_mut_ptr(),
+            exit.as_mut_ptr(),
+            kernel.as_mut_ptr(),
+            user.as_mut_ptr(),
+        )
+    } == 0
+    {
+        return Err(format!(
+            "read process CPU clock: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: the successful call above initialized the kernel value.
+    let kernel = unsafe { kernel.assume_init() };
+    // SAFETY: the successful call above initialized the user value.
+    let user = unsafe { user.assume_init() };
+    let ticks = filetime_ticks(kernel)
+        .checked_add(filetime_ticks(user))
+        .ok_or_else(|| "process CPU clock overflowed".to_owned())?;
+    const TICKS_PER_SECOND: u64 = 10_000_000;
+    let seconds = ticks / TICKS_PER_SECOND;
+    let nanoseconds = u32::try_from((ticks % TICKS_PER_SECOND) * 100)
+        .map_err(|_| "process CPU clock returned invalid subsecond ticks".to_owned())?;
+    Ok(Duration::new(seconds, nanoseconds))
+}
+
+#[cfg(target_os = "windows")]
+fn filetime_ticks(value: windows_sys::Win32::Foundation::FILETIME) -> u64 {
+    (u64::from(value.dwHighDateTime) << 32) | u64::from(value.dwLowDateTime)
+}
+
+#[cfg(unix)]
+fn process_cpu_clock_name() -> &'static str {
+    "CLOCK_PROCESS_CPUTIME_ID"
+}
+
+#[cfg(target_os = "windows")]
+fn process_cpu_clock_name() -> &'static str {
+    "GetProcessTimes"
+}
+
+#[cfg(not(any(unix, target_os = "windows")))]
+fn process_cpu_time() -> Result<Duration, String> {
+    Err("process CPU clock is unavailable on this platform".into())
+}
+
+#[cfg(not(any(unix, target_os = "windows")))]
+fn process_cpu_clock_name() -> &'static str {
+    "unavailable"
+}
+
 fn current_rss_bytes() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
@@ -731,6 +959,7 @@ fn parse_args() -> Result<Args, String> {
     let mut model_path = None;
     let mut seconds = 60usize;
     let mut parallel = 1usize;
+    let mut realtime_paced = false;
     let mut json = None;
     while let Some(argument) = arguments.next() {
         let value = |arguments: &mut std::iter::Skip<std::env::Args>| {
@@ -751,6 +980,7 @@ fn parse_args() -> Result<Args, String> {
                     .parse()
                     .map_err(|_| "--parallel must be an integer".to_string())?;
             }
+            "--realtime-paced" => realtime_paced = true,
             "--json" => json = Some(PathBuf::from(value(&mut arguments)?)),
             _ => return Err(format!("unknown argument `{argument}`\n{}", usage())),
         }
@@ -766,10 +996,11 @@ fn parse_args() -> Result<Args, String> {
         model_path: model_path.ok_or_else(|| format!("missing --model-path\n{}", usage()))?,
         seconds,
         parallel,
+        realtime_paced,
         json: json.ok_or_else(|| format!("missing --json\n{}", usage()))?,
     })
 }
 
 fn usage() -> &'static str {
-    "usage: dpdfnet_gtcrn_stress --model dpdfnet2|dpdfnet8|dpdfnet-daw|gtcrn|gtcrn-daw \\\n  --model-path MODEL.onnx [--seconds 60] [--parallel 1] --json RESULT.json"
+    "usage: dpdfnet_gtcrn_stress --model dpdfnet2|dpdfnet8|dpdfnet-daw|gtcrn|gtcrn-daw \\\n  --model-path MODEL.onnx [--seconds 60] [--parallel 1] [--realtime-paced] --json RESULT.json"
 }

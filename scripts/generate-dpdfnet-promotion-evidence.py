@@ -264,10 +264,114 @@ def generate(args: argparse.Namespace) -> bool:
     lowest_tier = 0
     for path, bundle in zip(args.platform_evidence, args.platform_attestation, strict=True):
         document, payload = load(path, "platform evidence")
-        if document.get("schema") != "denoize-dpdfnet-platform-evidence-v1" or document.get("source_commit") != source_commit:
+        platform_schema = document.get("schema")
+        platform_versions = {
+            "denoize-dpdfnet-platform-evidence-v1": 1,
+            "denoize-dpdfnet-platform-evidence-v2": 2,
+        }
+        if (
+            platform_schema not in platform_versions
+            or document.get("schema_version") != platform_versions[platform_schema]
+            or document.get("source_commit") != source_commit
+        ):
             raise PromotionError(f"platform evidence binds the wrong schema or source: {path}")
         operating_system = nested(document, "platform.os")
         hardware_tier = nested(document, "platform.hardware_tier")
+        if (
+            platform_schema == "denoize-dpdfnet-platform-evidence-v2"
+            and nested(document, "measurement.stress_realtime_paced") is not True
+        ):
+            raise PromotionError(
+                "v2 platform promotion evidence must record real-time pacing"
+            )
+        if platform_schema == "denoize-dpdfnet-platform-evidence-v2":
+            deadline_clock = nested(document, "measurement.deadline_clock")
+            compute_rtf_clock = nested(document, "measurement.compute_rtf_clock")
+            direct_call_deadline_gate_eligible = nested(
+                document, "measurement.direct_call_deadline_gate_eligible"
+            )
+            wall_clock_worker_gate_eligible = nested(
+                document, "measurement.wall_clock_worker_gate_eligible"
+            )
+            expected_deadline_clock = (
+                "process-cpu" if operating_system == "macos" else "monotonic-wall"
+            )
+            expected_compute_rtf_clock = (
+                "process-cpu"
+                if operating_system in {"macos", "windows"}
+                else "monotonic-wall"
+            )
+            if deadline_clock != expected_deadline_clock:
+                raise PromotionError(
+                    f"v2 {operating_system} platform evidence must use "
+                    f"{expected_deadline_clock} deadlines"
+                )
+            if compute_rtf_clock != expected_compute_rtf_clock:
+                raise PromotionError(
+                    f"v2 {operating_system} platform evidence must use "
+                    f"{expected_compute_rtf_clock} compute RTF"
+                )
+            expected_direct_call_gate = False
+            expected_worker_gate = hardware_tier == "portable-ci"
+            if direct_call_deadline_gate_eligible is not expected_direct_call_gate:
+                raise PromotionError(
+                    f"v2 {hardware_tier} platform evidence has invalid "
+                    "direct-call deadline eligibility"
+                )
+            if wall_clock_worker_gate_eligible is not expected_worker_gate:
+                raise PromotionError(
+                    f"v2 {hardware_tier} platform evidence has invalid "
+                    "wall-clock worker eligibility"
+                )
+            direct_call_check_ids = {
+                "stress-p99-9-ms",
+                "stress-maximum-ms",
+                "stress-deadline-misses",
+            }
+            observed_check_ids = {
+                item.get("id")
+                for item in document.get("checks", [])
+                if isinstance(item, dict)
+            }
+            has_any_direct_call_gate = bool(
+                direct_call_check_ids & observed_check_ids
+            )
+            if has_any_direct_call_gate:
+                raise PromotionError(
+                    f"v2 {hardware_tier} platform evidence unexpectedly applies "
+                    "the direct-call gate"
+                )
+            worker_gate_id = (
+                "worker-error-counters"
+                if wall_clock_worker_gate_eligible
+                else "worker-processing-errors"
+            )
+            unexpected_worker_gate_id = (
+                "worker-processing-errors"
+                if wall_clock_worker_gate_eligible
+                else "worker-error-counters"
+            )
+            if (
+                worker_gate_id not in observed_check_ids
+                or unexpected_worker_gate_id in observed_check_ids
+            ):
+                raise PromotionError(
+                    f"v2 {hardware_tier} platform evidence applies the wrong worker gate"
+                )
+            wall_p99_9_ms = nested(document, "measurement.wall_p99_9_ms")
+        else:
+            deadline_clock = "monotonic-wall"
+            compute_rtf_clock = "monotonic-wall"
+            direct_call_deadline_gate_eligible = True
+            wall_clock_worker_gate_eligible = True
+            wall_p99_9_ms = nested(document, "measurement.p99_9_ms")
+        if (
+            hardware_tier == "lowest-supported"
+            and platform_schema != "denoize-dpdfnet-platform-evidence-v2"
+        ):
+            raise PromotionError(
+                "lowest-supported promotion evidence must use the real-time-paced v2 schema"
+            )
         slot = (operating_system, hardware_tier)
         if slot in platform_slots:
             raise PromotionError(
@@ -284,7 +388,12 @@ def generate(args: argparse.Namespace) -> bool:
             "cpu_model": nested(document, "platform.cpu_model"),
             "hardware_tier": hardware_tier,
             "runner_label": nested(document, "platform.runner_label"),
+            "deadline_clock": deadline_clock,
+            "compute_rtf_clock": compute_rtf_clock,
+            "direct_call_deadline_gate_eligible": direct_call_deadline_gate_eligible,
+            "wall_clock_worker_gate_eligible": wall_clock_worker_gate_eligible,
             "p99_9_ms": nested(document, "measurement.p99_9_ms"),
+            "wall_p99_9_ms": wall_p99_9_ms,
             "peak_rss_bytes": nested(document, "measurement.peak_rss_bytes"),
             "accepted": document.get("accepted") is True and all(item.get("passed") is True for item in document.get("checks", [])),
         })

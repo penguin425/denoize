@@ -17,10 +17,10 @@ use clack_plugin::stream::{InputStream, OutputStream};
 use crossbeam_queue::ArrayQueue;
 use denoize::{
     AcceleratorRuntime, Backend, BackendOptions, ChannelMode, DenoiserConfig, GtcrnModel,
-    NEURAL_DAW_LATENCY_CHUNKS, NEURAL_DAW_MAX_SAMPLE_RATE, NEURAL_DAW_MODEL_ID,
-    NEURAL_DAW_MODEL_SHA256, NEURAL_DAW_PLUGIN_ID, NeuralDawModel,
-    NeuralDawOverloadFallback as OverloadFallback, NeuralDawParameters as NeuralParameters,
-    NeuralDawPortConfiguration as NeuralPortConfiguration,
+    NEURAL_DAW_BLOCK_POOL_SIZE, NEURAL_DAW_LATENCY_CHUNKS, NEURAL_DAW_MAX_SAMPLE_RATE,
+    NEURAL_DAW_MODEL_ID, NEURAL_DAW_MODEL_SHA256, NEURAL_DAW_PLUGIN_ID, NEURAL_DAW_QUEUE_BLOCKS,
+    NeuralDawModel, NeuralDawOverloadFallback as OverloadFallback,
+    NeuralDawParameters as NeuralParameters, NeuralDawPortConfiguration as NeuralPortConfiguration,
     NeuralDawSessionState as NeuralSessionState, OnnxModelConfig, StreamingBackendSession,
     neural_daw_chunk_frames, select_accelerator_for_options,
 };
@@ -44,8 +44,11 @@ pub(crate) const NEURAL_HQ_PLUGIN_ID: &str = NEURAL_HQ_DAW_PLUGIN_ID;
 const STATE_LIMIT_BYTES: u64 = 64 * 1024;
 const MODEL_ID: &str = NEURAL_DAW_MODEL_ID;
 const LATENCY_CHUNKS: u32 = NEURAL_DAW_LATENCY_CHUNKS;
-const QUEUE_BLOCKS: usize = 16;
-const BLOCK_POOL_SIZE: usize = 40;
+// Keep a complete declared-latency window available to the worker. A shorter
+// input queue can turn a recoverable host scheduling pause into a dropped
+// block and recurrent-state discontinuity before the 240 ms deadline expires.
+const QUEUE_BLOCKS: usize = NEURAL_DAW_QUEUE_BLOCKS;
+const BLOCK_POOL_SIZE: usize = NEURAL_DAW_BLOCK_POOL_SIZE;
 const WORKER_WARMUP_EXTRA_BLOCKS: usize = QUEUE_BLOCKS + 8;
 const WORKER_POLL: Duration = Duration::from_micros(100);
 const MAX_SAMPLE_RATE: u32 = NEURAL_DAW_MAX_SAMPLE_RATE;
@@ -1045,6 +1048,7 @@ struct AudioBlock {
 struct ProcessedBlock {
     block: AudioBlock,
     valid: bool,
+    invalid_output: bool,
 }
 
 trait BlockProcessor: Send {
@@ -1409,23 +1413,25 @@ impl<'a> NeuralEngine<'a> {
         let worker = thread::Builder::new()
             .name("denoize-neural".to_owned())
             .spawn(move || {
-                let (mut processor, priority_guard) = match factory().and_then(|mut processor| {
-                    warm_up_block_processor(&mut *processor, channels, warmup_frames)?;
-                    let priority_guard =
-                        denoize::neural_daw::NeuralDawWorkerPriorityGuard::acquire()?;
-                    Ok((processor, priority_guard))
-                }) {
-                    Ok(initialized) => {
-                        let _ = ready_tx.send(Ok(()));
-                        initialized
-                    }
-                    Err(error) => {
-                        let _ = ready_tx.send(Err(error));
-                        return;
-                    }
-                };
+                let (mut processor, mut priority_guard) =
+                    match factory().and_then(|mut processor| {
+                        warm_up_block_processor(&mut *processor, channels, warmup_frames)?;
+                        let priority_guard =
+                            denoize::neural_daw::NeuralDawWorkerPriorityGuard::acquire()?;
+                        Ok((processor, priority_guard))
+                    }) {
+                        Ok(initialized) => {
+                            let _ = ready_tx.send(Ok(()));
+                            initialized
+                        }
+                        Err(error) => {
+                            let _ = ready_tx.send(Err(error));
+                            return;
+                        }
+                    };
                 worker_loop(
                     &mut *processor,
+                    &mut priority_guard,
                     channels,
                     worker_input,
                     worker_output,
@@ -1632,7 +1638,11 @@ impl<'a> NeuralEngine<'a> {
             .is_some_and(|result| result.block.start_frame == due)
         {
             self.playback = self.ready.pop_front();
-            if self.playback.as_ref().is_some_and(|result| !result.valid) {
+            if self
+                .playback
+                .as_ref()
+                .is_some_and(|result| result.invalid_output)
+            {
                 self.metrics.invalid_blocks.fetch_add(1, Ordering::Relaxed);
             }
         } else {
@@ -1812,6 +1822,7 @@ impl NeuralEngine<'_> {
 
 fn worker_loop(
     processor: &mut dyn BlockProcessor,
+    priority_guard: &mut denoize::neural_daw::NeuralDawWorkerPriorityGuard,
     channels: usize,
     input: Arc<ArrayQueue<AudioBlock>>,
     output: Arc<ArrayQueue<ProcessedBlock>>,
@@ -1839,59 +1850,73 @@ fn worker_loop(
             thread::park_timeout(WORKER_POLL);
             continue;
         };
-        let discontinuity = block.generation != generation || block.start_frame != next_start;
-        if discontinuity {
-            generation = block.generation;
-            ready.iter_mut().for_each(VecDeque::clear);
-            while let Some(pending_block) = pending.pop_front() {
-                completed.push_back(ProcessedBlock {
-                    block: pending_block,
-                    valid: false,
-                });
-            }
-            failed = if let Err(error) = processor.reset() {
-                eprintln!("denoize Neural worker reset error: {error}");
-                worker_errors.fetch_add(1, Ordering::Relaxed);
-                true
-            } else {
-                false
-            };
-        }
-        next_start = block.start_frame.saturating_add(block.frames as u64);
-        if failed {
-            completed.push_back(ProcessedBlock {
-                block,
-                valid: false,
-            });
-            continue;
-        }
-
-        let planar = block_to_planar(&block, channels);
-        let processed = processor.process(&planar).and_then(|processed| {
-            append_ready(&mut ready, &processed, channels)
-                .map_err(|()| "neural worker returned invalid channel geometry".to_owned())
-        });
-        match processed {
-            Ok(()) => {
-                pending.push_back(block);
-                complete_ready_blocks(&mut pending, &mut completed, &mut ready, channels);
-            }
-            Err(error) => {
-                eprintln!("denoize Neural worker processing error: {error}");
-                failed = true;
-                worker_errors.fetch_add(1, Ordering::Relaxed);
-                completed.push_back(ProcessedBlock {
-                    block,
-                    valid: false,
-                });
+        // Once a block has been dequeued, all deadline-bound preparation,
+        // inference, and output assembly belongs to the same Audio Work
+        // Interval. Queue exchange and diagnostics stay outside the interval.
+        let cycle_failure = priority_guard.run_inference_cycle(|| {
+            let mut cycle_failure = None;
+            let discontinuity = block.generation != generation || block.start_frame != next_start;
+            if discontinuity {
+                generation = block.generation;
+                ready.iter_mut().for_each(VecDeque::clear);
                 while let Some(pending_block) = pending.pop_front() {
                     completed.push_back(ProcessedBlock {
                         block: pending_block,
                         valid: false,
+                        invalid_output: false,
                     });
                 }
-                ready.iter_mut().for_each(VecDeque::clear);
+                failed = if let Err(error) = processor.reset() {
+                    worker_errors.fetch_add(1, Ordering::Relaxed);
+                    cycle_failure = Some(("reset", error));
+                    true
+                } else {
+                    false
+                };
             }
+            next_start = block.start_frame.saturating_add(block.frames as u64);
+            if failed {
+                completed.push_back(ProcessedBlock {
+                    block,
+                    valid: false,
+                    invalid_output: false,
+                });
+                return cycle_failure;
+            }
+
+            let planar = block_to_planar(&block, channels);
+            let processed = processor.process(&planar).and_then(|processed| {
+                append_ready(&mut ready, &processed, channels)
+                    .map_err(|()| "neural worker returned invalid channel geometry".to_owned())
+            });
+            match processed {
+                Ok(()) => {
+                    pending.push_back(block);
+                    complete_ready_blocks(&mut pending, &mut completed, &mut ready, channels);
+                }
+                Err(error) => {
+                    failed = true;
+                    worker_errors.fetch_add(1, Ordering::Relaxed);
+                    cycle_failure = Some(("processing", error));
+                    completed.push_back(ProcessedBlock {
+                        block,
+                        valid: false,
+                        invalid_output: false,
+                    });
+                    while let Some(pending_block) = pending.pop_front() {
+                        completed.push_back(ProcessedBlock {
+                            block: pending_block,
+                            valid: false,
+                            invalid_output: false,
+                        });
+                    }
+                    ready.iter_mut().for_each(VecDeque::clear);
+                }
+            }
+            cycle_failure
+        });
+        if let Some((operation, error)) = cycle_failure {
+            eprintln!("denoize Neural worker {operation} error: {error}");
         }
     }
 }
@@ -1954,7 +1979,11 @@ fn complete_ready_blocks(
                 };
             }
         }
-        completed.push_back(ProcessedBlock { block, valid });
+        completed.push_back(ProcessedBlock {
+            block,
+            valid,
+            invalid_output: !valid,
+        });
     }
 }
 
@@ -2089,6 +2118,54 @@ mod tests {
         .unwrap();
         hq.validate_for_model(NeuralDawModel::Dpdfnet2).unwrap();
         assert!(hq.validate_for_model(NeuralDawModel::Gtcrn).is_err());
+    }
+
+    #[test]
+    fn worker_queues_cover_the_declared_latency_window() {
+        assert_eq!(QUEUE_BLOCKS, LATENCY_CHUNKS as usize);
+        assert_eq!(BLOCK_POOL_SIZE, QUEUE_BLOCKS * 2 + 8);
+    }
+
+    #[test]
+    fn lowest_tier_worker_gate_relaxes_only_scheduling_counters() {
+        let scheduling_only = WorkerMetrics {
+            overload_blocks: 3,
+            late_blocks: 2,
+            ..WorkerMetrics::default()
+        };
+        assert!(worker_metrics_pass(scheduling_only, false));
+        assert!(!worker_metrics_pass(scheduling_only, true));
+        assert!(!worker_metrics_pass(
+            WorkerMetrics {
+                invalid_blocks: 1,
+                ..WorkerMetrics::default()
+            },
+            false,
+        ));
+        assert!(!worker_metrics_pass(
+            WorkerMetrics {
+                worker_errors: 1,
+                ..WorkerMetrics::default()
+            },
+            false,
+        ));
+    }
+
+    #[test]
+    fn unsafe_worker_output_is_distinct_from_a_scheduling_fallback() {
+        let mut pending = VecDeque::from([AudioBlock {
+            generation: 1,
+            start_frame: 0,
+            frames: 1,
+            samples: vec![0.0].into_boxed_slice(),
+        }]);
+        let mut completed = VecDeque::new();
+        let mut ready = [VecDeque::from([MAX_OUTPUT_PEAK + 1.0])];
+        complete_ready_blocks(&mut pending, &mut completed, &mut ready, 1);
+
+        let result = completed.pop_front().unwrap();
+        assert!(!result.valid);
+        assert!(result.invalid_output);
     }
 
     #[test]
@@ -2452,17 +2529,24 @@ mod tests {
     #[test]
     #[ignore = "requires the pinned managed GTCRN model and cargo test --release"]
     fn pinned_gtcrn_release_worker_meets_sustained_deadlines() {
-        assert_pinned_release_worker(NeuralDawModel::Gtcrn);
+        assert_pinned_release_worker(NeuralDawModel::Gtcrn, true);
     }
 
     #[test]
     #[ignore = "requires the pinned managed DPDFNet model and cargo test --release"]
     #[cfg(feature = "experimental-dpdfnet-hq")]
     fn pinned_dpdfnet2_release_worker_meets_sustained_deadlines() {
-        assert_pinned_release_worker(NeuralDawModel::Dpdfnet2);
+        assert_pinned_release_worker(NeuralDawModel::Dpdfnet2, true);
     }
 
-    fn assert_pinned_release_worker(model: NeuralDawModel) {
+    #[test]
+    #[ignore = "requires the pinned managed DPDFNet model and cargo test --release"]
+    #[cfg(feature = "experimental-dpdfnet-hq")]
+    fn pinned_dpdfnet2_release_worker_measures_lowest_tier_capacity() {
+        assert_pinned_release_worker(NeuralDawModel::Dpdfnet2, false);
+    }
+
+    fn assert_pinned_release_worker(model: NeuralDawModel, require_zero_scheduling_counters: bool) {
         assert!(
             !cfg!(debug_assertions),
             "the sustained neural deadline gate must exercise the release profile"
@@ -2479,13 +2563,34 @@ mod tests {
         assert_eq!(shared.late_blocks.load(Ordering::Relaxed), 0);
         assert_eq!(shared.invalid_blocks.load(Ordering::Relaxed), 0);
 
+        let paced_seconds = std::env::var("DENOIZE_NEURAL_WORKER_SECONDS")
+            .map(|value| {
+                value
+                    .parse::<usize>()
+                    .expect("DENOIZE_NEURAL_WORKER_SECONDS must be an integer")
+            })
+            .unwrap_or(1);
+        assert!(
+            (1..=3_600).contains(&paced_seconds),
+            "DENOIZE_NEURAL_WORKER_SECONDS must be between 1 and 3600"
+        );
+        let paced_blocks = paced_seconds * 100;
         let latency = engine.latency_frames as usize;
-        let frames = latency + engine.chunk_frames * 100;
+        assert_eq!(
+            latency % engine.chunk_frames,
+            0,
+            "worker latency must contain whole callback blocks"
+        );
+        let latency_blocks = latency / engine.chunk_frames;
+        let total_blocks = latency_blocks + paced_blocks;
+        let frames = engine.chunk_frames * total_blocks;
         let mut finite = 0usize;
         let mut neural_frames = 0usize;
         let mut inputs = Vec::with_capacity(frames);
         let mut noise_state = 0x5eed_1234_9876_abcd_u64;
-        let measurement_started = Instant::now();
+        // Fixture generation is not part of the simulated callback cadence.
+        // Build it before starting the wall-clock measurement so every block
+        // can be presented on one absolute 10 ms schedule.
         for frame in 0..frames {
             let phase = frame as f64 * 440.0 * std::f64::consts::TAU / 48_000.0;
             noise_state = noise_state
@@ -2494,18 +2599,43 @@ mod tests {
             let noise = f64::from((noise_state >> 32) as u32) / f64::from(u32::MAX) - 0.5;
             let input = phase.sin() * 0.03 + noise * 0.08;
             inputs.push(input);
-            let output = engine.process_frame([input, 0.0], parameters)[0];
-            finite += usize::from(output.is_finite());
-            if frame >= latency && (output - inputs[frame - latency]).abs() > 1.0e-6 {
-                neural_frames += 1;
+        }
+
+        let measurement_started = Instant::now();
+        for block in 0..total_blocks {
+            let due = measurement_started
+                + Duration::from_micros(
+                    (block as u64)
+                        .saturating_mul(u64::from(denoize::NEURAL_DAW_CHUNK_MILLIS))
+                        .saturating_mul(1_000),
+                );
+            if let Some(delay) = due.checked_duration_since(Instant::now()) {
+                thread::sleep(delay);
             }
-            if frame % engine.chunk_frames == 0 {
-                thread::sleep(Duration::from_millis(u64::from(
-                    denoize::NEURAL_DAW_CHUNK_MILLIS,
-                )));
+            let start = block * engine.chunk_frames;
+            for frame in start..start + engine.chunk_frames {
+                let output = engine.process_frame([inputs[frame], 0.0], parameters)[0];
+                finite += usize::from(output.is_finite());
+                if frame >= latency && (output - inputs[frame - latency]).abs() > 1.0e-6 {
+                    neural_frames += 1;
+                }
             }
         }
         let measurement_wall_seconds = measurement_started.elapsed().as_secs_f64();
+        let worker_metrics = shared.worker_metrics();
+        // Preserve the complete run even when a following gate assertion
+        // fails, so rejected CI artifacts identify the actual counter rather
+        // than stopping at the first assertion without worker evidence.
+        write_worker_evidence(
+            model,
+            &engine,
+            frames,
+            finite,
+            neural_frames,
+            paced_blocks,
+            measurement_wall_seconds,
+            shared,
+        );
         assert_eq!(finite, frames);
         assert!(
             neural_frames >= engine.chunk_frames,
@@ -2518,19 +2648,16 @@ mod tests {
             engine.output_queue.len(),
             engine.ready.len(),
         );
-        assert_eq!(shared.worker_errors.load(Ordering::Relaxed), 0);
-        assert_eq!(shared.invalid_blocks.load(Ordering::Relaxed), 0);
-        assert_eq!(shared.overload_blocks.load(Ordering::Relaxed), 0);
-        assert_eq!(shared.late_blocks.load(Ordering::Relaxed), 0);
-        write_worker_evidence(
-            model,
-            &engine,
-            frames,
-            finite,
-            neural_frames,
-            measurement_wall_seconds,
-            shared,
+        assert!(
+            worker_metrics_pass(worker_metrics, require_zero_scheduling_counters),
+            "worker metrics did not pass this tier: {worker_metrics:?}"
         );
+    }
+
+    fn worker_metrics_pass(metrics: WorkerMetrics, require_zero_scheduling_counters: bool) -> bool {
+        metrics.worker_errors == 0
+            && metrics.invalid_blocks == 0
+            && (!require_zero_scheduling_counters || metrics == WorkerMetrics::default())
     }
 
     fn write_worker_evidence(
@@ -2539,6 +2666,7 @@ mod tests {
         measured_frames: usize,
         finite_frames: usize,
         neural_frames: usize,
+        paced_blocks: usize,
         measurement_wall_seconds: f64,
         shared: &NeuralShared,
     ) {
@@ -2556,7 +2684,7 @@ mod tests {
             "channels": 1,
             "chunk_frames": engine.chunk_frames,
             "latency_frames": engine.latency_frames,
-            "paced_blocks": 100,
+            "paced_blocks": paced_blocks,
             "measured_frames": measured_frames,
             "finite_frames": finite_frames,
             "neural_frames": neural_frames,

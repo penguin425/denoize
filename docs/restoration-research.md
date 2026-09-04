@@ -300,7 +300,7 @@ four chunks. This is 10,584, 11,520, and 23,040 frames at 44.1, 48, and 96 kHz
 respectively (240 ms). CLAP carries sample rate as a floating-point value, so
 finite fractional rates use the same formula rather than being rejected; the
 integer-rate backend receives the nearest rate only for its resampling ratio.
-The callback owns a 40-block pool and bounded 16-block input/result queues. An
+The callback owns a 56-block pool and bounded 24-block input/result queues. An
 absolute input-frame identity plus reset generation prevents late work from a
 previous transport/session from being replayed.
 
