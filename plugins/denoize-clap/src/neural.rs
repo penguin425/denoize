@@ -1052,8 +1052,50 @@ struct ProcessedBlock {
 }
 
 trait BlockProcessor: Send {
-    fn process(&mut self, channels: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, String>;
+    fn process(&mut self, channels: Vec<Vec<f64>>) -> Result<Vec<Vec<f64>>, String>;
     fn reset(&mut self) -> Result<(), String>;
+}
+
+struct WorkerBuffers {
+    planar: Vec<Vec<f64>>,
+    pending: VecDeque<AudioBlock>,
+    completed: VecDeque<ProcessedBlock>,
+    ready: Vec<VecDeque<f64>>,
+}
+
+impl WorkerBuffers {
+    fn new(channels: usize, chunk_frames: usize) -> Result<Self, String> {
+        let ready_frames = chunk_frames
+            .checked_mul(QUEUE_BLOCKS)
+            .ok_or_else(|| "neural worker ready-buffer geometry overflow".to_owned())?;
+        let mut planar = Vec::new();
+        prepare_planar(&mut planar, channels, chunk_frames)?;
+        let mut ready = Vec::new();
+        ready
+            .try_reserve_exact(channels)
+            .map_err(|_| "unable to reserve neural worker ready channels".to_owned())?;
+        for _ in 0..channels {
+            let mut channel_ready = VecDeque::new();
+            channel_ready
+                .try_reserve_exact(ready_frames)
+                .map_err(|_| "unable to reserve neural worker ready samples".to_owned())?;
+            ready.push(channel_ready);
+        }
+        let mut pending = VecDeque::new();
+        pending
+            .try_reserve_exact(BLOCK_POOL_SIZE)
+            .map_err(|_| "unable to reserve neural worker pending blocks".to_owned())?;
+        let mut completed = VecDeque::new();
+        completed
+            .try_reserve_exact(BLOCK_POOL_SIZE)
+            .map_err(|_| "unable to reserve neural worker completed blocks".to_owned())?;
+        Ok(Self {
+            planar,
+            pending,
+            completed,
+            ready,
+        })
+    }
 }
 
 fn warm_up_block_processor(
@@ -1063,7 +1105,7 @@ fn warm_up_block_processor(
 ) -> Result<(), String> {
     let input = vec![vec![0.0; frames]; channels];
     let output = processor
-        .process(&input)
+        .process(input)
         .map_err(|error| format!("warm up neural inference worker: {error}"))?;
     // Streaming backends may retain their look-ahead tail until `finish`, so a
     // successful warm-up can legitimately return fewer frames than it accepts.
@@ -1143,8 +1185,8 @@ fn prepared_gtcrn_model(
 }
 
 impl BlockProcessor for GtcrnProcessor {
-    fn process(&mut self, channels: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, String> {
-        self.0.process_block(channels)
+    fn process(&mut self, channels: Vec<Vec<f64>>) -> Result<Vec<Vec<f64>>, String> {
+        self.0.process_owned_block(channels)
     }
 
     fn reset(&mut self) -> Result<(), String> {
@@ -1229,8 +1271,8 @@ fn prepared_dpdfnet_model(
 
 #[cfg(feature = "experimental-dpdfnet-hq")]
 impl BlockProcessor for DpdfnetProcessor {
-    fn process(&mut self, channels: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, String> {
-        self.0.process_block(channels)
+    fn process(&mut self, channels: Vec<Vec<f64>>) -> Result<Vec<Vec<f64>>, String> {
+        self.0.process_owned_block(channels)
     }
 
     fn reset(&mut self) -> Result<(), String> {
@@ -1413,12 +1455,13 @@ impl<'a> NeuralEngine<'a> {
         let worker = thread::Builder::new()
             .name("denoize-neural".to_owned())
             .spawn(move || {
-                let (mut processor, mut priority_guard) =
+                let (mut processor, mut priority_guard, worker_buffers) =
                     match factory().and_then(|mut processor| {
                         warm_up_block_processor(&mut *processor, channels, warmup_frames)?;
+                        let worker_buffers = WorkerBuffers::new(channels, chunk_frames)?;
                         let priority_guard =
                             denoize::neural_daw::NeuralDawWorkerPriorityGuard::acquire()?;
-                        Ok((processor, priority_guard))
+                        Ok((processor, priority_guard, worker_buffers))
                     }) {
                         Ok(initialized) => {
                             let _ = ready_tx.send(Ok(()));
@@ -1432,7 +1475,7 @@ impl<'a> NeuralEngine<'a> {
                 worker_loop(
                     &mut *processor,
                     &mut priority_guard,
-                    channels,
+                    worker_buffers,
                     worker_input,
                     worker_output,
                     worker_running,
@@ -1823,7 +1866,7 @@ impl NeuralEngine<'_> {
 fn worker_loop(
     processor: &mut dyn BlockProcessor,
     priority_guard: &mut denoize::neural_daw::NeuralDawWorkerPriorityGuard,
-    channels: usize,
+    worker_buffers: WorkerBuffers,
     input: Arc<ArrayQueue<AudioBlock>>,
     output: Arc<ArrayQueue<ProcessedBlock>>,
     running: Arc<AtomicBool>,
@@ -1831,11 +1874,13 @@ fn worker_loop(
 ) {
     let mut generation = 0u64;
     let mut next_start = 0u64;
-    let mut pending = VecDeque::<AudioBlock>::new();
-    let mut completed = VecDeque::<ProcessedBlock>::new();
-    let mut ready = (0..channels)
-        .map(|_| VecDeque::<f64>::new())
-        .collect::<Vec<_>>();
+    let WorkerBuffers {
+        mut planar,
+        mut pending,
+        mut completed,
+        mut ready,
+    } = worker_buffers;
+    let channels = planar.len();
     let mut failed = false;
 
     while running.load(Ordering::Acquire) {
@@ -1884,10 +1929,13 @@ fn worker_loop(
                 return cycle_failure;
             }
 
-            let planar = block_to_planar(&block, channels);
-            let processed = processor.process(&planar).and_then(|processed| {
-                append_ready(&mut ready, &processed, channels)
-                    .map_err(|()| "neural worker returned invalid channel geometry".to_owned())
+            let processed = fill_planar(&block, channels, &mut planar)
+                .and_then(|()| processor.process(std::mem::take(&mut planar)));
+            let processed = processed.and_then(|processed| {
+                let appended = append_ready(&mut ready, &processed, channels)
+                    .map_err(|()| "neural worker returned invalid channel geometry".to_owned());
+                planar = processed;
+                appended
             });
             match processed {
                 Ok(()) => {
@@ -1921,16 +1969,48 @@ fn worker_loop(
     }
 }
 
-fn block_to_planar(block: &AudioBlock, channels: usize) -> Vec<Vec<f64>> {
-    let mut planar = (0..channels)
-        .map(|_| Vec::with_capacity(block.frames))
-        .collect::<Vec<_>>();
+fn prepare_planar(
+    planar: &mut Vec<Vec<f64>>,
+    channels: usize,
+    frames: usize,
+) -> Result<(), String> {
+    if planar.len() != channels {
+        planar.clear();
+        planar
+            .try_reserve_exact(channels)
+            .map_err(|_| "unable to reserve neural worker planar channels".to_owned())?;
+        for _ in 0..channels {
+            planar.push(Vec::new());
+        }
+    }
+    for destination in planar {
+        destination.clear();
+        destination
+            .try_reserve_exact(frames)
+            .map_err(|_| "unable to reserve neural worker planar samples".to_owned())?;
+    }
+    Ok(())
+}
+
+fn fill_planar(
+    block: &AudioBlock,
+    channels: usize,
+    planar: &mut Vec<Vec<f64>>,
+) -> Result<(), String> {
+    if block
+        .frames
+        .checked_mul(channels)
+        .is_none_or(|samples| samples > block.samples.len())
+    {
+        return Err("neural worker received invalid planar scratch geometry".to_owned());
+    }
+    prepare_planar(planar, channels, block.frames)?;
     for frame in 0..block.frames {
         for (channel, destination) in planar.iter_mut().enumerate() {
             destination.push(f64::from(block.samples[frame * channels + channel]));
         }
     }
-    planar
+    Ok(())
 }
 
 fn append_ready(
@@ -2066,8 +2146,8 @@ mod tests {
     struct IdentityProcessor;
 
     impl BlockProcessor for IdentityProcessor {
-        fn process(&mut self, channels: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, String> {
-            Ok(channels.to_vec())
+        fn process(&mut self, channels: Vec<Vec<f64>>) -> Result<Vec<Vec<f64>>, String> {
+            Ok(channels)
         }
 
         fn reset(&mut self) -> Result<(), String> {
@@ -2078,9 +2158,9 @@ mod tests {
     struct StalledProcessor;
 
     impl BlockProcessor for StalledProcessor {
-        fn process(&mut self, channels: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, String> {
+        fn process(&mut self, channels: Vec<Vec<f64>>) -> Result<Vec<Vec<f64>>, String> {
             thread::sleep(Duration::from_millis(250));
-            Ok(channels.to_vec())
+            Ok(channels)
         }
 
         fn reset(&mut self) -> Result<(), String> {
@@ -2335,8 +2415,8 @@ mod tests {
         struct PanicOnDrop;
 
         impl BlockProcessor for PanicOnDrop {
-            fn process(&mut self, channels: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, String> {
-                Ok(channels.to_vec())
+            fn process(&mut self, channels: Vec<Vec<f64>>) -> Result<Vec<Vec<f64>>, String> {
+                Ok(channels)
             }
 
             fn reset(&mut self) -> Result<(), String> {
@@ -2378,12 +2458,12 @@ mod tests {
         }
 
         impl BlockProcessor for WarmupProbe {
-            fn process(&mut self, channels: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, String> {
+            fn process(&mut self, mut channels: Vec<Vec<f64>>) -> Result<Vec<Vec<f64>>, String> {
                 self.process_calls.fetch_add(1, Ordering::Relaxed);
-                Ok(channels
-                    .iter()
-                    .map(|channel| channel[..channel.len() - 1].to_vec())
-                    .collect())
+                channels.iter_mut().for_each(|channel| {
+                    channel.pop();
+                });
+                Ok(channels)
             }
 
             fn reset(&mut self) -> Result<(), String> {
@@ -2409,6 +2489,111 @@ mod tests {
         assert_eq!(engine.processed_frames, 0);
         assert_eq!(engine.input_queue.len(), 0);
         assert_eq!(engine.output_queue.len(), 0);
+        engine.stop();
+    }
+
+    #[test]
+    fn worker_reuses_owned_planar_storage_between_blocks() {
+        struct StorageProbe {
+            warmed: bool,
+            observed: mpsc::SyncSender<usize>,
+        }
+
+        impl BlockProcessor for StorageProbe {
+            fn process(&mut self, channels: Vec<Vec<f64>>) -> Result<Vec<Vec<f64>>, String> {
+                if self.warmed {
+                    let Some(channel) = channels.first() else {
+                        return Err("storage probe received no channels".to_owned());
+                    };
+                    self.observed
+                        .send(channel.as_ptr() as usize)
+                        .map_err(|_| "storage probe receiver was dropped".to_owned())?;
+                }
+                Ok(channels)
+            }
+
+            fn reset(&mut self) -> Result<(), String> {
+                self.warmed = true;
+                Ok(())
+            }
+        }
+
+        let (observed_tx, observed_rx) = mpsc::sync_channel(2);
+        let mut engine = test_engine(1, move || {
+            Ok(Box::new(StorageProbe {
+                warmed: false,
+                observed: observed_tx,
+            }))
+        });
+        let parameters = RuntimeParameters::from(NeuralParameters::default());
+        for _ in 0..engine.chunk_frames * 2 {
+            engine.process_frame([0.1, 0.0], parameters);
+        }
+
+        let Ok(first) = observed_rx.recv_timeout(Duration::from_secs(1)) else {
+            panic!("worker did not process the first block");
+        };
+        let Ok(second) = observed_rx.recv_timeout(Duration::from_secs(1)) else {
+            panic!("worker did not process the second block");
+        };
+        assert_eq!(first, second);
+        engine.stop();
+    }
+
+    #[test]
+    fn worker_rebuilds_owned_planar_storage_after_processing_error() {
+        struct ErrorThenRecover {
+            warmed: bool,
+            fail_next: bool,
+            failed: mpsc::SyncSender<()>,
+            recovered: mpsc::SyncSender<()>,
+        }
+
+        impl BlockProcessor for ErrorThenRecover {
+            fn process(&mut self, channels: Vec<Vec<f64>>) -> Result<Vec<Vec<f64>>, String> {
+                if self.warmed && self.fail_next {
+                    self.fail_next = false;
+                    let _ = self.failed.send(());
+                    return Err("injected processing failure".to_owned());
+                }
+                if self.warmed {
+                    let _ = self.recovered.send(());
+                }
+                Ok(channels)
+            }
+
+            fn reset(&mut self) -> Result<(), String> {
+                self.warmed = true;
+                Ok(())
+            }
+        }
+
+        let (failed_tx, failed_rx) = mpsc::sync_channel(1);
+        let (recovered_tx, recovered_rx) = mpsc::sync_channel(1);
+        let mut engine = test_engine(1, move || {
+            Ok(Box::new(ErrorThenRecover {
+                warmed: false,
+                fail_next: true,
+                failed: failed_tx,
+                recovered: recovered_tx,
+            }))
+        });
+        let parameters = RuntimeParameters::from(NeuralParameters::default());
+        for _ in 0..engine.chunk_frames {
+            engine.process_frame([0.1, 0.0], parameters);
+        }
+        if failed_rx.recv_timeout(Duration::from_secs(1)).is_err() {
+            panic!("worker did not report the injected failure");
+        }
+
+        engine.reset();
+        for _ in 0..engine.chunk_frames {
+            engine.process_frame([0.2, 0.0], parameters);
+        }
+        if recovered_rx.recv_timeout(Duration::from_secs(1)).is_err() {
+            panic!("worker did not recover after the transport reset");
+        }
+        assert_eq!(engine.metrics.worker_errors.load(Ordering::Relaxed), 1);
         engine.stop();
     }
 
@@ -2450,12 +2635,12 @@ mod tests {
         }
 
         impl BlockProcessor for ResetBlockingProcessor {
-            fn process(&mut self, channels: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, String> {
+            fn process(&mut self, channels: Vec<Vec<f64>>) -> Result<Vec<Vec<f64>>, String> {
                 if self.warmed {
                     let _ = self.started.send(());
                     let _ = self.release.recv();
                 }
-                Ok(channels.to_vec())
+                Ok(channels)
             }
 
             fn reset(&mut self) -> Result<(), String> {

@@ -544,6 +544,27 @@ impl StreamingBackendSession {
         self.process_block_with_limit(channels, MAX_STREAM_BLOCK_FRAMES)
     }
 
+    /// Process an owned block, reusing its channel storage when the selected
+    /// backend and channel-mode adapter support that fast path.
+    ///
+    /// This has the same stream semantics as [`process_block`](Self::process_block).
+    /// Callers that already own a bounded realtime scratch block can pass it
+    /// here and retain the returned storage for the next call.
+    pub fn process_owned_block(
+        &mut self,
+        channels: Vec<Vec<f64>>,
+    ) -> Result<Vec<Vec<f64>>, String> {
+        if self.finished {
+            return Err("streaming backend session has already been finished".into());
+        }
+        validate_block(&channels, self.input_channels)?;
+        let frames = channels.first().map_or(0, Vec::len);
+        if frames > MAX_STREAM_BLOCK_FRAMES {
+            return self.process_block_with_limit(&channels, MAX_STREAM_BLOCK_FRAMES);
+        }
+        self.process_bounded_owned_block(channels)
+    }
+
     /// Flush every pending model frame and converter delay exactly once.
     pub fn finish(&mut self) -> Result<Vec<Vec<f64>>, String> {
         if self.finished {
@@ -758,9 +779,63 @@ impl StreamingBackendSession {
         }
     }
 
-    fn restore_channel_mode(
+    fn process_bounded_owned_block(
+        &mut self,
+        mut channels: Vec<Vec<f64>>,
+    ) -> Result<Vec<Vec<f64>>, String> {
+        // The existing mid-side helper returns independently allocated
+        // channels. Keep its established path until it has an owned adapter;
+        // the neural DAW contract uses Independent or StereoLinked mode.
+        if self.channel_mode == ChannelMode::MidSide {
+            return self.process_bounded_block(&channels);
+        }
+        if let Some(vad) = &mut self.vad {
+            vad.push_input(&channels)?;
+        }
+        let mut linked_right = None;
+        let processed = match self.channel_mode {
+            ChannelMode::Independent => self.processor.process_owned_block(channels),
+            ChannelMode::StereoLinked => {
+                let frames = channels[0].len();
+                self.linked_original.try_reserve(frames).map_err(|_| {
+                    ConfigError::allocation_failed("linked stream alignment").to_string()
+                })?;
+                let mut right = channels
+                    .pop()
+                    .ok_or_else(|| "linked stream input is missing its right channel".to_owned())?;
+                let left = channels
+                    .first_mut()
+                    .ok_or_else(|| "linked stream input is missing its left channel".to_owned())?;
+                for (left, &right) in left.iter_mut().zip(&right) {
+                    let original_left = crate::audio::sanitize_sample(*left);
+                    let original_right = crate::audio::sanitize_sample(right);
+                    *left = (original_left + original_right) * 0.5;
+                    self.linked_original
+                        .push_back((original_left, original_right));
+                }
+                right.clear();
+                linked_right = Some(right);
+                self.processor.process_owned_block(channels)
+            }
+            ChannelMode::MidSide => unreachable!("mid-side returned through the borrowed path"),
+        }?;
+        let processed = self.restore_channel_mode_with_scratch(processed, linked_right)?;
+        if let Some(vad) = &mut self.vad {
+            vad.push_processed(&processed)?;
+            vad.drain_ready()
+        } else {
+            Ok(processed)
+        }
+    }
+
+    fn restore_channel_mode(&mut self, processed: Vec<Vec<f64>>) -> Result<Vec<Vec<f64>>, String> {
+        self.restore_channel_mode_with_scratch(processed, None)
+    }
+
+    fn restore_channel_mode_with_scratch(
         &mut self,
         mut processed: Vec<Vec<f64>>,
+        linked_right: Option<Vec<f64>>,
     ) -> Result<Vec<Vec<f64>>, String> {
         match self.channel_mode {
             ChannelMode::Independent => {
@@ -777,7 +852,8 @@ impl StreamingBackendSession {
                 if left.len() > self.linked_original.len() {
                     return Err("linked streaming backend returned unaligned frames".into());
                 }
-                let mut right = Vec::new();
+                let mut right = linked_right.unwrap_or_default();
+                right.clear();
                 right.try_reserve_exact(left.len()).map_err(|_| {
                     ConfigError::allocation_failed("linked stream output").to_string()
                 })?;
@@ -941,11 +1017,16 @@ mod tests {
         let mut enhanced_channels = Vec::with_capacity(2);
         enhanced_channels.push(enhanced);
         let channels_ptr = enhanced_channels.as_ptr();
-        let output = session.restore_channel_mode(enhanced_channels).unwrap();
+        let right = Vec::with_capacity(original.len());
+        let right_ptr = right.as_ptr();
+        let output = session
+            .restore_channel_mode_with_scratch(enhanced_channels, Some(right))
+            .unwrap();
 
         assert_eq!(output.len(), 2);
         assert_eq!(output.as_ptr(), channels_ptr);
         assert_eq!(output[0].as_ptr(), enhanced_ptr);
+        assert_eq!(output[1].as_ptr(), right_ptr);
         assert!(session.linked_original.is_empty());
         let expected = [[0.4, -0.35, 0.65], [0.0, 0.25, 0.15]];
         for (actual, expected) in output.iter().zip(expected) {
