@@ -3578,7 +3578,6 @@ mod tests {
         let requested_frames = 11_520 + seconds * 48_000;
         let callback_calls = requested_frames.div_ceil(callback_frames);
         let frames = callback_calls * callback_frames;
-        let inputs = stereo_worker_fixture(frames);
         let shared = NeuralShared::new_for_model(NeuralDawModel::Dpdfnet2).unwrap();
         let epoch = Instant::now();
         let mut engine = NeuralEngine::new_with_factory_inner(
@@ -3603,6 +3602,9 @@ mod tests {
         let mut dropped_callbacks = 0usize;
         let mut finite_frames = 0usize;
         let mut neural_frames = [0usize; 2];
+        // Match the strict worker gate's activation-before-fixture order.
+        // Both fixture preparation and trace storage remain off cadence.
+        let inputs = stereo_worker_fixture(frames);
         let measurement_started = Instant::now();
         let measurement_start_ns = measurement_started.duration_since(epoch).as_nanos() as u64;
         for callback in 0..callback_calls {
@@ -3705,6 +3707,11 @@ mod tests {
         let document = serde_json::json!({
             "schema": "denoize-dpdfnet-worker-profile-diagnostic-v1",
             "diagnostic_only": true,
+            "model_id": NeuralDawModel::Dpdfnet2.model_id(),
+            "model_sha256": NeuralDawModel::Dpdfnet2.model_sha256(),
+            "channels": 2,
+            "channel_mode": "independent",
+            "fixture_preparation_order": "activation_then_fixture_then_measurement",
             "test_binary_sha256": test_binary_sha256,
             "test_allocator": if cfg!(feature = "diagnostic-mimalloc") { "mimalloc" } else { "std-system" },
             "diagnostic_mimalloc_feature": cfg!(feature = "diagnostic-mimalloc"),
