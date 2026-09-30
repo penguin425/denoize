@@ -328,6 +328,49 @@ jobs:
           cp "${{ steps.attest.outputs.bundle-path }}" \
             "$DENOIZE_EVIDENCE_DIR/dpdfnet-${{ matrix.target }}.sigstore.json"
 
+      - name: Record verifier GitHub CLI version
+        if: github.event_name != 'pull_request'
+        shell: bash
+        run: |
+          gh --version | tee "$RUNNER_TEMP/dpdfnet-gh-version-${{ matrix.target }}.txt"
+
+      - name: Verify local attestation bundle subjects
+        if: github.event_name != 'pull_request'
+        id: verify-local-attestation
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bundle="$DENOIZE_EVIDENCE_DIR/dpdfnet-${{ matrix.target }}.sigstore.json"
+          test -f "$bundle"
+          subjects=()
+          shopt -s nullglob dotglob
+          for subject in "$DENOIZE_EVIDENCE_DIR"/*; do
+            [[ -f "$subject" ]] || continue
+            [[ "$subject" == "$bundle" ]] && continue
+            subjects+=("$subject")
+          done
+          test "${#subjects[@]}" -gt 0
+          for subject in "${subjects[@]}"; do
+            gh attestation verify "$subject" \
+              --repo penguin425/denoize \
+              --bundle "$bundle" \
+              --signer-workflow penguin425/denoize/.github/workflows/dpdfnet-promotion.yml \
+              --source-digest "$GITHUB_SHA"
+          done
+
+      - name: Preserve rejected local attestation diagnostics
+        if: failure() && steps.verify-local-attestation.outcome == 'failure'
+        # actions/upload-artifact v6.
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: dpdfnet-rejected-attestation-${{ matrix.target }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/dpdfnet-evidence
+            ${{ runner.temp }}/dpdfnet-gh-version-${{ matrix.target }}.txt
+          if-no-files-found: warn
+          retention-days: 7
+
       - name: Upload experimental artifact and evidence
         # actions/upload-artifact v6.
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
