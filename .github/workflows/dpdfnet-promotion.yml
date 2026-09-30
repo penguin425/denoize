@@ -254,6 +254,36 @@ jobs:
             neural::tests::pinned_dpdfnet2_release_worker_profiles_deadline_failure \
             -- --ignored --exact --nocapture
 
+      - name: Profile rejected optimized model operations separately from its gate
+        if: failure() && steps.worker_gate.outcome == 'failure'
+        continue-on-error: true
+        shell: bash
+        env:
+          DENOIZE_DPDFNET_OP_PROFILE: ${{ runner.temp }}/dpdfnet-evidence/model-op-profile.json
+          RAYON_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+        run: |
+          cargo test --locked --release --target "${{ matrix.target }}" \
+            --lib --no-default-features --features dpdfnet,gtcrn \
+            backend::dpdfnet::tests::pinned_dpdfnet2_op_profile_diagnostic \
+            -- --ignored --exact --nocapture
+
+      - name: Compare rejected Windows callback notifications on the same runner
+        if: failure() && runner.os == 'Windows' && steps.worker_gate.outcome == 'failure'
+        continue-on-error: true
+        shell: bash
+        env:
+          DENOIZE_NEURAL_WORKER_PROFILE: ${{ runner.temp }}/dpdfnet-evidence/worker-profile-comparison
+          DENOIZE_NEURAL_WORKER_SECONDS: ${{ inputs.stress_seconds || '60' }}
+          RAYON_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+        run: |
+          # ABBA diagnostic only; no result replaces the rejected strict gate.
+          cargo test --locked --release --target "${{ matrix.target }}" \
+            -p denoize-clap --lib --features experimental-dpdfnet-hq \
+            neural::tests::pinned_dpdfnet2_release_worker_compares_callback_notifications \
+            -- --ignored --exact --nocapture
+
       - name: Preserve rejected platform diagnostics
         if: failure()
         # actions/upload-artifact v6.

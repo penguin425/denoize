@@ -1042,11 +1042,93 @@ fn tract_error(error: impl std::fmt::Display) -> String {
 mod tests {
     use super::*;
     use prost::Message;
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+    use std::io::Write;
+    use std::time::Instant;
     use tract_onnx::pb::{
         attribute_proto, tensor_proto, tensor_shape_proto, type_proto, AttributeProto, GraphProto,
         ModelProto, NodeProto, OperatorSetIdProto, StringStringEntryProto, TensorProto,
         TensorShapeProto, TypeProto, ValueInfoProto,
     };
+    use tract_onnx::tract_core::internal::DimLike;
+
+    struct ProfileAllocator;
+    #[derive(Clone, Copy, Default)]
+    struct ProfileRow {
+        nanos: u128,
+        allocations: u64,
+        bytes: u64,
+        calls: u64,
+    }
+    #[derive(Clone, Copy, Default)]
+    struct ProfileCounters {
+        allocations: u64,
+        bytes: u64,
+    }
+    thread_local! {
+        static PROFILE_COUNTERS: Cell<Option<ProfileCounters>> = const { Cell::new(None) };
+    }
+
+    struct ProfileAllocationScope;
+
+    impl ProfileAllocationScope {
+        fn start() -> Self {
+            PROFILE_COUNTERS.with(|c| {
+                assert!(c.replace(Some(ProfileCounters::default())).is_none());
+            });
+            Self
+        }
+
+        fn finish(self) -> ProfileCounters {
+            PROFILE_COUNTERS.with(|c| c.replace(None).unwrap())
+        }
+    }
+
+    impl Drop for ProfileAllocationScope {
+        fn drop(&mut self) {
+            PROFILE_COUNTERS.with(|c| c.set(None));
+        }
+    }
+
+    unsafe impl GlobalAlloc for ProfileAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let _ = PROFILE_COUNTERS.try_with(|c| {
+                if let Some(mut counters) = c.get() {
+                    counters.allocations += 1;
+                    counters.bytes += layout.size() as u64;
+                    c.set(Some(counters));
+                }
+            });
+            unsafe { System.alloc(layout) }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            let _ = PROFILE_COUNTERS.try_with(|c| {
+                if let Some(mut counters) = c.get() {
+                    counters.allocations += 1;
+                    counters.bytes += layout.size() as u64;
+                    c.set(Some(counters));
+                }
+            });
+            unsafe { System.alloc_zeroed(layout) }
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+            let _ = PROFILE_COUNTERS.try_with(|c| {
+                if let Some(mut counters) = c.get() {
+                    counters.allocations += 1;
+                    counters.bytes += size as u64;
+                    c.set(Some(counters));
+                }
+            });
+            unsafe { System.realloc(ptr, layout, size) }
+        }
+    }
+
+    #[global_allocator]
+    static TEST_PROFILE_ALLOCATOR: ProfileAllocator = ProfileAllocator;
 
     fn valid_metadata() -> BTreeMap<String, String> {
         let mut metadata: BTreeMap<String, String> = [
@@ -1205,6 +1287,173 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    #[ignore = "diagnostic: requires pinned model, release test, and DENOIZE_DPDFNET_OP_PROFILE=<new-json-path>"]
+    fn pinned_dpdfnet2_op_profile_diagnostic() {
+        use sha2::{Digest as _, Sha256};
+
+        let profile_path = std::env::var_os("DENOIZE_DPDFNET_OP_PROFILE")
+            .expect("DENOIZE_DPDFNET_OP_PROFILE must name a new private JSON output path");
+        assert!(!cfg!(debug_assertions));
+        let directory = std::env::var_os("DENOIZE_MODEL_DIR")
+            .expect("DENOIZE_MODEL_DIR must contain the authenticated managed model");
+        let path = Path::new(&directory).join("dpdfnet2-48khz-hr/dpdfnet2_48khz_hr.onnx");
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&bytes)),
+            "7f0575a5cec0ba4ffd8f8bd657e06d007e4ccdd955d76faab922b9d3291dc14b"
+        );
+
+        let loaded = DpdfnetModel::load(&OnnxModelConfig {
+            path: path.clone(),
+            sample_rate: SAMPLE_RATE,
+        })
+        .unwrap();
+        let typed = loaded.model.typed_model().unwrap().clone();
+        let plan = Arc::clone(loaded.model.typed_plan().expect("CPU typed plan"));
+        let source_commit = std::env::var("DENOIZE_EVIDENCE_SOURCE_COMMIT")
+            .expect("bind the diagnostic to DENOIZE_EVIDENCE_SOURCE_COMMIT");
+        assert_eq!(source_commit.len(), 40);
+        assert!(source_commit.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        let initial = loaded.initial_state;
+        let mut state = plan.spawn().unwrap();
+        let mut reference_state = plan.spawn().unwrap();
+        let mut recurrent = initial.as_ref().clone().into_arc_tensor();
+        let mut reference_recurrent = initial.as_ref().clone().into_arc_tensor();
+        let mut rows = vec![ProfileRow::default(); typed.nodes().len()];
+        let mut input = vec![0.0f32; BINS * 2];
+        const WARMUP_HOPS: usize = 4;
+        const MEASURED_HOPS: usize = 300;
+        let mut hop_wall_ns = Vec::with_capacity(MEASURED_HOPS);
+        let mut reference_wall_ns = Vec::with_capacity(MEASURED_HOPS);
+        for hop in 0..WARMUP_HOPS + MEASURED_HOPS {
+            for (index, value) in input.iter_mut().enumerate() {
+                *value = ((index * 17 + hop * 11) as f32 * 0.013).sin() * 0.1;
+            }
+            // Move external recurrent state exactly as production does, and
+            // create a separate spectrum for the reference. Holding cloned
+            // measured inputs could force extra copy-on-write allocations.
+            let inputs = tvec!(
+                Tensor::from_shape(&[1, 1, BINS, 2], &input)
+                    .unwrap()
+                    .into_tvalue(),
+                recurrent.into_tvalue(),
+            );
+            let reference_inputs = tvec!(
+                Tensor::from_shape(&[1, 1, BINS, 2], &input)
+                    .unwrap()
+                    .into_tvalue(),
+                reference_recurrent.into_tvalue(),
+            );
+            let started = Instant::now();
+            let outputs = if hop < WARMUP_HOPS {
+                state.run(inputs).unwrap()
+            } else {
+                state
+                    .run_plan_with_eval(inputs, |session, op_state, node, inputs| {
+                        let scope = ProfileAllocationScope::start();
+                        let started = Instant::now();
+                        let output =
+                            tract_onnx::tract_core::plan::eval(session, op_state, node, inputs);
+                        let nanos = started.elapsed().as_nanos();
+                        let counters = scope.finish();
+                        let row = &mut rows[node.id];
+                        row.nanos += nanos;
+                        row.allocations += counters.allocations;
+                        row.bytes += counters.bytes;
+                        row.calls += 1;
+                        output
+                    })
+                    .unwrap()
+            };
+            if hop >= WARMUP_HOPS {
+                hop_wall_ns.push(started.elapsed().as_nanos() as u64);
+            }
+            let reference_started = Instant::now();
+            let expected = reference_state.run(reference_inputs).unwrap();
+            if hop >= WARMUP_HOPS {
+                reference_wall_ns.push(reference_started.elapsed().as_nanos() as u64);
+            }
+            let actual_bits = |value: &TValue| {
+                value
+                    .try_as_plain()
+                    .unwrap()
+                    .as_slice::<f32>()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(outputs.len(), 2);
+            assert_eq!(expected.len(), 2);
+            for output in 0..2 {
+                assert_eq!(
+                    actual_bits(&outputs[output]),
+                    actual_bits(&expected[output]),
+                    "instrumented graph differs at hop={hop}, output={output}"
+                );
+            }
+            recurrent = outputs.into_iter().nth(1).unwrap().into_arc_tensor();
+            reference_recurrent = expected.into_iter().nth(1).unwrap().into_arc_tensor();
+        }
+        assert_eq!(hop_wall_ns.len(), MEASURED_HOPS);
+        assert!(rows.iter().any(|row| row.calls == MEASURED_HOPS as u64));
+        let nodes: Vec<_> = typed.nodes().iter().map(|node| {
+            let row = rows[node.id];
+            let facts = typed.node_input_facts(node.id).unwrap();
+            let scan = node.op().downcast_ref::<tract_onnx::tract_core::ops::scan::OptScan>()
+                .map(|scan| serde_json::json!({
+                    "iterations": scan.iteration_count(&facts).and_then(|n| n.to_usize().ok()),
+                    "input_mapping": format!("{:?}", scan.input_mapping),
+                    "output_mapping": format!("{:?}", scan.output_mapping),
+                    "body_nodes": scan.plan.model().nodes().len(),
+                    "boundary_copy_estimate_bytes": null,
+                    "boundary_copy_estimate_reason": "not isolated: inclusive Scan timing/allocation includes the body",
+                }));
+            serde_json::json!({
+                "id": node.id,
+                "name": node.name,
+                "op": node.op().name(),
+                "input_shapes": facts.iter().map(|fact| format!("{:?}", fact.shape)).collect::<Vec<_>>(),
+                "output_shapes": node.outputs.iter().map(|outlet| format!("{:?}", outlet.fact.shape)).collect::<Vec<_>>(),
+                "inclusive_ns": row.nanos as u64,
+                "calls": row.calls,
+                "allocations": row.allocations,
+                "allocation_requested_bytes": row.bytes,
+                "scan": scan,
+            })
+        }).collect();
+        let document = serde_json::json!({
+            "schema": "denoize-dpdfnet-op-profile-diagnostic-v1",
+            "diagnostic_only": true,
+            "source_commit": source_commit,
+            "model_sha256": "7f0575a5cec0ba4ffd8f8bd657e06d007e4ccdd955d76faab922b9d3291dc14b",
+            "warmup_hops": WARMUP_HOPS,
+            "actual_hops": MEASURED_HOPS,
+            "reference_bit_exact_hops": WARMUP_HOPS + MEASURED_HOPS,
+            "static_input_shape": [1, 1, BINS, 2],
+            "hop_wall_ns": hop_wall_ns,
+            "reference_wall_ns": reference_wall_ns,
+            "reference_execution_order": "instrumented then uninstrumented, interleaved on the same thread; not an unbiased performance gate",
+            "recurrent_storage": "Arc<Tensor>, Const input, into_arc_tensor output as in production",
+            "clock": "Instant",
+            "allocator_scope": "current-thread, eval and timer reads only; excludes plan glue, input construction, metadata and reference; requested bytes are not copy bytes or peak RSS",
+            "timing_scope": "top-level inclusive eval; Scan includes its body; instrumentation overhead is not a gate result",
+            "optimized_nodes": nodes,
+        });
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&profile_path)
+            .expect("DENOIZE_DPDFNET_OP_PROFILE must be a new private JSON path");
+        serde_json::to_writer_pretty(&mut output, &document).unwrap();
+        output.write_all(b"\n").unwrap();
+        eprintln!(
+            "diagnostic profile written to {}",
+            Path::new(&profile_path).display()
+        );
     }
 
     #[test]

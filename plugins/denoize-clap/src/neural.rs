@@ -1324,6 +1324,11 @@ struct NeuralEngine<'a> {
     metrics: &'a NeuralShared,
     #[cfg(test)]
     profile_rx: Option<mpsc::Receiver<WorkerProfileTrace>>,
+    // Diagnostic control only: ordinary tests and production always notify.
+    #[cfg(test)]
+    callback_notifications_enabled: bool,
+    #[cfg(test)]
+    callback_notifications_sent: std::cell::Cell<u64>,
 }
 
 impl<'a> NeuralEngine<'a> {
@@ -1598,6 +1603,10 @@ impl<'a> NeuralEngine<'a> {
             metrics,
             #[cfg(test)]
             profile_rx,
+            #[cfg(test)]
+            callback_notifications_enabled: true,
+            #[cfg(test)]
+            callback_notifications_sent: std::cell::Cell::new(0),
         })
     }
 
@@ -1781,6 +1790,20 @@ impl<'a> NeuralEngine<'a> {
 
     #[inline]
     fn wake_worker(&self) {
+        #[cfg(test)]
+        if !self.callback_notifications_enabled {
+            return;
+        }
+        #[cfg(test)]
+        if self.worker.is_some() {
+            self.callback_notifications_sent
+                .set(self.callback_notifications_sent.get().saturating_add(1));
+        }
+        self.notify_worker();
+    }
+
+    #[inline]
+    fn notify_worker(&self) {
         if let Some(worker) = self.worker.as_ref() {
             // Borrow the already initialized thread handle: no callback
             // allocation, queue retry, or wait. A sticky unpark token also
@@ -1819,7 +1842,8 @@ impl<'a> NeuralEngine<'a> {
         while let Some(result) = self.output_queue.pop() {
             self.recycle(result.block);
         }
-        self.wake_worker();
+        // Reset is not part of the callback-notification diagnostic switch.
+        self.notify_worker();
     }
 
     fn stop(&mut self) {
@@ -2602,6 +2626,53 @@ mod tests {
             thread::yield_now();
         }
         assert!(condition(), "condition did not become true before deadline");
+    }
+
+    #[test]
+    fn diagnostic_callback_notification_switch_does_not_mask_shutdown() {
+        let entered = Arc::new(AtomicU64::new(0));
+        let gate = Arc::new(AtomicBool::new(true));
+        let shared = NeuralShared::new().unwrap();
+        let mut engine = NeuralEngine::new_with_factory_inner(
+            48_000.0,
+            1,
+            &shared,
+            || Ok(Box::new(IdentityProcessor)),
+            None,
+            WorkerParkConfig {
+                timeout: Duration::from_secs(5),
+                entered: Some(Arc::clone(&entered)),
+                before_park_gate: Some(Arc::clone(&gate)),
+            },
+        )
+        .unwrap();
+        assert!(engine.worker_started);
+        wait_until(Instant::now() + Duration::from_secs(1), || {
+            entered.load(Ordering::Acquire) == 1
+        });
+        engine.callback_notifications_enabled = false;
+        let parameters = RuntimeParameters::from(NeuralParameters::default());
+        for _ in 0..960 {
+            engine.process_frame([0.0, 0.0], parameters);
+        }
+        // The worker is held before its park, so a spurious timeout cannot
+        // turn this into an unreliable negative timing assertion. Observe
+        // actual notification publication directly instead.
+        assert_eq!(engine.callback_notifications_sent.get(), 0);
+        assert_eq!(engine.input_queue.len(), 2);
+        assert!(engine.output_queue.is_empty());
+        engine.callback_notifications_enabled = true;
+        engine.wake_worker();
+        assert_eq!(engine.callback_notifications_sent.get(), 1);
+        gate.store(false, Ordering::Release);
+        wait_until(Instant::now() + Duration::from_secs(1), || {
+            engine.output_queue.len() == 2 && entered.load(Ordering::Acquire) == 1
+        });
+        engine.callback_notifications_enabled = false;
+        let stopped = Instant::now();
+        engine.stop();
+        assert!(stopped.elapsed() < Duration::from_secs(1));
+        assert!(engine.finished_gracefully);
     }
 
     #[test]
@@ -3469,8 +3540,36 @@ mod tests {
         }
     }
 
+    #[test]
+    #[ignore = "release-only ABBA diagnostic; requires pinned model and private profile path"]
+    #[cfg(feature = "experimental-dpdfnet-hq")]
+    fn pinned_dpdfnet2_release_worker_compares_callback_notifications() {
+        assert!(!cfg!(debug_assertions));
+        let path = std::env::var("DENOIZE_NEURAL_WORKER_PROFILE")
+            .expect("set a private, new DENOIZE_NEURAL_WORKER_PROFILE path");
+        let seconds = worker_paced_seconds();
+        // Same process, graph, fixture, priority, warmup, timeout and geometry.
+        // Stop/reset notifications remain enabled in all four runs. ABBA
+        // reduces, but cannot eliminate, time/order and external-load effects.
+        for (index, enabled) in [true, false, false, true].into_iter().enumerate() {
+            let label = if enabled { "on" } else { "off" };
+            let run_path = format!("{path}.callback-wakes-{index}-{label}.json");
+            profile_pinned_stereo_worker_with_notifications(480, seconds, &run_path, enabled);
+        }
+    }
+
     #[cfg(feature = "experimental-dpdfnet-hq")]
     fn profile_pinned_stereo_worker(callback_frames: usize, seconds: usize, path: &str) {
+        profile_pinned_stereo_worker_with_notifications(callback_frames, seconds, path, true);
+    }
+
+    #[cfg(feature = "experimental-dpdfnet-hq")]
+    fn profile_pinned_stereo_worker_with_notifications(
+        callback_frames: usize,
+        seconds: usize,
+        path: &str,
+        notifications_enabled: bool,
+    ) {
         let requested_frames = 11_520 + seconds * 48_000;
         let callback_calls = requested_frames.div_ceil(callback_frames);
         let frames = callback_calls * callback_frames;
@@ -3492,6 +3591,7 @@ mod tests {
         assert_eq!(engine.channels, 2);
         assert_eq!(engine.latency_frames, 11_520);
         assert!(engine.profile_rx.is_some());
+        engine.callback_notifications_enabled = notifications_enabled;
         let parameters = RuntimeParameters::from(NeuralParameters::default());
         let callback_capacity = callback_calls.min(32_000);
         let mut callbacks = Vec::with_capacity(callback_capacity);
@@ -3558,6 +3658,8 @@ mod tests {
         let document = serde_json::json!({
             "schema": "denoize-dpdfnet-worker-profile-diagnostic-v1",
             "diagnostic_only": true,
+            "callback_notifications_enabled": notifications_enabled,
+            "callback_notifications_sent": engine.callback_notifications_sent.get(),
             "source_commit": std::env::var("DENOIZE_EVIDENCE_SOURCE_COMMIT").unwrap_or_default(),
             "cpu_clock": if cfg!(windows) { "GetThreadTimes" }
                 else if cfg!(any(target_os = "linux", target_os = "macos")) { "CLOCK_THREAD_CPUTIME_ID" }
