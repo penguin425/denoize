@@ -1009,6 +1009,12 @@ fn load_model(
     runtime: AcceleratorRuntime,
     state_size: usize,
 ) -> Result<SharedRunnable, String> {
+    let mut model = load_typed_model(path, state_size)?;
+    super::tract_runtime::reset_plain_scans_for_reuse(&mut model);
+    super::tract_runtime::prepare(model, runtime, "DPDFNet 48 kHz model")
+}
+
+fn load_typed_model(path: &Path, state_size: usize) -> Result<TypedModel, String> {
     let mut model = tract_onnx::onnx()
         .model_for_path(path)
         .map_err(|error| format!("failed to load DPDFNet model {}: {error}", path.display()))?;
@@ -1025,8 +1031,7 @@ fn load_model(
             .set_output_fact(index, f32::fact(*shape).into())
             .map_err(tract_error)?;
     }
-    let model = model.into_typed().map_err(tract_error)?;
-    super::tract_runtime::prepare(model, runtime, "DPDFNet 48 kHz model")
+    model.into_typed().map_err(tract_error)
 }
 
 fn tract_error(error: impl std::fmt::Display) -> String {
@@ -1077,6 +1082,129 @@ mod tests {
                 .join(","),
         );
         metadata
+    }
+
+    #[test]
+    #[ignore = "requires the pinned managed DPDFNet model and cargo test --release"]
+    fn pinned_dpdfnet2_runtime_reuse_matches_fresh_inference() {
+        use sha2::{Digest as _, Sha256};
+
+        assert!(!cfg!(debug_assertions));
+        let model_directory = std::env::var_os("DENOIZE_MODEL_DIR")
+            .expect("DENOIZE_MODEL_DIR must contain the authenticated managed model");
+        let path = Path::new(&model_directory).join("dpdfnet2-48khz-hr/dpdfnet2_48khz_hr.onnx");
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&bytes)),
+            "7f0575a5cec0ba4ffd8f8bd657e06d007e4ccdd955d76faab922b9d3291dc14b"
+        );
+        let model = DpdfnetModel::load(&OnnxModelConfig {
+            path: path.clone(),
+            sample_rate: SAMPLE_RATE,
+        })
+        .unwrap();
+        let original = super::super::tract_runtime::prepare(
+            load_typed_model(&path, DPDFNET2_STATE_SIZE).unwrap(),
+            AcceleratorRuntime::Cpu,
+            "original DPDFNet fresh-run reference",
+        )
+        .unwrap();
+        for (label, runnable) in [("original", &original), ("candidate", &model.model)] {
+            for node in runnable.typed_model().unwrap().nodes() {
+                if !node.op().is_stateless() {
+                    eprintln!(
+                        "{label} non-stateless node: {} ({})",
+                        node.name,
+                        node.op().name()
+                    );
+                }
+            }
+            eprintln!(
+                "{label} reuse_runtime_state={}",
+                super::super::tract_runtime::supports_state_reuse(runnable)
+            );
+        }
+        let mut reference = std::array::from_fn::<_, 2, _>(|_| {
+            let mut stream =
+                DpdfnetStream::from_model(Arc::clone(&original), Arc::clone(&model.initial_state))
+                    .unwrap();
+            stream.reuse_runtime_state = false;
+            stream
+        });
+        let mut candidate = [model.stream().unwrap(), model.stream().unwrap()];
+        assert!(candidate.iter().all(|stream| stream.reuse_runtime_state));
+        for case in 0..5 {
+            for stream in reference.iter_mut().chain(candidate.iter_mut()) {
+                stream.reset();
+            }
+            for hop in 0..24 {
+                // Alternate lane order as well as lane input, so hidden Scan
+                // state cannot silently leak through the shared runtime cache.
+                for channel in if hop % 2 == 0 { [0, 1] } else { [1, 0] } {
+                    let sign = if channel == 1 && case == 3 { -1.0 } else { 1.0 };
+                    let silent = case == 0 || (case == 1 && channel == 1);
+                    for index in 0..BINS * 2 {
+                        let lane = if case == 2 || case == 3 { 0 } else { channel };
+                        let phase = (index * 13 + hop * 7 + lane * 19) as f32 * 0.017;
+                        let input = if silent {
+                            0.0
+                        } else {
+                            phase.sin() * sign * 0.1
+                        };
+                        reference[channel].model_input[index] = input;
+                        candidate[channel].model_input[index] = input;
+                    }
+                    let expected = reference[channel].infer().unwrap();
+                    let actual = candidate[channel].infer().unwrap();
+                    let bits = |value: &TValue| -> Vec<u32> {
+                        value
+                            .try_as_plain()
+                            .unwrap()
+                            .as_slice::<f32>()
+                            .unwrap()
+                            .iter()
+                            .map(|sample| sample.to_bits())
+                            .collect()
+                    };
+                    assert_eq!(
+                        bits(&actual),
+                        bits(&expected),
+                        "spectrum: case={case}, hop={hop}, channel={channel}"
+                    );
+                    assert_eq!(bits(&actual).len(), BINS * 2);
+                    let expected_state: Vec<u32> = reference[channel]
+                        .state
+                        .try_as_plain()
+                        .unwrap()
+                        .as_slice::<f32>()
+                        .unwrap()
+                        .iter()
+                        .map(|sample| sample.to_bits())
+                        .collect();
+                    let actual_state: Vec<u32> = candidate[channel]
+                        .state
+                        .try_as_plain()
+                        .unwrap()
+                        .as_slice::<f32>()
+                        .unwrap()
+                        .iter()
+                        .map(|sample| sample.to_bits())
+                        .collect();
+                    assert_eq!(actual_state.len(), DPDFNET2_STATE_SIZE);
+                    assert_eq!(
+                        actual_state, expected_state,
+                        "state: case={case}, hop={hop}, channel={channel}"
+                    );
+                    assert!(actual
+                        .try_as_plain()
+                        .unwrap()
+                        .as_slice::<f32>()
+                        .unwrap()
+                        .iter()
+                        .all(|sample| sample.is_finite()));
+                }
+            }
+        }
     }
 
     #[test]

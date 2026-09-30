@@ -118,9 +118,9 @@ fn run() -> Result<(), String> {
                         args.realtime_paced,
                     )?,
                     if args.realtime_paced {
-                        "one real-time-paced 48-kHz stereo-linked 480-frame host block through the production arbitrary-block adapter"
+                        "one real-time-paced 48-kHz independent-stereo 480-frame host block through the production arbitrary-block adapter"
                     } else {
-                        "one unpaced 48-kHz stereo-linked 480-frame host block through the production arbitrary-block adapter"
+                        "one unpaced 48-kHz independent-stereo 480-frame host block through the production arbitrary-block adapter"
                     },
                 )
             } else {

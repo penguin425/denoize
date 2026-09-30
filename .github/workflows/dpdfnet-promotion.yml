@@ -215,6 +215,10 @@ jobs:
           OMP_NUM_THREADS: "1"
         run: |
           cargo test --locked --release --target "${{ matrix.target }}" \
+            -p denoize --no-default-features --features dpdfnet,gtcrn \
+            backend::dpdfnet::tests::pinned_dpdfnet2_runtime_reuse_matches_fresh_inference \
+            -- --ignored --exact --nocapture
+          cargo test --locked --release --target "${{ matrix.target }}" \
             -p denoize-clap --features experimental-dpdfnet-hq \
             neural::tests::pinned_dpdfnet2_stereo_matches_independent_mono \
             -- --ignored --exact --nocapture
