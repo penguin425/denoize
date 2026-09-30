@@ -1402,6 +1402,8 @@ impl<'a> NeuralEngine<'a> {
             factory,
             #[cfg(test)]
             None,
+            #[cfg(test)]
+            WorkerParkConfig::default(),
         )
     }
 
@@ -1411,6 +1413,7 @@ impl<'a> NeuralEngine<'a> {
         metrics: &'a NeuralShared,
         factory: F,
         #[cfg(test)] profile_epoch: Option<std::time::Instant>,
+        #[cfg(test)] park_config: WorkerParkConfig,
     ) -> Result<Self, String>
     where
         F: FnOnce() -> Result<Box<dyn BlockProcessor>, String> + Send + 'static,
@@ -1493,6 +1496,13 @@ impl<'a> NeuralEngine<'a> {
                         Ok((processor, priority_guard, worker_buffers))
                     }) {
                         Ok(initialized) => {
+                            // Consume any sticky token left by model startup,
+                            // then enter the actual OS wait path before a
+                            // callback can first notify this worker. macOS's
+                            // semaphore may otherwise allocate its kernel
+                            // wait resource lazily on the first unpark.
+                            thread::park_timeout(WORKER_POLL);
+                            thread::park_timeout(WORKER_POLL);
                             let _ = ready_tx.send(Ok(()));
                             initialized
                         }
@@ -1511,6 +1521,8 @@ impl<'a> NeuralEngine<'a> {
                     worker_errors,
                     #[cfg(test)]
                     profile,
+                    #[cfg(test)]
+                    park_config,
                 );
                 drop(priority_guard);
             })
@@ -1684,7 +1696,9 @@ impl<'a> NeuralEngine<'a> {
         if let Some(result) = self.playback.take() {
             self.recycle(result.block);
         }
+        let mut released_output = false;
         while let Some(result) = self.output_queue.pop() {
+            released_output = true;
             if result.block.generation != self.generation {
                 self.recycle(result.block);
             } else if self.ready.len() < BLOCK_POOL_SIZE {
@@ -1693,6 +1707,9 @@ impl<'a> NeuralEngine<'a> {
                 self.metrics.overload_blocks.fetch_add(1, Ordering::Relaxed);
                 self.recycle(result.block);
             }
+        }
+        if released_output {
+            self.wake_worker();
         }
         if self.input_frame < u64::from(self.latency_frames) {
             return;
@@ -1748,7 +1765,10 @@ impl<'a> NeuralEngine<'a> {
             return;
         };
         match self.input_queue.push(completed) {
-            Ok(()) => self.capture = Some(replacement),
+            Ok(()) => {
+                self.capture = Some(replacement);
+                self.wake_worker();
+            }
             Err(mut returned) => {
                 self.metrics.overload_blocks.fetch_add(1, Ordering::Relaxed);
                 returned.frames = 0;
@@ -1757,6 +1777,16 @@ impl<'a> NeuralEngine<'a> {
             }
         }
         self.capture_frames = 0;
+    }
+
+    #[inline]
+    fn wake_worker(&self) {
+        if let Some(worker) = self.worker.as_ref() {
+            // Borrow the already initialized thread handle: no callback
+            // allocation, queue retry, or wait. A sticky unpark token also
+            // covers publication racing the worker's empty/full check.
+            worker.thread().unpark();
+        }
     }
 
     #[inline]
@@ -1789,16 +1819,18 @@ impl<'a> NeuralEngine<'a> {
         while let Some(result) = self.output_queue.pop() {
             self.recycle(result.block);
         }
+        self.wake_worker();
     }
 
     fn stop(&mut self) {
         self.running.store(false, Ordering::Release);
-        if let Some(worker) = self.worker.take()
-            && worker.join().is_err()
-        {
-            self.finished_gracefully = false;
-            self.metrics.worker_errors.fetch_add(1, Ordering::Relaxed);
-            eprintln!("denoize Neural worker panicked during shutdown");
+        if let Some(worker) = self.worker.take() {
+            worker.thread().unpark();
+            if worker.join().is_err() {
+                self.finished_gracefully = false;
+                self.metrics.worker_errors.fetch_add(1, Ordering::Relaxed);
+                eprintln!("denoize Neural worker panicked during shutdown");
+            }
         }
     }
 
@@ -1914,6 +1946,7 @@ fn worker_loop(
     running: Arc<AtomicBool>,
     worker_errors: Arc<AtomicU64>,
     #[cfg(test)] profile: Option<(WorkerProfileRecorder, mpsc::SyncSender<WorkerProfileTrace>)>,
+    #[cfg(test)] park_config: WorkerParkConfig,
 ) {
     let mut generation = 0u64;
     let mut next_start = 0u64;
@@ -1939,14 +1972,20 @@ fn worker_loop(
             #[cfg(not(test))]
             thread::park_timeout(WORKER_POLL);
             #[cfg(test)]
-            profile_worker_park(&mut profile_cycles, true);
+            profile_worker_park(&mut profile_cycles, true, &park_config, &running);
             continue;
         }
         let Some(block) = input.pop() else {
+            // A discontinuity can complete several pending blocks at once.
+            // Publish every bounded result before waiting for new input;
+            // output backpressure is handled by the branch above.
+            if !completed.is_empty() {
+                continue;
+            }
             #[cfg(not(test))]
             thread::park_timeout(WORKER_POLL);
             #[cfg(test)]
-            profile_worker_park(&mut profile_cycles, false);
+            profile_worker_park(&mut profile_cycles, false, &park_config, &running);
             continue;
         };
         // Once a block has been dequeued, all deadline-bound preparation,
@@ -2097,6 +2136,26 @@ fn worker_loop(
 // Explicitly enabled test-only diagnostics. The recorders are preallocated
 // before activation publishes readiness and never grow in the hot path.
 #[cfg(test)]
+struct WorkerParkConfig {
+    timeout: Duration,
+    // 0 = not waiting, 1 = input empty, 2 = output full. Reaching this probe
+    // means the predicate was checked, not that the OS has already slept.
+    entered: Option<Arc<AtomicU64>>,
+    before_park_gate: Option<Arc<AtomicBool>>,
+}
+
+#[cfg(test)]
+impl Default for WorkerParkConfig {
+    fn default() -> Self {
+        Self {
+            timeout: WORKER_POLL,
+            entered: None,
+            before_park_gate: None,
+        }
+    }
+}
+
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default)]
 struct WorkerProfileCycle {
     input_pop_ns: u64,
@@ -2183,7 +2242,7 @@ impl WorkerProfileRecorder {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 #[allow(unsafe_code)]
 fn thread_cpu_time_ns() -> Option<u64> {
     let mut value = libc::timespec {
@@ -2204,7 +2263,40 @@ fn thread_cpu_time_ns() -> Option<u64> {
         .checked_add(u64::try_from(value.tv_nsec).ok()?)
 }
 
-#[cfg(all(test, not(target_os = "linux")))]
+#[cfg(all(test, windows))]
+#[allow(unsafe_code)]
+fn thread_cpu_time_ns() -> Option<u64> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
+
+    let mut created = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut exited = created;
+    let mut kernel = created;
+    let mut user = created;
+    // SAFETY: this pseudo handle refers to the calling live worker thread.
+    // All four FILETIME pointers are valid distinct writable storage and are
+    // not retained. The pseudo handle must not be closed.
+    if unsafe {
+        GetThreadTimes(
+            GetCurrentThread(),
+            &mut created,
+            &mut exited,
+            &mut kernel,
+            &mut user,
+        )
+    } == 0
+    {
+        return None;
+    }
+    let ticks =
+        |value: FILETIME| (u64::from(value.dwHighDateTime) << 32) | u64::from(value.dwLowDateTime);
+    ticks(kernel).checked_add(ticks(user))?.checked_mul(100)
+}
+
+#[cfg(all(test, not(any(target_os = "linux", target_os = "macos", windows))))]
 fn thread_cpu_time_ns() -> Option<u64> {
     None
 }
@@ -2235,9 +2327,27 @@ fn profile_phase_finish(
 }
 
 #[cfg(test)]
-fn profile_worker_park(recorder: &mut Option<WorkerProfileRecorder>, output_full: bool) {
+fn profile_worker_park(
+    recorder: &mut Option<WorkerProfileRecorder>,
+    output_full: bool,
+    config: &WorkerParkConfig,
+    running: &AtomicBool,
+) {
     let started = recorder.as_ref().map(|_| std::time::Instant::now());
-    thread::park_timeout(WORKER_POLL);
+    if let Some(entered) = &config.entered {
+        entered.store(if output_full { 2 } else { 1 }, Ordering::Release);
+    }
+    if let Some(gate) = &config.before_park_gate {
+        while gate.load(Ordering::Acquire) && running.load(Ordering::Acquire) {
+            thread::yield_now();
+        }
+    }
+    // Keep the same check-to-park race as production: stopping must leave
+    // a token that also wakes a worker which has not entered park yet.
+    thread::park_timeout(config.timeout);
+    if let Some(entered) = &config.entered {
+        entered.store(0, Ordering::Release);
+    }
     if let (Some(recorder), Some(started)) = (recorder, started) {
         let wall_ns = started.elapsed().as_nanos() as u64;
         if output_full {
@@ -2440,7 +2550,7 @@ mod tests {
         assert_eq!(recorder.trace.dropped_cycles, 8);
         assert_eq!(recorder.trace.cycles.capacity(), capacity);
         assert_eq!(recorder.trace.cycles.last().unwrap().start_frame, 8_191);
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
         assert!(thread_cpu_time_ns().is_some());
     }
 
@@ -2452,6 +2562,204 @@ mod tests {
         fn reset(&mut self) -> Result<(), String> {
             Ok(())
         }
+    }
+
+    struct TwoChunkProcessor {
+        pending: Vec<Vec<f64>>,
+        warming_up: bool,
+    }
+
+    impl BlockProcessor for TwoChunkProcessor {
+        fn process(&mut self, channels: Vec<Vec<f64>>) -> Result<Vec<Vec<f64>>, String> {
+            if self.warming_up {
+                self.warming_up = false;
+                return Ok(channels);
+            }
+            if self.pending.is_empty() {
+                self.pending = channels;
+                return Ok(self.pending.iter().map(|_| Vec::new()).collect());
+            }
+            let mut output = Vec::with_capacity(channels.len());
+            for (old, current) in self.pending.drain(..).zip(channels) {
+                let mut joined = old;
+                joined.extend(current);
+                output.push(joined);
+            }
+            Ok(output)
+        }
+
+        fn reset(&mut self) -> Result<(), String> {
+            self.pending.clear();
+            Ok(())
+        }
+    }
+
+    fn wait_until(deadline: Instant, mut condition: impl FnMut() -> bool) {
+        while Instant::now() < deadline {
+            if condition() {
+                return;
+            }
+            thread::yield_now();
+        }
+        assert!(condition(), "condition did not become true before deadline");
+    }
+
+    #[test]
+    fn input_empty_wake_coalesces_capture_notifications() {
+        let entered = Arc::new(AtomicU64::new(0));
+        let gate = Arc::new(AtomicBool::new(true));
+        let shared = NeuralShared::new().unwrap();
+        let mut engine = NeuralEngine::new_with_factory_inner(
+            48_000.0,
+            1,
+            &shared,
+            || Ok(Box::new(IdentityProcessor)),
+            None,
+            WorkerParkConfig {
+                timeout: Duration::from_secs(5),
+                entered: Some(Arc::clone(&entered)),
+                before_park_gate: Some(Arc::clone(&gate)),
+            },
+        )
+        .unwrap();
+        assert!(engine.worker_started);
+        wait_until(Instant::now() + Duration::from_secs(1), || {
+            entered.load(Ordering::Acquire) == 1
+        });
+        let parameters = RuntimeParameters::from(NeuralParameters::default());
+        for _ in 0..960 {
+            engine.process_frame([0.0, 0.0], parameters);
+        }
+        gate.store(false, Ordering::Release);
+        wait_until(Instant::now() + Duration::from_secs(1), || {
+            engine.output_queue.len() == 2 && entered.load(Ordering::Acquire) == 1
+        });
+        let started = Instant::now();
+        engine.stop();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(engine.finished_gracefully);
+    }
+
+    #[test]
+    fn output_slot_release_wakes_completed_backlog() {
+        let entered = Arc::new(AtomicU64::new(0));
+        let gate = Arc::new(AtomicBool::new(true));
+        let shared = NeuralShared::new().unwrap();
+        let mut engine = NeuralEngine::new_with_factory_inner(
+            48_000.0,
+            1,
+            &shared,
+            || Ok(Box::new(IdentityProcessor)),
+            None,
+            WorkerParkConfig {
+                timeout: Duration::from_secs(5),
+                entered: Some(Arc::clone(&entered)),
+                before_park_gate: Some(Arc::clone(&gate)),
+            },
+        )
+        .unwrap();
+        assert!(engine.worker_started);
+        wait_until(Instant::now() + Duration::from_secs(1), || {
+            entered.load(Ordering::Acquire) == 1
+        });
+        let generation = engine.generation;
+        // Seed a full output queue while the worker is gated at its first
+        // input-empty wait. The single setup notification below must then
+        // be consumed by that wait, not the later output-full wait.
+        for index in 0..QUEUE_BLOCKS {
+            let mut block = engine.free_blocks.pop().unwrap();
+            block.generation = generation;
+            block.start_frame = (index * 480) as u64;
+            block.frames = 480;
+            assert!(
+                engine
+                    .output_queue
+                    .push(ProcessedBlock {
+                        block,
+                        valid: true,
+                        invalid_output: false,
+                    })
+                    .is_ok()
+            );
+        }
+        let mut block = engine.free_blocks.pop().unwrap();
+        block.generation = generation;
+        block.start_frame = (QUEUE_BLOCKS * 480) as u64;
+        block.frames = 480;
+        assert!(engine.input_queue.push(block).is_ok());
+        engine.wake_worker();
+        gate.store(false, Ordering::Release);
+        wait_until(Instant::now() + Duration::from_secs(1), || {
+            entered.load(Ordering::Acquire) == 2 && engine.input_queue.is_empty()
+        });
+        engine.begin_output_chunk();
+        wait_until(Instant::now() + Duration::from_secs(1), || {
+            engine.output_queue.len() == 1
+        });
+        wait_until(Instant::now() + Duration::from_secs(1), || {
+            entered.load(Ordering::Acquire) == 1
+        });
+        // Fill the output queue again without draining it, then stop from
+        // output-full waiting. Joining must not wait for the 5-second timer.
+        for index in QUEUE_BLOCKS + 1..QUEUE_BLOCKS * 2 + 1 {
+            let mut block = engine.free_blocks.pop().unwrap();
+            block.generation = generation;
+            block.start_frame = (index * 480) as u64;
+            block.frames = 480;
+            assert!(engine.input_queue.push(block).is_ok());
+        }
+        engine.wake_worker();
+        wait_until(Instant::now() + Duration::from_secs(1), || {
+            entered.load(Ordering::Acquire) == 2 && engine.input_queue.is_empty()
+        });
+        let stopped = Instant::now();
+        engine.stop();
+        assert!(stopped.elapsed() < Duration::from_secs(1));
+        assert!(engine.finished_gracefully);
+    }
+
+    #[test]
+    fn completed_backlog_publishes_without_another_input_callback() {
+        let entered = Arc::new(AtomicU64::new(0));
+        let shared = NeuralShared::new().unwrap();
+        let mut engine = NeuralEngine::new_with_factory_inner(
+            48_000.0,
+            1,
+            &shared,
+            || {
+                Ok(Box::new(TwoChunkProcessor {
+                    pending: Vec::new(),
+                    warming_up: true,
+                }))
+            },
+            None,
+            WorkerParkConfig {
+                timeout: Duration::from_secs(5),
+                entered: Some(Arc::clone(&entered)),
+                before_park_gate: None,
+            },
+        )
+        .unwrap();
+        assert!(engine.worker_started);
+        // Ensure the input notification is consumed by this first wait,
+        // rather than accidentally waking the later completed-backlog wait.
+        wait_until(Instant::now() + Duration::from_secs(1), || {
+            entered.load(Ordering::Acquire) == 1
+        });
+        let generation = engine.generation;
+        for index in 0..2 {
+            let mut block = engine.free_blocks.pop().unwrap();
+            block.generation = generation;
+            block.start_frame = (index * 480) as u64;
+            block.frames = 480;
+            assert!(engine.input_queue.push(block).is_ok());
+        }
+        engine.wake_worker();
+        wait_until(Instant::now() + Duration::from_secs(1), || {
+            engine.output_queue.len() == 2 && engine.input_queue.is_empty()
+        });
+        engine.stop();
+        assert!(engine.finished_gracefully);
     }
 
     struct StalledProcessor;
@@ -3138,15 +3446,31 @@ mod tests {
         );
         let path = std::env::var("DENOIZE_NEURAL_WORKER_PROFILE")
             .expect("set a private, new DENOIZE_NEURAL_WORKER_PROFILE path");
-        let callback_frames = std::env::var("DENOIZE_NEURAL_PROFILE_CALLBACK_FRAMES")
+        let geometry = std::env::var("DENOIZE_NEURAL_PROFILE_CALLBACK_FRAMES")
+            .unwrap_or_else(|_| "1024".to_owned());
+        let geometries: Vec<usize> = geometry
+            .split(',')
             .map(|value| {
                 value
-                    .parse::<usize>()
-                    .expect("profile callback size must be an integer")
+                    .parse()
+                    .expect("profile callback sizes must be comma-separated integers")
             })
-            .unwrap_or(1_024);
-        assert!([144, 480, 1_024].contains(&callback_frames));
+            .collect();
+        assert!((1..=3).contains(&geometries.len()));
         let seconds = worker_paced_seconds();
+        for callback_frames in &geometries {
+            assert!([144, 480, 1_024].contains(callback_frames));
+            let run_path = if geometries.len() == 1 {
+                path.clone()
+            } else {
+                format!("{path}.{callback_frames}.json")
+            };
+            profile_pinned_stereo_worker(*callback_frames, seconds, &run_path);
+        }
+    }
+
+    #[cfg(feature = "experimental-dpdfnet-hq")]
+    fn profile_pinned_stereo_worker(callback_frames: usize, seconds: usize, path: &str) {
         let requested_frames = 11_520 + seconds * 48_000;
         let callback_calls = requested_frames.div_ceil(callback_frames);
         let frames = callback_calls * callback_frames;
@@ -3162,6 +3486,7 @@ mod tests {
                     .map(|processor| Box::new(processor) as Box<dyn BlockProcessor>)
             },
             Some(epoch),
+            WorkerParkConfig::default(),
         )
         .unwrap();
         assert_eq!(engine.channels, 2);
@@ -3234,7 +3559,10 @@ mod tests {
             "schema": "denoize-dpdfnet-worker-profile-diagnostic-v1",
             "diagnostic_only": true,
             "source_commit": std::env::var("DENOIZE_EVIDENCE_SOURCE_COMMIT").unwrap_or_default(),
-            "cpu_clock": if cfg!(target_os = "linux") { "CLOCK_THREAD_CPUTIME_ID" } else { "unsupported" },
+            "cpu_clock": if cfg!(windows) { "GetThreadTimes" }
+                else if cfg!(any(target_os = "linux", target_os = "macos")) { "CLOCK_THREAD_CPUTIME_ID" }
+                else { "unsupported" },
+            "cpu_clock_may_be_quantized": cfg!(windows),
             "callback_frames": callback_frames,
             "requested_seconds": seconds,
             "measured_frames": frames,
@@ -3285,7 +3613,7 @@ mod tests {
             "output_full_parks": trace.output_full_parks,
             "output_full_park_wall_ns": trace.output_full_park_wall_ns,
         });
-        write_worker_evidence_document(&path, &document);
+        write_worker_evidence_document(path, &document);
         assert_eq!(finite_frames, frames);
         assert_eq!(shared.worker_metrics().worker_errors, 0);
         // Scheduling misses remain data, not a passed promotion gate.

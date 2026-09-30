@@ -207,6 +207,7 @@ jobs:
           fi
 
       - name: Exercise stereo CLAP worker at actual 144, 480, and 1024-frame callbacks
+        id: worker_gate
         shell: bash
         env:
           DENOIZE_NEURAL_WORKER_EVIDENCE: ${{ runner.temp }}/dpdfnet-evidence/worker.json
@@ -215,15 +216,15 @@ jobs:
           OMP_NUM_THREADS: "1"
         run: |
           cargo test --locked --release --target "${{ matrix.target }}" \
-            -p denoize --no-default-features --features dpdfnet,gtcrn \
+            -p denoize --lib --no-default-features --features dpdfnet,gtcrn \
             backend::dpdfnet::tests::pinned_dpdfnet2_runtime_reuse_matches_fresh_inference \
             -- --ignored --exact --nocapture
           cargo test --locked --release --target "${{ matrix.target }}" \
-            -p denoize-clap --features experimental-dpdfnet-hq \
+            -p denoize-clap --lib --features experimental-dpdfnet-hq \
             neural::tests::pinned_dpdfnet2_stereo_matches_independent_mono \
             -- --ignored --exact --nocapture
           cargo test --locked --release --target "${{ matrix.target }}" \
-            -p denoize-clap --features experimental-dpdfnet-hq \
+            -p denoize-clap --lib --features experimental-dpdfnet-hq \
             neural::tests::pinned_dpdfnet2_release_worker_meets_sustained_deadlines \
             -- --ignored --exact --nocapture
 
@@ -234,6 +235,24 @@ jobs:
             --stress "$DENOIZE_EVIDENCE_DIR/stress.json" \
             --worker "$DENOIZE_EVIDENCE_DIR/worker.json" \
             --output "$DENOIZE_EVIDENCE_DIR/platform.json"
+
+      - name: Profile a rejected stereo worker without changing its gate result
+        if: failure() && steps.worker_gate.outcome == 'failure'
+        continue-on-error: true
+        shell: bash
+        env:
+          DENOIZE_NEURAL_WORKER_PROFILE: ${{ runner.temp }}/dpdfnet-evidence/worker-profile
+          DENOIZE_NEURAL_PROFILE_CALLBACK_FRAMES: "144,480,1024"
+          DENOIZE_NEURAL_WORKER_SECONDS: ${{ inputs.stress_seconds || '60' }}
+          RAYON_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+        run: |
+          # Diagnostic-only, real worker/feeder traces. The failed strict
+          # worker.json is retained unchanged and still rejects this job.
+          cargo test --locked --release --target "${{ matrix.target }}" \
+            -p denoize-clap --lib --features experimental-dpdfnet-hq \
+            neural::tests::pinned_dpdfnet2_release_worker_profiles_deadline_failure \
+            -- --ignored --exact --nocapture
 
       - name: Preserve rejected platform diagnostics
         if: failure()
@@ -251,7 +270,7 @@ jobs:
           cargo build --locked --release --target "${{ matrix.target }}" \
             -p denoize-clap --features experimental-dpdfnet-hq
           cargo test --locked --release --target "${{ matrix.target }}" \
-            -p denoize-clap --features experimental-dpdfnet-hq \
+            -p denoize-clap --lib --features experimental-dpdfnet-hq \
             tests::bundle_exposes_stable_realtime_and_neural_plugin_ids -- --exact
           archive=$(bash scripts/package-dpdfnet-experimental-clap.sh \
             "${{ matrix.target }}" "$GITHUB_SHA" "$DENOIZE_EVIDENCE_DIR" \
