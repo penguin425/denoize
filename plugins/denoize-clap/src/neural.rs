@@ -2498,11 +2498,15 @@ mod tests {
 
     #[allow(unsafe_code)]
     mod allocation_counter {
-        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::alloc::{GlobalAlloc, Layout};
         use std::cell::Cell;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         pub(super) struct CountingAllocator;
+        #[cfg(feature = "diagnostic-mimalloc")]
+        static UPSTREAM_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+        #[cfg(not(feature = "diagnostic-mimalloc"))]
+        static UPSTREAM_ALLOCATOR: std::alloc::System = std::alloc::System;
 
         thread_local! {
             static RECORDING: Cell<bool> = const { Cell::new(false) };
@@ -2513,24 +2517,24 @@ mod tests {
             unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
                 record();
                 // SAFETY: the allocation request is forwarded unchanged.
-                unsafe { System.alloc(layout) }
+                unsafe { UPSTREAM_ALLOCATOR.alloc(layout) }
             }
 
             unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
-                // SAFETY: the allocation originated from the system allocator.
-                unsafe { System.dealloc(pointer, layout) }
+                // SAFETY: every allocation uses this same compile-time backend.
+                unsafe { UPSTREAM_ALLOCATOR.dealloc(pointer, layout) }
             }
 
             unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
                 record();
                 // SAFETY: the allocation request is forwarded unchanged.
-                unsafe { System.alloc_zeroed(layout) }
+                unsafe { UPSTREAM_ALLOCATOR.alloc_zeroed(layout) }
             }
 
             unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
                 record();
-                // SAFETY: the allocation originated from the system allocator.
-                unsafe { System.realloc(pointer, layout, new_size) }
+                // SAFETY: every allocation uses this same compile-time backend.
+                unsafe { UPSTREAM_ALLOCATOR.realloc(pointer, layout, new_size) }
             }
         }
 
@@ -3570,6 +3574,7 @@ mod tests {
         path: &str,
         notifications_enabled: bool,
     ) {
+        let test_binary_sha256 = diagnostic_test_binary_sha256();
         let requested_frames = 11_520 + seconds * 48_000;
         let callback_calls = requested_frames.div_ceil(callback_frames);
         let frames = callback_calls * callback_frames;
@@ -3658,6 +3663,13 @@ mod tests {
         let document = serde_json::json!({
             "schema": "denoize-dpdfnet-worker-profile-diagnostic-v1",
             "diagnostic_only": true,
+            "test_binary_sha256": test_binary_sha256,
+            "test_allocator": if cfg!(feature = "diagnostic-mimalloc") { "mimalloc" } else { "std-system" },
+            "diagnostic_mimalloc_feature": cfg!(feature = "diagnostic-mimalloc"),
+            "mimalloc_wrapper_version": if cfg!(feature = "diagnostic-mimalloc") { Some("0.1.52") } else { None },
+            "mimalloc_sys_version": if cfg!(feature = "diagnostic-mimalloc") { Some("0.1.49") } else { None },
+            "mimalloc_c_version": if cfg!(feature = "diagnostic-mimalloc") { Some("3.3.2") } else { None },
+            "allocator_override": false,
             "callback_notifications_enabled": notifications_enabled,
             "callback_notifications_sent": engine.callback_notifications_sent.get(),
             "source_commit": std::env::var("DENOIZE_EVIDENCE_SOURCE_COMMIT").unwrap_or_default(),
@@ -3867,7 +3879,7 @@ mod tests {
             return;
         };
         let model = NeuralDawModel::Dpdfnet2;
-        let document = serde_json::json!({
+        let mut document = serde_json::json!({
             "schema": "denoize-dpdfnet-worker-run-v2",
             "schema_version": 2,
             "source_commit": std::env::var("DENOIZE_EVIDENCE_SOURCE_COMMIT").unwrap_or_default(),
@@ -3882,6 +3894,7 @@ mod tests {
             "runs": runs,
             "environment": worker_evidence_environment(),
         });
+        mark_test_allocator_diagnostic(&mut document);
         write_worker_evidence_document(&path, &document);
     }
 
@@ -4002,7 +4015,7 @@ mod tests {
         let Ok(path) = std::env::var("DENOIZE_NEURAL_WORKER_EVIDENCE") else {
             return;
         };
-        let document = serde_json::json!({
+        let mut document = serde_json::json!({
             "schema": "denoize-dpdfnet-worker-run-v1",
             "schema_version": 1,
             "source_commit": std::env::var("DENOIZE_EVIDENCE_SOURCE_COMMIT").unwrap_or_default(),
@@ -4031,7 +4044,66 @@ mod tests {
             },
             "environment": worker_evidence_environment(),
         });
+        mark_test_allocator_diagnostic(&mut document);
         write_worker_evidence_document(&path, &document);
+    }
+
+    fn mark_test_allocator_diagnostic(document: &mut serde_json::Value) {
+        if !cfg!(feature = "diagnostic-mimalloc") {
+            return;
+        }
+        // A test-only allocator is not the allocator of the shipped plugin.
+        // Deliberately use an unsupported promotion schema even if a caller
+        // accidentally supplies a portable/lowest-tier environment label.
+        document["schema"] = "denoize-neural-worker-allocator-diagnostic-v1".into();
+        document["schema_version"] = 1.into();
+        document["diagnostic_only"] = true.into();
+        document["test_allocator"] = "mimalloc".into();
+        document["test_binary_sha256"] = diagnostic_test_binary_sha256().into();
+        document["diagnostic_mimalloc_feature"] = true.into();
+        document["mimalloc_wrapper_version"] = "0.1.52".into();
+        document["mimalloc_sys_version"] = "0.1.49".into();
+        document["mimalloc_c_version"] = "3.3.2".into();
+        document["allocator_override"] = false.into();
+    }
+
+    fn diagnostic_test_binary_sha256() -> String {
+        use sha2::{Digest as _, Sha256};
+        use std::io::Read;
+
+        let mut executable = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
+        let mut hasher = Sha256::new();
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let count = executable.read(&mut buffer).unwrap();
+            if count == 0 {
+                break;
+            }
+            hasher.update(&buffer[..count]);
+        }
+        format!("{:x}", hasher.finalize())
+    }
+
+    #[test]
+    fn test_allocator_worker_evidence_cannot_impersonate_production() {
+        let mut document = serde_json::json!({
+            "schema": "denoize-dpdfnet-worker-run-v2",
+            "schema_version": 2,
+        });
+        mark_test_allocator_diagnostic(&mut document);
+        if cfg!(feature = "diagnostic-mimalloc") {
+            assert_eq!(
+                document["schema"],
+                "denoize-neural-worker-allocator-diagnostic-v1"
+            );
+            assert_eq!(document["diagnostic_only"], true);
+            assert_eq!(document["test_allocator"], "mimalloc");
+            assert_eq!(document["test_binary_sha256"].as_str().unwrap().len(), 64);
+        } else {
+            assert_eq!(document["schema"], "denoize-dpdfnet-worker-run-v2");
+            assert_eq!(document["schema_version"], 2);
+            assert!(document.get("diagnostic_only").is_none());
+        }
     }
 
     fn worker_evidence_environment() -> serde_json::Value {

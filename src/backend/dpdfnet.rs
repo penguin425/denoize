@@ -1042,7 +1042,7 @@ fn tract_error(error: impl std::fmt::Display) -> String {
 mod tests {
     use super::*;
     use prost::Message;
-    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::alloc::{GlobalAlloc, Layout};
     use std::cell::Cell;
     use std::io::Write;
     use std::time::Instant;
@@ -1054,6 +1054,10 @@ mod tests {
     use tract_onnx::tract_core::internal::DimLike;
 
     struct ProfileAllocator;
+    #[cfg(feature = "diagnostic-mimalloc")]
+    static PROFILE_UPSTREAM_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+    #[cfg(not(feature = "diagnostic-mimalloc"))]
+    static PROFILE_UPSTREAM_ALLOCATOR: std::alloc::System = std::alloc::System;
     #[derive(Clone, Copy, Default)]
     struct ProfileRow {
         nanos: u128,
@@ -1100,10 +1104,10 @@ mod tests {
                     c.set(Some(counters));
                 }
             });
-            unsafe { System.alloc(layout) }
+            unsafe { PROFILE_UPSTREAM_ALLOCATOR.alloc(layout) }
         }
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-            unsafe { System.dealloc(ptr, layout) }
+            unsafe { PROFILE_UPSTREAM_ALLOCATOR.dealloc(ptr, layout) }
         }
         unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
             let _ = PROFILE_COUNTERS.try_with(|c| {
@@ -1113,7 +1117,7 @@ mod tests {
                     c.set(Some(counters));
                 }
             });
-            unsafe { System.alloc_zeroed(layout) }
+            unsafe { PROFILE_UPSTREAM_ALLOCATOR.alloc_zeroed(layout) }
         }
         unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
             let _ = PROFILE_COUNTERS.try_with(|c| {
@@ -1123,7 +1127,7 @@ mod tests {
                     c.set(Some(counters));
                 }
             });
-            unsafe { System.realloc(ptr, layout, size) }
+            unsafe { PROFILE_UPSTREAM_ALLOCATOR.realloc(ptr, layout, size) }
         }
     }
 
@@ -1293,10 +1297,24 @@ mod tests {
     #[ignore = "diagnostic: requires pinned model, release test, and DENOIZE_DPDFNET_OP_PROFILE=<new-json-path>"]
     fn pinned_dpdfnet2_op_profile_diagnostic() {
         use sha2::{Digest as _, Sha256};
+        use std::io::Read;
 
         let profile_path = std::env::var_os("DENOIZE_DPDFNET_OP_PROFILE")
             .expect("DENOIZE_DPDFNET_OP_PROFILE must name a new private JSON output path");
         assert!(!cfg!(debug_assertions));
+        // Stream the executable digest before warmup, without keeping a large
+        // file buffer alive or mixing hashing into any measured operation.
+        let mut executable = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
+        let mut executable_hash = Sha256::new();
+        let mut hash_buffer = [0u8; 64 * 1024];
+        loop {
+            let count = executable.read(&mut hash_buffer).unwrap();
+            if count == 0 {
+                break;
+            }
+            executable_hash.update(&hash_buffer[..count]);
+        }
+        let test_binary_sha256 = format!("{:x}", executable_hash.finalize());
         let directory = std::env::var_os("DENOIZE_MODEL_DIR")
             .expect("DENOIZE_MODEL_DIR must contain the authenticated managed model");
         let path = Path::new(&directory).join("dpdfnet2-48khz-hr/dpdfnet2_48khz_hr.onnx");
@@ -1328,6 +1346,7 @@ mod tests {
         const MEASURED_HOPS: usize = 300;
         let mut hop_wall_ns = Vec::with_capacity(MEASURED_HOPS);
         let mut reference_wall_ns = Vec::with_capacity(MEASURED_HOPS);
+        let mut output_checksum = Sha256::new();
         for hop in 0..WARMUP_HOPS + MEASURED_HOPS {
             for (index, value) in input.iter_mut().enumerate() {
                 *value = ((index * 17 + hop * 11) as f32 * 0.013).sin() * 0.1;
@@ -1394,6 +1413,14 @@ mod tests {
                     actual_bits(&expected[output]),
                     "instrumented graph differs at hop={hop}, output={output}"
                 );
+                for sample in outputs[output]
+                    .try_as_plain()
+                    .unwrap()
+                    .as_slice::<f32>()
+                    .unwrap()
+                {
+                    output_checksum.update(sample.to_bits().to_le_bytes());
+                }
             }
             recurrent = outputs.into_iter().nth(1).unwrap().into_arc_tensor();
             reference_recurrent = expected.into_iter().nth(1).unwrap().into_arc_tensor();
@@ -1429,10 +1456,19 @@ mod tests {
             "schema": "denoize-dpdfnet-op-profile-diagnostic-v1",
             "diagnostic_only": true,
             "source_commit": source_commit,
+            "test_binary_sha256": test_binary_sha256,
+            "test_allocator": if cfg!(feature = "diagnostic-mimalloc") { "mimalloc" } else { "std-system" },
+            "diagnostic_mimalloc_feature": cfg!(feature = "diagnostic-mimalloc"),
+            "mimalloc_wrapper_version": if cfg!(feature = "diagnostic-mimalloc") { Some("0.1.52") } else { None },
+            "mimalloc_sys_version": if cfg!(feature = "diagnostic-mimalloc") { Some("0.1.49") } else { None },
+            "mimalloc_c_version": if cfg!(feature = "diagnostic-mimalloc") { Some("3.3.2") } else { None },
+            "allocator_override": false,
             "model_sha256": "7f0575a5cec0ba4ffd8f8bd657e06d007e4ccdd955d76faab922b9d3291dc14b",
             "warmup_hops": WARMUP_HOPS,
             "actual_hops": MEASURED_HOPS,
             "reference_bit_exact_hops": WARMUP_HOPS + MEASURED_HOPS,
+            "output_checksum_sha256": format!("{:x}", output_checksum.finalize()),
+            "output_checksum_scope": "all 304 hops, spectrum then recurrent state, each f32 bit pattern little-endian",
             "static_input_shape": [1, 1, BINS, 2],
             "hop_wall_ns": hop_wall_ns,
             "reference_wall_ns": reference_wall_ns,
