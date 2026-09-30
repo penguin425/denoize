@@ -384,12 +384,28 @@ frames, or absence of neural output, but leaves overload/late as scheduling
 diagnostics. The input and result queues each span all 24 scheduler chunks,
 rather than ending after 16 chunks, so a recoverable pause cannot force a
 recurrent-state discontinuity before the declared deadline.
-Input fixtures are prepared before measurement, then whole 480-frame blocks are
-submitted on one absolute 10 ms clock; processing time is carried into the next
-deadline instead of added to a relative sleep. Evidence is rejected if the
+The earlier worker-run-v1 evidence exercised only mono 480-frame callbacks.
+It does not prove the independent-stereo HQ path introduced after preview.3.
+Current worker-run-v2 evidence runs actual stereo host callbacks of 144, 480,
+and 1024 frames separately. Each geometry must cover the full requested
+duration, every output frame must be finite, and both channels must have neural
+output. There are no 10 ms sleeps inside a larger host callback. Independent
+left/right processing uses separate recurrent/WOLA states and a shared graph;
+it denoises the side field rather than preserving it exactly, but may change
+stereo width or correlation and costs two inferences per model hop.
+
+Input fixtures are prepared before measurement, then whole host callbacks are
+submitted on one absolute sample clock; processing time is carried into the next
+deadline instead of added to a relative sleep. Evidence is rejected if each
 measured wall time falls below 95% or exceeds 105% plus 250 ms of the complete
 scheduled window (including latency priming), so a slow feeder cannot hide
 production-worker deadline failures.
+Platform-evidence-v3 binds this coverage to the independent-stereo stress path.
+All three portable operating systems and the lowest supported tier must provide
+that coverage; historical mono/v1 or mid-linked/v2 evidence remains readable
+but cannot satisfy the new stereo promotion gate.
+The final promotion-evidence-v2 decision adds the stereo gate without changing
+the archived promotion-evidence-v1 schema or its historical fourteen checks.
 
 ## Sources
 

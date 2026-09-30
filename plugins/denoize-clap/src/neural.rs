@@ -1220,17 +1220,17 @@ impl DpdfnetProcessor {
                 "DPDFNet model is unavailable ({error}); run `denoize models install dpdfnet` before activating denoize Neural HQ"
             )
         })?;
-        let mut options = BackendOptions {
+        let options = BackendOptions {
             onnx: Some(OnnxModelConfig {
                 path,
                 sample_rate: model.sample_rate,
             }),
             deterministic: true,
+            // HQ must enhance both L/R signals, including anti-phase side
+            // noise. StereoLinked intentionally preserves side unchanged.
+            channel_mode: ChannelMode::Independent,
             ..BackendOptions::default()
         };
-        if channels == 2 {
-            options.channel_mode = ChannelMode::StereoLinked;
-        }
         let accelerator = select_accelerator_for_options(Backend::Dpdfnet, &options)?;
         let Some(model_config) = options.onnx.as_ref() else {
             return Err("internal DPDFNet model options are unavailable".to_owned());
@@ -2720,15 +2720,273 @@ mod tests {
     #[test]
     #[ignore = "requires the pinned managed DPDFNet model and cargo test --release"]
     #[cfg(feature = "experimental-dpdfnet-hq")]
+    fn pinned_dpdfnet2_stereo_matches_independent_mono() {
+        let mut stereo = DpdfnetProcessor::new(48_000, 2).unwrap();
+        let mut mono = [
+            DpdfnetProcessor::new(48_000, 1).unwrap(),
+            DpdfnetProcessor::new(48_000, 1).unwrap(),
+        ];
+        let fixture = stereo_worker_fixture(9_613);
+        for case in 0..5 {
+            stereo.reset().unwrap();
+            for stream in &mut mono {
+                stream.reset().unwrap();
+            }
+            let input: Vec<[f64; 2]> = fixture
+                .iter()
+                .map(|&[left, right]| match case {
+                    0 => [left, right],
+                    1 => [left, 0.0],
+                    2 => [left, left],
+                    3 => [left, -left],
+                    _ => [right, left],
+                })
+                .collect();
+            let mut output = [Vec::new(), Vec::new()];
+            let mut position = 0usize;
+            let mut block = 0usize;
+            let pattern = [1, 127, 480, 1_024, 31, 511, 97];
+            while position < input.len() {
+                let end = (position + pattern[block % pattern.len()]).min(input.len());
+                let planar: Vec<Vec<f64>> = (0..2)
+                    .map(|channel| {
+                        input[position..end]
+                            .iter()
+                            .map(|frame| frame[channel])
+                            .collect()
+                    })
+                    .collect();
+                let expected = [
+                    mono[0].process(vec![planar[0].clone()]).unwrap(),
+                    mono[1].process(vec![planar[1].clone()]).unwrap(),
+                ];
+                let actual = stereo.process(planar).unwrap();
+                for channel in 0..2 {
+                    assert_eq!(
+                        actual[channel], expected[channel][0],
+                        "case={case}, channel={channel}, block={block}"
+                    );
+                    output[channel].extend_from_slice(&actual[channel]);
+                }
+                position = end;
+                block += 1;
+            }
+            let tail = stereo.0.finish().unwrap();
+            let expected_tail = [mono[0].0.finish().unwrap(), mono[1].0.finish().unwrap()];
+            for channel in 0..2 {
+                assert_eq!(tail[channel], expected_tail[channel][0]);
+                output[channel].extend_from_slice(&tail[channel]);
+                assert_eq!(output[channel].len(), input.len());
+                assert!(output[channel].iter().all(|sample| sample.is_finite()));
+                if case != 1 || channel == 0 {
+                    assert!(
+                        output[channel]
+                            .iter()
+                            .zip(&input)
+                            .any(|(enhanced, original)| (enhanced - original[channel]).abs()
+                                > 1.0e-6),
+                        "case={case}, channel={channel} was not enhanced"
+                    );
+                }
+            }
+            if case == 3 {
+                assert!(
+                    input.iter().zip(output[0].iter().zip(&output[1])).any(
+                        |(original, (left, right))| ((left - right) - (original[0] - original[1]))
+                            .abs()
+                            > 1.0e-6
+                    ),
+                    "anti-phase side signal was passed through unchanged"
+                );
+                let input_energy: f64 = input
+                    .iter()
+                    .map(|frame| (frame[0] - frame[1]).powi(2))
+                    .sum();
+                let output_energy: f64 = output[0]
+                    .iter()
+                    .zip(&output[1])
+                    .map(|(left, right)| (left - right).powi(2))
+                    .sum();
+                assert!(
+                    output_energy < input_energy,
+                    "anti-phase noise was not reduced: {output_energy} >= {input_energy}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the pinned managed DPDFNet model and cargo test --release"]
+    #[cfg(feature = "experimental-dpdfnet-hq")]
     fn pinned_dpdfnet2_release_worker_meets_sustained_deadlines() {
-        assert_pinned_release_worker(NeuralDawModel::Dpdfnet2, true);
+        assert_pinned_stereo_release_worker(true);
     }
 
     #[test]
     #[ignore = "requires the pinned managed DPDFNet model and cargo test --release"]
     #[cfg(feature = "experimental-dpdfnet-hq")]
     fn pinned_dpdfnet2_release_worker_measures_lowest_tier_capacity() {
-        assert_pinned_release_worker(NeuralDawModel::Dpdfnet2, false);
+        assert_pinned_stereo_release_worker(false);
+    }
+
+    #[cfg(feature = "experimental-dpdfnet-hq")]
+    fn assert_pinned_stereo_release_worker(require_zero_scheduling_counters: bool) {
+        assert!(
+            !cfg!(debug_assertions),
+            "the sustained neural deadline gate must exercise the release profile"
+        );
+        let paced_seconds = worker_paced_seconds();
+        let mut runs = Vec::new();
+        for callback_frames in [144, 480, 1_024] {
+            let shared = NeuralShared::new_for_model(NeuralDawModel::Dpdfnet2).unwrap();
+            let mut engine =
+                NeuralEngine::new_model(NeuralDawModel::Dpdfnet2, 48_000.0, 2, &shared).unwrap();
+            assert!(engine.worker_started);
+            assert_eq!(engine.channels, 2);
+            assert_eq!(engine.chunk_frames, 480);
+            assert_eq!(engine.latency_frames, 11_520);
+            assert_eq!(shared.worker_metrics(), WorkerMetrics::default());
+            let parameters = RuntimeParameters::from(NeuralParameters::default());
+            let latency = engine.latency_frames as usize;
+            let requested_frames = latency + paced_seconds * 48_000;
+            let callback_calls = requested_frames.div_ceil(callback_frames);
+            let frames = callback_calls * callback_frames;
+            // Do not put 10 ms sleeps inside a larger host callback. The
+            // worker sees precisely the same burst geometry as the host.
+            let inputs = stereo_worker_fixture(frames);
+            let mut finite_frames = 0usize;
+            let mut neural_frames = [0usize; 2];
+            let measurement_started = Instant::now();
+            for callback in 0..callback_calls {
+                pace_to_frame(measurement_started, callback * callback_frames);
+                engine.record_callback(callback_frames);
+                let start = callback * callback_frames;
+                for frame in start..start + callback_frames {
+                    let output = engine.process_frame(inputs[frame], parameters);
+                    finite_frames += usize::from(output.iter().all(|sample| sample.is_finite()));
+                    if frame >= latency {
+                        for channel in 0..2 {
+                            neural_frames[channel] += usize::from(
+                                (output[channel] - inputs[frame - latency][channel]).abs() > 1.0e-6,
+                            );
+                        }
+                    }
+                }
+            }
+            // Include the final complete callback interval in wall accounting.
+            pace_to_frame(measurement_started, frames);
+            let measurement_wall_seconds = measurement_started.elapsed().as_secs_f64();
+            assert_eq!(engine.callback_calls, callback_calls as u64);
+            assert_eq!(engine.callback_min_frames, callback_frames as u32);
+            assert_eq!(engine.callback_max_frames, callback_frames as u32);
+            // Join outside the measured callback cadence, then include any
+            // shutdown panic in this run's processing-error evidence.
+            engine.stop();
+            let metrics = shared.worker_metrics();
+            runs.push(serde_json::json!({
+                "callback_frames": callback_frames,
+                "callback_calls": callback_calls,
+                "paced_blocks": paced_seconds * 100,
+                "measured_frames": frames,
+                "finite_frames": finite_frames,
+                "neural_frames_per_channel": neural_frames,
+                "measurement_wall_seconds": measurement_wall_seconds,
+                "metrics": {
+                    "overload_blocks": metrics.overload_blocks,
+                    "late_blocks": metrics.late_blocks,
+                    "invalid_blocks": metrics.invalid_blocks,
+                    "worker_errors": metrics.worker_errors,
+                },
+                "queues_after_run": {
+                    "input": engine.input_queue.len(),
+                    "output": engine.output_queue.len(),
+                    "ready": engine.ready.len(),
+                },
+            }));
+            // Every geometry is retained, including rejected ones. Never
+            // stop at the first miss and lose evidence for the other runs.
+        }
+        write_stereo_worker_evidence(&runs);
+        for run in &runs {
+            assert_eq!(run["finite_frames"], run["measured_frames"]);
+            let neural = run["neural_frames_per_channel"].as_array().unwrap();
+            assert!(
+                neural.iter().all(|frames| frames.as_u64().unwrap() >= 480),
+                "both channels must produce neural output: {run}"
+            );
+            let metrics = WorkerMetrics {
+                overload_blocks: run["metrics"]["overload_blocks"].as_u64().unwrap(),
+                late_blocks: run["metrics"]["late_blocks"].as_u64().unwrap(),
+                invalid_blocks: run["metrics"]["invalid_blocks"].as_u64().unwrap(),
+                worker_errors: run["metrics"]["worker_errors"].as_u64().unwrap(),
+            };
+            assert!(
+                worker_metrics_pass(metrics, require_zero_scheduling_counters),
+                "stereo host callback geometry failed: {run}"
+            );
+        }
+    }
+
+    fn worker_paced_seconds() -> usize {
+        let seconds = std::env::var("DENOIZE_NEURAL_WORKER_SECONDS")
+            .map(|value| {
+                value
+                    .parse::<usize>()
+                    .expect("DENOIZE_NEURAL_WORKER_SECONDS must be an integer")
+            })
+            .unwrap_or(1);
+        assert!(
+            (1..=3_600).contains(&seconds),
+            "DENOIZE_NEURAL_WORKER_SECONDS must be between 1 and 3600"
+        );
+        seconds
+    }
+
+    #[cfg(feature = "experimental-dpdfnet-hq")]
+    fn pace_to_frame(started: Instant, frame: usize) {
+        let due = started + Duration::from_secs_f64(frame as f64 / 48_000.0);
+        if let Some(delay) = due.checked_duration_since(Instant::now()) {
+            thread::sleep(delay);
+        }
+    }
+
+    #[cfg(feature = "experimental-dpdfnet-hq")]
+    fn stereo_worker_fixture(frames: usize) -> Vec<[f64; 2]> {
+        let mut state = 0x5eed_1234_9876_abcd_u64;
+        (0..frames)
+            .map(|frame| {
+                let phase = frame as f64 * 440.0 * std::f64::consts::TAU / 48_000.0;
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                let side = (f64::from((state >> 32) as u32) / f64::from(u32::MAX) - 0.5) * 0.08;
+                [phase.sin() * 0.03 + side, phase.sin() * 0.03 - side]
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "experimental-dpdfnet-hq")]
+    fn write_stereo_worker_evidence(runs: &[serde_json::Value]) {
+        let Ok(path) = std::env::var("DENOIZE_NEURAL_WORKER_EVIDENCE") else {
+            return;
+        };
+        let model = NeuralDawModel::Dpdfnet2;
+        let document = serde_json::json!({
+            "schema": "denoize-dpdfnet-worker-run-v2",
+            "schema_version": 2,
+            "source_commit": std::env::var("DENOIZE_EVIDENCE_SOURCE_COMMIT").unwrap_or_default(),
+            "model_id": model.model_id(),
+            "model_sha256": model.model_sha256(),
+            "plugin_id": model.plugin_id(),
+            "sample_rate_hz": 48_000,
+            "channels": 2,
+            "channel_mode": "independent",
+            "chunk_frames": 480,
+            "latency_frames": 11_520,
+            "runs": runs,
+            "environment": worker_evidence_environment(),
+        });
+        write_worker_evidence_document(&path, &document);
     }
 
     fn assert_pinned_release_worker(model: NeuralDawModel, require_zero_scheduling_counters: bool) {
@@ -2748,17 +3006,7 @@ mod tests {
         assert_eq!(shared.late_blocks.load(Ordering::Relaxed), 0);
         assert_eq!(shared.invalid_blocks.load(Ordering::Relaxed), 0);
 
-        let paced_seconds = std::env::var("DENOIZE_NEURAL_WORKER_SECONDS")
-            .map(|value| {
-                value
-                    .parse::<usize>()
-                    .expect("DENOIZE_NEURAL_WORKER_SECONDS must be an integer")
-            })
-            .unwrap_or(1);
-        assert!(
-            (1..=3_600).contains(&paced_seconds),
-            "DENOIZE_NEURAL_WORKER_SECONDS must be between 1 and 3600"
-        );
+        let paced_seconds = worker_paced_seconds();
         let paced_blocks = paced_seconds * 100;
         let latency = engine.latency_frames as usize;
         assert_eq!(
@@ -2885,7 +3133,13 @@ mod tests {
                 "output": engine.output_queue.len(),
                 "ready": engine.ready.len(),
             },
-            "environment": {
+            "environment": worker_evidence_environment(),
+        });
+        write_worker_evidence_document(&path, &document);
+    }
+
+    fn worker_evidence_environment() -> serde_json::Value {
+        serde_json::json!({
                 "os": std::env::consts::OS,
                 "arch": std::env::consts::ARCH,
                 "logical_parallelism": std::thread::available_parallelism()
@@ -2895,13 +3149,15 @@ mod tests {
                 "cpu_model": std::env::var("DENOIZE_EVIDENCE_CPU_MODEL").unwrap_or_default(),
                 "hardware_tier": std::env::var("DENOIZE_EVIDENCE_HARDWARE_TIER").unwrap_or_default(),
                 "runner_label": std::env::var("DENOIZE_EVIDENCE_RUNNER_LABEL").unwrap_or_default(),
-            },
-        });
-        let bytes = serde_json::to_vec_pretty(&document).expect("encode worker evidence");
+        })
+    }
+
+    fn write_worker_evidence_document(path: &str, document: &serde_json::Value) {
+        let bytes = serde_json::to_vec_pretty(document).expect("encode worker evidence");
         let mut destination = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&path)
+            .open(path)
             .unwrap_or_else(|error| panic!("create worker evidence {path}: {error}"));
         destination
             .write_all(&bytes)

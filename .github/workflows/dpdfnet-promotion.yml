@@ -206,7 +206,7 @@ jobs:
               "$DENOIZE_EVIDENCE_DIR/stress-run.log"
           fi
 
-      - name: Exercise paced experimental CLAP worker
+      - name: Exercise stereo CLAP worker at actual 144, 480, and 1024-frame callbacks
         shell: bash
         env:
           DENOIZE_NEURAL_WORKER_EVIDENCE: ${{ runner.temp }}/dpdfnet-evidence/worker.json
@@ -214,6 +214,10 @@ jobs:
           RAYON_NUM_THREADS: "1"
           OMP_NUM_THREADS: "1"
         run: |
+          cargo test --locked --release --target "${{ matrix.target }}" \
+            -p denoize-clap --features experimental-dpdfnet-hq \
+            neural::tests::pinned_dpdfnet2_stereo_matches_independent_mono \
+            -- --ignored --exact --nocapture
           cargo test --locked --release --target "${{ matrix.target }}" \
             -p denoize-clap --features experimental-dpdfnet-hq \
             neural::tests::pinned_dpdfnet2_release_worker_meets_sustained_deadlines \

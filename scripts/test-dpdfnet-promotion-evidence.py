@@ -33,16 +33,16 @@ SCHEMAS = {
     "answer_v2": ROOT / "schemas/denoize-dpdfnet-blind-answer-key-v2.schema.json",
     "response": ROOT / "schemas/denoize-dpdfnet-blind-listener-response-v1.schema.json",
     "result": ROOT / "schemas/denoize-dpdfnet-blind-listening-result-v1.schema.json",
-    "worker": ROOT / "schemas/denoize-dpdfnet-worker-run-v1.schema.json",
+    "worker": ROOT / "schemas/denoize-dpdfnet-worker-run-v2.schema.json",
     "clap_host": ROOT / "schemas/denoize-dpdfnet-clap-host-run-v1.schema.json",
     "clap_host_v2": ROOT / "schemas/denoize-dpdfnet-clap-host-run-v2.schema.json",
     "platform_v1": ROOT / "schemas/denoize-dpdfnet-platform-evidence-v1.schema.json",
-    "platform": ROOT / "schemas/denoize-dpdfnet-platform-evidence-v2.schema.json",
+    "platform": ROOT / "schemas/denoize-dpdfnet-platform-evidence-v3.schema.json",
     "reaper": ROOT / "schemas/denoize-dpdfnet-reaper-automated-evidence-v1.schema.json",
     "reporter_v1": ROOT / "schemas/denoize-dpdfnet-reporter-evidence-v1.schema.json",
     "reporter_v2": ROOT / "schemas/denoize-dpdfnet-reporter-evidence-v2.schema.json",
     "equivalence": ROOT / "schemas/denoize-dpdfnet-objective-equivalence-v1.schema.json",
-    "promotion": ROOT / "schemas/denoize-dpdfnet-promotion-evidence-v1.schema.json",
+    "promotion": ROOT / "schemas/denoize-dpdfnet-promotion-evidence-v2.schema.json",
 }
 
 
@@ -139,7 +139,7 @@ def platform_fixture(root: Path) -> tuple[Path, Path]:
     commit = "0123456789abcdef0123456789abcdef01234567"
     stress = {
         "schema": "denoize-dpdfnet-gtcrn-stress-v1",
-        "model": "dpdfnet2_48khz_stereo_linked_daw_path",
+        "model": "dpdfnet2_48khz_stereo_independent_daw_path",
         "model_file_sha256": "7f0575a5cec0ba4ffd8f8bd657e06d007e4ccdd955d76faab922b9d3291dc14b",
         "state_size": 56_436,
         "parallel_streams": 1,
@@ -176,28 +176,26 @@ def platform_fixture(root: Path) -> tuple[Path, Path]:
         },
     }
     worker = {
-        "schema": "denoize-dpdfnet-worker-run-v1",
-        "schema_version": 1,
+        "schema": "denoize-dpdfnet-worker-run-v2",
+        "schema_version": 2,
         "source_commit": commit,
         "model_id": "dpdfnet2-48khz-hr",
         "model_sha256": "7f0575a5cec0ba4ffd8f8bd657e06d007e4ccdd955d76faab922b9d3291dc14b",
         "plugin_id": "org.penguin425.denoize.neural-hq",
         "sample_rate_hz": 48_000,
-        "channels": 1,
+        "channels": 2,
+        "channel_mode": "independent",
         "chunk_frames": 480,
         "latency_frames": 11_520,
-        "paced_blocks": 6_000,
-        "measured_frames": 2_891_520,
-        "finite_frames": 2_891_520,
-        "neural_frames": 2_880_000,
-        "measurement_wall_seconds": 60.25,
-        "metrics": {
-            "overload_blocks": 0,
-            "late_blocks": 0,
-            "invalid_blocks": 0,
-            "worker_errors": 0,
-        },
-        "queues_after_run": {"input": 0, "output": 0, "ready": 0},
+        "runs": [
+            {"callback_frames": frames, "callback_calls": ((11_520 + 6_000 * 480 + frames - 1) // frames), "paced_blocks": 6_000,
+             "measured_frames": ((11_520 + 6_000 * 480 + frames - 1) // frames) * frames,
+             "finite_frames": ((11_520 + 6_000 * 480 + frames - 1) // frames) * frames,
+             "neural_frames_per_channel": [2_880_000, 2_880_000], "measurement_wall_seconds": 60.25,
+             "metrics": {"overload_blocks": 0, "late_blocks": 0, "invalid_blocks": 0, "worker_errors": 0},
+             "queues_after_run": {"input": 0, "output": 0, "ready": 0}}
+            for frames in (144, 480, 1024)
+        ],
         "environment": {
             "os": "linux",
             "arch": "x86_64",
@@ -1284,12 +1282,42 @@ def main() -> int:
         platform = json.loads(platform_result.read_text(encoding="utf-8"))
         validators["platform"].validate(platform)
         assert platform["accepted"] is True
-        assert len(platform["checks"]) == 8
+        assert len(platform["checks"]) == 9
         assert (
             platform["measurement"]["direct_call_deadline_gate_eligible"]
             is False
         )
         assert platform["measurement"]["wall_clock_worker_gate_eligible"] is True
+        # Exercise the production generator as well as the schema. A schema
+        # assertion alone cannot prove that the command rejects a bad run.
+        worker_base = json.loads(worker_path.read_text(encoding="utf-8"))
+        bad_workers = {}
+        for name in (
+            "missing-geometry", "mono", "linked-mode", "one-channel-unprocessed",
+            "frame-accounting", "nonfinite-output", "processing-error",
+            "negative-counter-cancellation", "queue-out-of-bounds", "float-latency",
+        ):
+            bad_workers[name] = json.loads(json.dumps(worker_base))
+        bad_workers["missing-geometry"]["runs"].pop()
+        bad_workers["mono"]["channels"] = 1
+        bad_workers["linked-mode"]["channel_mode"] = "stereo-linked"
+        bad_workers["one-channel-unprocessed"]["runs"][1]["neural_frames_per_channel"][1] = 479
+        bad_workers["frame-accounting"]["runs"][2]["callback_calls"] += 1
+        bad_workers["nonfinite-output"]["runs"][2]["finite_frames"] -= 1
+        bad_workers["processing-error"]["runs"][2]["metrics"]["worker_errors"] = 1
+        bad_workers["negative-counter-cancellation"]["runs"][0]["metrics"].update(
+            overload_blocks=1, late_blocks=-1
+        )
+        bad_workers["queue-out-of-bounds"]["runs"][0]["queues_after_run"]["ready"] = 57
+        bad_workers["float-latency"]["latency_frames"] = 11520.0
+        for name, bad_worker in bad_workers.items():
+            bad_path = platform_root / f"bad-worker-{name}.json"
+            bad_path.write_text(json.dumps(bad_worker) + "\n", encoding="utf-8")
+            run(
+                [sys.executable, str(PLATFORM), "--stress", str(stress_path),
+                 "--worker", str(bad_path), "--output", str(platform_root / f"bad-platform-{name}.json")],
+                success=False,
+            )
         assert {
             "stress-p99-9-ms",
             "stress-maximum-ms",
@@ -1318,7 +1346,7 @@ def main() -> int:
         assert "promotion stress evidence must be real-time paced" in unpaced_result.stderr
 
         fast_worker = json.loads(worker_path.read_text(encoding="utf-8"))
-        fast_worker["measurement_wall_seconds"] = 50.0
+        fast_worker["runs"][0]["measurement_wall_seconds"] = 50.0
         fast_worker_path = platform_root / "fast-worker.json"
         fast_worker_path.write_text(
             json.dumps(fast_worker) + "\n", encoding="utf-8"
@@ -1336,10 +1364,10 @@ def main() -> int:
             ],
             success=False,
         )
-        assert "completed too quickly" in fast_worker_result.stderr
+        assert "wall time does not represent" in fast_worker_result.stderr
 
         slow_worker = json.loads(worker_path.read_text(encoding="utf-8"))
-        slow_worker["measurement_wall_seconds"] = 204.0
+        slow_worker["runs"][0]["measurement_wall_seconds"] = 204.0
         slow_worker_path = platform_root / "slow-worker.json"
         slow_worker_path.write_text(
             json.dumps(slow_worker) + "\n", encoding="utf-8"
@@ -1357,14 +1385,22 @@ def main() -> int:
             ],
             success=False,
         )
-        assert "completed too slowly" in slow_worker_result.stderr
+        assert "wall time does not represent" in slow_worker_result.stderr
 
         short_worker = json.loads(worker_path.read_text(encoding="utf-8"))
-        short_worker["paced_blocks"] = 100
-        short_worker["measured_frames"] = 59_520
-        short_worker["finite_frames"] = 59_520
-        short_worker["neural_frames"] = 48_000
-        short_worker["measurement_wall_seconds"] = 1.25
+        short_worker["runs"][0]["paced_blocks"] = 100
+        short_worker["runs"][0]["measured_frames"] = ((11_520 + 100 * 480 + 143) // 144) * 144
+        short_worker["runs"][0]["callback_calls"] = short_worker["runs"][0]["measured_frames"] // 144
+        short_worker["runs"][0]["finite_frames"] = short_worker["runs"][0]["measured_frames"]
+        short_worker["runs"][0]["neural_frames_per_channel"] = [48_000, 48_000]
+        short_worker["runs"][0]["measurement_wall_seconds"] = 1.25
+        for short_run in short_worker["runs"][1:]:
+            short_run["paced_blocks"] = 100
+            short_run["measured_frames"] = ((11_520 + 100 * 480 + short_run["callback_frames"] - 1) // short_run["callback_frames"]) * short_run["callback_frames"]
+            short_run["callback_calls"] = short_run["measured_frames"] // short_run["callback_frames"]
+            short_run["finite_frames"] = short_run["measured_frames"]
+            short_run["neural_frames_per_channel"] = [48_000, 48_000]
+            short_run["measurement_wall_seconds"] = 1.25
         short_worker_path = platform_root / "short-worker.json"
         short_worker_path.write_text(
             json.dumps(short_worker) + "\n", encoding="utf-8"
@@ -1400,6 +1436,25 @@ def main() -> int:
             "limit": 6_000,
             "passed": False,
         }
+
+        partial_worker = json.loads(worker_path.read_text(encoding="utf-8"))
+        partial_worker["runs"][0]["paced_blocks"] = 100
+        partial_worker["runs"][0]["measured_frames"] = ((11_520 + 100 * 480 + 143) // 144) * 144
+        partial_worker["runs"][0]["callback_calls"] = partial_worker["runs"][0]["measured_frames"] // 144
+        partial_worker["runs"][0]["finite_frames"] = partial_worker["runs"][0]["measured_frames"]
+        partial_worker["runs"][0]["neural_frames_per_channel"] = [48_000, 48_000]
+        partial_worker["runs"][0]["measurement_wall_seconds"] = 1.25
+        partial_worker_path = platform_root / "partial-worker.json"
+        partial_worker_path.write_text(json.dumps(partial_worker) + "\n", encoding="utf-8")
+        partial_platform_path = platform_root / "partial-platform.json"
+        run([sys.executable, str(PLATFORM), "--stress", str(stress_path), "--worker", str(partial_worker_path), "--output", str(partial_platform_path), "--allow-rejected"])
+        partial_platform = json.loads(partial_platform_path.read_text(encoding="utf-8"))
+        validators["platform"].validate(partial_platform)
+        assert partial_platform["accepted"] is False
+
+        invalid_queue_worker = json.loads(worker_path.read_text(encoding="utf-8"))
+        invalid_queue_worker["runs"][0]["queues_after_run"]["ready"] = 57
+        assert validators["worker"].is_valid(invalid_queue_worker) is False
 
         preempted_stress = json.loads(stress_path.read_text(encoding="utf-8"))
         preempted_stress["timing"].update(
@@ -1801,7 +1856,7 @@ def main() -> int:
             is False
         )
         assert lowest_platform["measurement"]["p99_9_ms"] == 21.453856
-        assert len(lowest_platform["checks"]) == 8
+        assert len(lowest_platform["checks"]) == 9
         assert {
             "stress-p99-9-ms",
             "stress-maximum-ms",
@@ -1809,7 +1864,7 @@ def main() -> int:
         }.isdisjoint(check["id"] for check in lowest_platform["checks"])
 
         overloaded_lowest_worker = json.loads(json.dumps(lowest_worker))
-        overloaded_lowest_worker["metrics"]["overload_blocks"] = 1
+        overloaded_lowest_worker["runs"][0]["metrics"]["overload_blocks"] = 1
         validators["worker"].validate(overloaded_lowest_worker)
         overloaded_lowest_worker_path = platform_root / "overloaded-lowest-worker.json"
         overloaded_lowest_worker_path.write_text(
@@ -1856,7 +1911,7 @@ def main() -> int:
         overloaded_portable_worker = json.loads(
             worker_path.read_text(encoding="utf-8")
         )
-        overloaded_portable_worker["metrics"]["overload_blocks"] = 1
+        overloaded_portable_worker["runs"][0]["metrics"]["overload_blocks"] = 1
         assert validators["worker"].is_valid(overloaded_portable_worker) is False
         overloaded_portable_worker_path = (
             platform_root / "overloaded-portable-worker.json"
@@ -1891,7 +1946,7 @@ def main() -> int:
         }["worker-error-counters"] is False
 
         failed_lowest_worker = json.loads(json.dumps(lowest_worker))
-        failed_lowest_worker["metrics"]["worker_errors"] = 1
+        failed_lowest_worker["runs"][0]["metrics"]["worker_errors"] = 1
         failed_lowest_worker_path = platform_root / "failed-lowest-worker.json"
         failed_lowest_worker_path.write_text(
             json.dumps(failed_lowest_worker) + "\n", encoding="utf-8"
@@ -2050,6 +2105,30 @@ def main() -> int:
             for entry in promotion["platforms"]
         ) == 1
 
+        # v3 promotion must reject accepted documents that hide missing or
+        # duplicated duration/RTF/RSS/worker-gate checks.
+        for mutation_name, mutate in (
+            ("missing-paced", lambda checks: checks.pop(next(i for i, item in enumerate(checks) if item["id"] == "minimum-paced-worker-blocks"))),
+            ("missing-rtf", lambda checks: checks.pop(next(i for i, item in enumerate(checks) if item["id"] == "stress-summed-rtf"))),
+            ("missing-rss", lambda checks: checks.pop(next(i for i, item in enumerate(checks) if item["id"] == "stress-peak-rss-bytes"))),
+            ("duplicate-check", lambda checks: checks.__setitem__(next(i for i, item in enumerate(checks) if item["id"] == "minimum-paced-worker-blocks"), dict(next(item for item in checks if item["id"] == "stress-summed-rtf")))),
+            ("wrong-tier-worker-gate", lambda checks: checks.__setitem__(next(i for i, item in enumerate(checks) if item["id"] == "worker-error-counters"), {**next(item for item in checks if item["id"] == "worker-error-counters"), "id": "worker-processing-errors"})),
+        ):
+            tampered = json.loads(arguments.platform_evidence[0].read_text(encoding="utf-8"))
+            mutate(tampered["checks"])
+            tampered["accepted"] = True
+            tampered_path = promotion_root / f"platform-{mutation_name}.json"
+            tampered_path.write_text(json.dumps(tampered) + "\n", encoding="utf-8")
+            tampered_args = SimpleNamespace(**vars(arguments))
+            tampered_args.platform_evidence = [tampered_path, *arguments.platform_evidence[1:]]
+            tampered_args.output = promotion_root / f"promotion-{mutation_name}.json"
+            try:
+                module.generate(tampered_args)
+            except module.PromotionError as error:
+                assert "checks" in str(error) or "worker gate" in str(error)
+            else:
+                raise AssertionError(f"v3 {mutation_name} unexpectedly passed")
+
         false_portable_direct_eligibility = json.loads(
             arguments.platform_evidence[0].read_text(encoding="utf-8")
         )
@@ -2074,7 +2153,7 @@ def main() -> int:
         try:
             module.generate(false_direct_eligibility)
         except module.PromotionError as error:
-            assert "direct-call deadline eligibility" in str(error)
+            assert "clock or direct-call gate" in str(error)
         else:
             raise AssertionError("false direct-call eligibility unexpectedly passed")
 
@@ -2267,7 +2346,9 @@ def main() -> int:
         )
         legacy_portable["schema"] = "denoize-dpdfnet-platform-evidence-v1"
         legacy_portable["schema_version"] = 1
+        legacy_portable["measurement"]["worker_neural_frames"] = min(legacy_portable["measurement"]["worker_neural_frames_per_channel"])
         legacy_portable["checks"].extend(json.loads(json.dumps(legacy_direct_checks)))
+        legacy_portable["checks"] = [item for item in legacy_portable["checks"] if item["id"] != "worker-independent-stereo"]
         for field in (
             "stress_realtime_paced",
             "deadline_clock",
@@ -2280,6 +2361,10 @@ def main() -> int:
             "wall_summed_compute_rtf",
             "worker_scheduling_counter_total",
             "worker_processing_error_count",
+            "worker_channels",
+            "worker_channel_mode",
+            "worker_callback_frames",
+            "worker_neural_frames_per_channel",
         ):
             del legacy_portable["measurement"][field]
         validators["platform_v1"].validate(legacy_portable)
@@ -2293,16 +2378,18 @@ def main() -> int:
             *arguments.platform_evidence[1:],
         ]
         mixed_versions.output = promotion_root / "promotion-mixed-platform-versions.json"
-        assert module.generate(mixed_versions) is True
-        validators["promotion"].validate(
-            json.loads(mixed_versions.output.read_text(encoding="utf-8"))
-        )
+        assert module.generate(mixed_versions) is False
+        mixed_promotion = json.loads(mixed_versions.output.read_text(encoding="utf-8"))
+        validators["promotion"].validate(mixed_promotion)
+        assert mixed_promotion["accepted"] is False
 
         legacy_lowest = json.loads(
             arguments.platform_evidence[3].read_text(encoding="utf-8")
         )
         legacy_lowest["schema"] = "denoize-dpdfnet-platform-evidence-v1"
         legacy_lowest["schema_version"] = 1
+        legacy_lowest["measurement"]["worker_neural_frames"] = min(legacy_lowest["measurement"]["worker_neural_frames_per_channel"])
+        legacy_lowest["checks"] = [item for item in legacy_lowest["checks"] if item["id"] != "worker-independent-stereo"]
         legacy_lowest["checks"].extend(json.loads(json.dumps(legacy_direct_checks)))
         for field in (
             "stress_realtime_paced",
@@ -2316,6 +2403,10 @@ def main() -> int:
             "wall_summed_compute_rtf",
             "worker_scheduling_counter_total",
             "worker_processing_error_count",
+            "worker_channels",
+            "worker_channel_mode",
+            "worker_callback_frames",
+            "worker_neural_frames_per_channel",
         ):
             del legacy_lowest["measurement"][field]
         validators["platform_v1"].validate(legacy_lowest)

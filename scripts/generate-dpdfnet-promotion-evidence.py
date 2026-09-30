@@ -429,12 +429,17 @@ def generate(args: argparse.Namespace) -> bool:
     operating_systems: set[str] = set()
     platform_slots: set[tuple[str, str]] = set()
     lowest_tier = 0
+    stereo_v3_count = 0
+    stereo_v3_os: set[str] = set()
+    stereo_v3_portable_os: set[str] = set()
+    stereo_v3_lowest = 0
     for path, bundle in zip(args.platform_evidence, args.platform_attestation, strict=True):
         document, payload = load(path, "platform evidence")
         platform_schema = document.get("schema")
         platform_versions = {
             "denoize-dpdfnet-platform-evidence-v1": 1,
             "denoize-dpdfnet-platform-evidence-v2": 2,
+            "denoize-dpdfnet-platform-evidence-v3": 3,
         }
         if (
             platform_schema not in platform_versions
@@ -526,6 +531,58 @@ def generate(args: argparse.Namespace) -> bool:
                     f"v2 {hardware_tier} platform evidence applies the wrong worker gate"
                 )
             wall_p99_9_ms = nested(document, "measurement.wall_p99_9_ms")
+        elif platform_schema == "denoize-dpdfnet-platform-evidence-v3":
+            if nested(document, "measurement.stress_realtime_paced") is not True:
+                raise PromotionError("v3 platform promotion evidence must record real-time pacing")
+            if nested(document, "measurement.worker_channels") != 2 or nested(document, "measurement.worker_channel_mode") != "independent":
+                raise PromotionError("v3 platform evidence lacks independent stereo worker geometry")
+            if any(item.get("id") in {"stress-p99-9-ms", "stress-maximum-ms", "stress-deadline-misses"} for item in document.get("checks", []) if isinstance(item, dict)):
+                raise PromotionError("v3 platform evidence unexpectedly applies the direct-call gate")
+            if nested(document, "measurement.worker_callback_frames") != [144, 480, 1024]:
+                raise PromotionError("v3 platform evidence lacks all callback geometries")
+            per_channel = nested(document, "measurement.worker_neural_frames_per_channel")
+            if (
+                not isinstance(per_channel, list)
+                or len(per_channel) != 2
+                or any(
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or not 480 <= value <= 4_800_000_000
+                    for value in per_channel
+                )
+            ):
+                raise PromotionError("v3 platform evidence lacks per-channel neural coverage")
+            stereo_v3_count += 1
+            stereo_v3_os.add(operating_system)
+            if hardware_tier == "portable-ci":
+                stereo_v3_portable_os.add(operating_system)
+            stereo_v3_lowest += int(hardware_tier == "lowest-supported")
+            deadline_clock = nested(document, "measurement.deadline_clock")
+            compute_rtf_clock = nested(document, "measurement.compute_rtf_clock")
+            direct_call_deadline_gate_eligible = nested(document, "measurement.direct_call_deadline_gate_eligible")
+            wall_clock_worker_gate_eligible = nested(document, "measurement.wall_clock_worker_gate_eligible")
+            if wall_clock_worker_gate_eligible is not (hardware_tier == "portable-ci"):
+                raise PromotionError("v3 platform evidence has invalid wall-clock worker eligibility")
+            expected_deadline_clock = "process-cpu" if operating_system == "macos" else "monotonic-wall"
+            expected_compute_rtf_clock = "process-cpu" if operating_system in {"macos", "windows"} else "monotonic-wall"
+            if deadline_clock != expected_deadline_clock or compute_rtf_clock != expected_compute_rtf_clock or direct_call_deadline_gate_eligible is not False:
+                raise PromotionError("v3 platform evidence has invalid clock or direct-call gate")
+            observed_check_ids = {item.get("id") for item in document.get("checks", []) if isinstance(item, dict)}
+            expected_worker_gate = "worker-error-counters" if hardware_tier == "portable-ci" else "worker-processing-errors"
+            unexpected_worker_gate = "worker-processing-errors" if hardware_tier == "portable-ci" else "worker-error-counters"
+            expected_check_ids = {
+                "minimum-stress-seconds", "minimum-stress-calls", "stress-summed-rtf",
+                "stress-peak-rss-bytes", "minimum-paced-worker-blocks", expected_worker_gate,
+                "worker-stereo-finite-frames", "worker-independent-stereo",
+                "worker-neural-frames-per-channel",
+            }
+            check_items = document.get("checks")
+            if not isinstance(check_items, list):
+                raise PromotionError("v3 platform evidence checks are missing")
+            observed_check_ids = [item.get("id") for item in check_items if isinstance(item, dict)]
+            if len(observed_check_ids) != 9 or len(set(observed_check_ids)) != 9 or set(observed_check_ids) != expected_check_ids:
+                raise PromotionError("v3 platform evidence checks are incomplete, duplicated, or use the wrong worker gate")
+            wall_p99_9_ms = nested(document, "measurement.wall_p99_9_ms")
         else:
             deadline_clock = "monotonic-wall"
             compute_rtf_clock = "monotonic-wall"
@@ -534,7 +591,7 @@ def generate(args: argparse.Namespace) -> bool:
             wall_p99_9_ms = nested(document, "measurement.p99_9_ms")
         if (
             hardware_tier == "lowest-supported"
-            and platform_schema != "denoize-dpdfnet-platform-evidence-v2"
+            and platform_schema not in {"denoize-dpdfnet-platform-evidence-v2", "denoize-dpdfnet-platform-evidence-v3"}
         ):
             raise PromotionError(
                 "lowest-supported promotion evidence must use the real-time-paced v2 schema"
@@ -579,8 +636,13 @@ def generate(args: argparse.Namespace) -> bool:
             "passed": operating_systems == {"linux", "macos", "windows"} and all(item["accepted"] for item in platforms),
         },
         {
+            "id": "full-stereo-host-geometry",
+            "observed": stereo_v3_count, "operator": "greater-or-equal", "limit": 4,
+            "passed": stereo_v3_os == {"linux", "macos", "windows"} and stereo_v3_portable_os == {"linux", "macos", "windows"} and stereo_v3_lowest >= 1 and all(item["accepted"] for item in platforms if item["os"] in {"linux", "macos", "windows"} and item["hardware_tier"] == "portable-ci"),
+        },
+        {
             "id": "lowest-supported-hardware",
-            "observed": lowest_tier, "operator": "greater-or-equal", "limit": 1, "passed": lowest_tier >= 1,
+            "observed": lowest_tier, "operator": "greater-or-equal", "limit": 1, "passed": lowest_tier >= 1 and stereo_v3_lowest >= 1,
         },
         {
             "id": "automated-reaper",
@@ -600,8 +662,8 @@ def generate(args: argparse.Namespace) -> bool:
     ]
     accepted = all(item["passed"] for item in checks)
     document = {
-        "schema": "denoize-dpdfnet-promotion-evidence-v1",
-        "schema_version": 1,
+        "schema": "denoize-dpdfnet-promotion-evidence-v2",
+        "schema_version": 2,
         "source": {"repository": "penguin425/denoize", "commit": source_commit, "issue": 221},
         "candidate": {
             "model_id": "dpdfnet2-48khz-hr",

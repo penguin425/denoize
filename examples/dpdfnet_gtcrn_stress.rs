@@ -42,7 +42,7 @@ impl ModelKind {
         match self {
             Self::Dpdfnet2 => "dpdfnet2_48khz_hr",
             Self::Dpdfnet8 => "dpdfnet8_48khz_hr",
-            Self::DpdfnetDaw => "dpdfnet2_48khz_stereo_linked_daw_path",
+            Self::DpdfnetDaw => "dpdfnet2_48khz_stereo_independent_daw_path",
             Self::Gtcrn => "gtcrn_native_hop",
             Self::GtcrnDaw => "gtcrn_48khz_stereo_linked_daw_path",
         }
@@ -499,7 +499,7 @@ fn run_dpdfnet_daw_threads(
                 sample_rate: dpdfnet::SAMPLE_RATE,
             }),
             deterministic: true,
-            channel_mode: ChannelMode::StereoLinked,
+            channel_mode: ChannelMode::Independent,
             ..BackendOptions::default()
         };
         let mut denoiser = DenoiserConfig::default(DAW_SAMPLE_RATE);
@@ -511,7 +511,8 @@ fn run_dpdfnet_daw_threads(
             options,
             &model,
         )?;
-        let input = daw_input(thread_index);
+        let fixture = daw_input(thread_index);
+        let mut input = fixture.clone();
         // The released worker receives an unmeasured pre-roll before host
         // evidence begins. Exercise the platform scheduler during this same
         // window so its workgroup and performance controller are established
@@ -526,7 +527,8 @@ fn run_dpdfnet_daw_threads(
                     std::thread::park_timeout(delay.min(DAW_WORKER_POLL));
                 }
             }
-            priority_guard.run_inference_cycle(|| stream.process_block(&input))?;
+            priority_guard
+                .run_inference_cycle(|| process_owned_daw_hop(&mut stream, &mut input, &fixture))?;
         }
         stream.reset()?;
         priority_guard.begin_inference_cycle_measurement();
@@ -561,7 +563,8 @@ fn run_dpdfnet_daw_threads(
                 None
             };
             let started = Instant::now();
-            let output = priority_guard.run_inference_cycle(|| stream.process_block(&input))?;
+            priority_guard
+                .run_inference_cycle(|| process_owned_daw_hop(&mut stream, &mut input, &fixture))?;
             durations_ms.push(milliseconds(started.elapsed()));
             if let (Some(durations), Some(process_cpu_started)) =
                 (&mut process_cpu_durations_ms, process_cpu_started)
@@ -571,12 +574,12 @@ fn run_dpdfnet_daw_threads(
                     .ok_or_else(|| "process CPU clock moved backwards".to_owned())?;
                 durations.push(milliseconds(elapsed));
             }
-            checksum += output
+            checksum += input
                 .first()
                 .and_then(|channel| channel.get(index % channel.len().max(1)))
                 .copied()
                 .unwrap_or(0.0);
-            if output.iter().flatten().any(|sample| !sample.is_finite()) {
+            if input.iter().flatten().any(|sample| !sample.is_finite()) {
                 return Err("DPDFNet DAW path produced a non-finite stress sample".into());
             }
         }
@@ -597,6 +600,22 @@ fn run_dpdfnet_daw_threads(
             checksum,
         })
     })
+}
+
+fn process_owned_daw_hop(
+    stream: &mut StreamingBackendSession,
+    storage: &mut Vec<Vec<f64>>,
+    fixture: &[Vec<f64>],
+) -> Result<(), String> {
+    if storage.len() != fixture.len() {
+        return Err("DPDFNet owned DAW storage lost its channel geometry".into());
+    }
+    for (channel, input) in storage.iter_mut().zip(fixture) {
+        channel.resize(input.len(), 0.0);
+        channel.copy_from_slice(input);
+    }
+    *storage = stream.process_owned_block(std::mem::take(storage))?;
+    Ok(())
 }
 
 fn run_parallel<F>(parallel: usize, task: F) -> Result<Vec<ThreadResult>, String>

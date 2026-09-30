@@ -21,6 +21,14 @@ evidence filename: the plug-in deliberately refuses to replace an existing
 file. Repeat at a requested buffer of 480 frames, one buffer no larger than 128
 frames, and one buffer no smaller than 1024 frames.
 
+For the HQ stereo re-check, also use actual stereo material with different
+left/right content; dual-mono alone cannot reveal a side-signal bypass. Check
+noise toward the sides as well as centered speech, and describe any changes
+to localization or stereo width separately from the worker counters. Use known
+continuous prerecorded audio played through REAPER **in real time** for the
+continuity runs; pauses in live speech can mask brief fallback events. An
+offline render does not exercise the same host scheduling.
+
 The generated JSON is the authoritative source for overload, late, invalid,
 worker-error, duration, and actual callback-frame measurements. Do not copy or
 guess those counters. Record audible XRUNs and continuous-audio status while

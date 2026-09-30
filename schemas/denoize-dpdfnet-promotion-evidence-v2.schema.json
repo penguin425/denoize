@@ -1,0 +1,149 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-dpdfnet-promotion-evidence-v2.schema.json",
+  "title": "denoize DPDFNet promotion evidence v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "schema_version", "source", "candidate", "baseline", "inputs", "artifact", "platforms", "checks", "decision", "accepted"],
+  "properties": {
+    "schema": { "const": "denoize-dpdfnet-promotion-evidence-v2" },
+    "schema_version": { "const": 2 },
+    "source": {
+      "type": "object", "additionalProperties": false,
+      "required": ["repository", "commit", "issue"],
+      "properties": {
+        "repository": { "const": "penguin425/denoize" },
+        "commit": { "$ref": "#/$defs/commit" },
+        "issue": { "const": 221 }
+      }
+    },
+    "candidate": {
+      "const": {
+        "model_id": "dpdfnet2-48khz-hr",
+        "model_sha256": "7f0575a5cec0ba4ffd8f8bd657e06d007e4ccdd955d76faab922b9d3291dc14b",
+        "plugin_id": "org.penguin425.denoize.neural-hq"
+      }
+    },
+    "baseline": {
+      "const": {
+        "model_id": "gtcrn-dns3",
+        "model_sha256": "b4718df6228e7bdf1a8a435cf98f838636eb2fd331acabf86ba87c5192ebcb87"
+      }
+    },
+    "inputs": {
+      "type": "object", "additionalProperties": false,
+      "required": ["objective_evaluation", "blinded_listening", "automated_reaper", "issue_reporter"],
+      "properties": {
+        "objective_evaluation": { "$ref": "#/$defs/jsonFile" },
+        "objective_equivalence": { "$ref": "#/$defs/jsonFile" },
+        "blinded_listening": { "$ref": "#/$defs/jsonFile" },
+        "automated_reaper": { "$ref": "#/$defs/jsonFile" },
+        "issue_reporter": { "$ref": "#/$defs/jsonFile" }
+      }
+    },
+    "artifact": {
+      "type": "object", "additionalProperties": false,
+      "required": ["archive", "package_manifest_sha256", "target", "plugin_sha256", "model_sha256", "descriptor_count", "attestation", "automated_reaper_attestation"],
+      "properties": {
+        "archive": { "$ref": "#/$defs/archiveFile" },
+        "package_manifest_sha256": { "$ref": "#/$defs/sha256" },
+        "target": { "const": "x86_64-pc-windows-msvc" },
+        "plugin_sha256": { "$ref": "#/$defs/sha256" },
+        "model_sha256": { "const": "7f0575a5cec0ba4ffd8f8bd657e06d007e4ccdd955d76faab922b9d3291dc14b" },
+        "descriptor_count": { "const": 3 },
+        "attestation": { "$ref": "#/$defs/attestation" },
+        "automated_reaper_attestation": { "$ref": "#/$defs/attestation" }
+      }
+    },
+    "platforms": {
+      "type": "array", "minItems": 3, "maxItems": 6,
+      "items": { "$ref": "#/$defs/platform" }
+    },
+    "checks": {
+      "type": "array", "minItems": 15, "maxItems": 15,
+      "items": { "$ref": "#/$defs/check" }
+    },
+    "decision": {
+      "type": "object", "additionalProperties": false,
+      "required": ["dpdfnet2_selectable_hq", "eligible_for_default_review", "keep_gtcrn_selectable", "include_dpdfnet8", "normal_clap_descriptor_count_before_decision", "experimental_clap_descriptor_count", "expand_vst3", "expand_auv3", "expand_lv2"],
+      "properties": {
+        "dpdfnet2_selectable_hq": { "type": "boolean" },
+        "eligible_for_default_review": { "type": "boolean" },
+        "keep_gtcrn_selectable": { "const": true },
+        "include_dpdfnet8": { "const": false },
+        "normal_clap_descriptor_count_before_decision": { "const": 2 },
+        "experimental_clap_descriptor_count": { "const": 3 },
+        "expand_vst3": { "const": false },
+        "expand_auv3": { "const": false },
+        "expand_lv2": { "const": false }
+      }
+    },
+    "accepted": { "type": "boolean" }
+  },
+  "$defs": {
+    "commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "jsonFile": {
+      "type": "object", "additionalProperties": false,
+      "required": ["name", "size_bytes", "sha256"],
+      "properties": {
+        "name": { "type": "string", "pattern": "^[A-Za-z0-9._+-]{1,255}$" },
+        "size_bytes": { "type": "integer", "minimum": 1, "maximum": 33554432 },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "archiveFile": {
+      "type": "object", "additionalProperties": false,
+      "required": ["name", "size_bytes", "sha256"],
+      "properties": {
+        "name": { "type": "string", "pattern": "^[A-Za-z0-9._+-]{1,255}\\.zip$" },
+        "size_bytes": { "type": "integer", "minimum": 1, "maximum": 536870912 },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "attestation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["subject_sha256", "bundle_sha256", "verified_attestations", "repository", "signer_workflow", "source_commit"],
+      "properties": {
+        "subject_sha256": { "$ref": "#/$defs/sha256" },
+        "bundle_sha256": { "$ref": "#/$defs/sha256" },
+        "verified_attestations": { "type": "integer", "minimum": 1, "maximum": 64 },
+        "repository": { "const": "penguin425/denoize" },
+        "signer_workflow": { "const": "penguin425/denoize/.github/workflows/dpdfnet-promotion.yml" },
+        "source_commit": { "$ref": "#/$defs/commit" }
+      }
+    },
+    "platform": {
+      "type": "object", "additionalProperties": false,
+      "required": ["file", "attestation", "os", "target", "cpu_model", "hardware_tier", "runner_label", "deadline_clock", "compute_rtf_clock", "direct_call_deadline_gate_eligible", "wall_clock_worker_gate_eligible", "p99_9_ms", "wall_p99_9_ms", "peak_rss_bytes", "accepted"],
+      "properties": {
+        "file": { "$ref": "#/$defs/jsonFile" },
+        "attestation": { "$ref": "#/$defs/attestation" },
+        "os": { "enum": ["linux", "macos", "windows"] },
+        "target": { "type": "string", "pattern": "^[A-Za-z0-9_.-]{3,128}$" },
+        "cpu_model": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "hardware_tier": { "enum": ["portable-ci", "lowest-supported"] },
+        "runner_label": { "enum": ["ubuntu-24.04", "macos-14", "macos-15", "windows-2025", "ubuntu-slim"] },
+        "deadline_clock": { "enum": ["monotonic-wall", "process-cpu"] },
+        "compute_rtf_clock": { "enum": ["monotonic-wall", "process-cpu"] },
+        "direct_call_deadline_gate_eligible": { "type": "boolean" },
+        "wall_clock_worker_gate_eligible": { "type": "boolean" },
+        "p99_9_ms": { "type": "number", "minimum": 0, "maximum": 10000 },
+        "wall_p99_9_ms": { "type": "number", "minimum": 0, "maximum": 10000 },
+        "peak_rss_bytes": { "type": "integer", "minimum": 1, "maximum": 536870912 },
+        "accepted": { "type": "boolean" }
+      }
+    },
+    "check": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "observed", "operator", "limit", "passed"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z0-9-]{1,64}$" },
+        "observed": { "type": "number" },
+        "operator": { "enum": ["greater-or-equal", "less-or-equal"] },
+        "limit": { "type": "number" },
+        "passed": { "type": "boolean" }
+      }
+    }
+  }
+}

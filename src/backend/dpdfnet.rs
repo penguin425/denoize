@@ -486,8 +486,8 @@ impl StreamingProcessor {
         Ok(output)
     }
 
-    /// Process an owned block while reusing its mono native-rate storage for
-    /// the result when the caller already prepared one exact model hop.
+    /// Process an owned block while reusing its native-rate storage for the
+    /// result when the caller already prepared one exact model hop.
     pub(crate) fn process_owned_block(
         &mut self,
         mut input: Vec<Vec<f64>>,
@@ -497,7 +497,6 @@ impl StreamingProcessor {
         }
         let frames = validate_stream_block(&input, self.channels)?;
         if !self.native_rate
-            || self.channels != 1
             || frames != HOP_SIZE
             || self
                 .pending_model_rate
@@ -515,18 +514,22 @@ impl StreamingProcessor {
             .model_input_frames
             .checked_add(frames)
             .ok_or_else(|| "DPDFNet model input length overflow".to_string())?;
-        for (&source, destination) in input[0].iter().zip(&mut self.hop_scratch[0]) {
-            *destination = crate::audio::sanitize_sample(source) as f32;
+        for (channel, hop) in input.iter().zip(&mut self.hop_scratch) {
+            for (&source, destination) in channel.iter().zip(hop) {
+                *destination = crate::audio::sanitize_sample(source) as f32;
+            }
         }
 
         let remaining = self
             .model_input_frames
             .checked_sub(self.model_output_frames)
             .ok_or_else(|| "DPDFNet model output exceeded its input clock".to_string())?;
-        input[0].clear();
-        input[0]
-            .try_reserve(remaining.min(HOP_SIZE))
-            .map_err(|_| "unable to reserve DPDFNet output samples".to_string())?;
+        for channel in &mut input {
+            channel.clear();
+            channel
+                .try_reserve(remaining.min(HOP_SIZE))
+                .map_err(|_| "unable to reserve DPDFNet output samples".to_string())?;
+        }
         self.process_scratch_hop(&mut input)?;
 
         let produced = validate_stream_block(&input, self.channels)?;
@@ -1035,8 +1038,9 @@ mod tests {
     use super::*;
     use prost::Message;
     use tract_onnx::pb::{
-        tensor_proto, tensor_shape_proto, type_proto, GraphProto, ModelProto, NodeProto,
-        OperatorSetIdProto, StringStringEntryProto, TensorShapeProto, TypeProto, ValueInfoProto,
+        attribute_proto, tensor_proto, tensor_shape_proto, type_proto, AttributeProto, GraphProto,
+        ModelProto, NodeProto, OperatorSetIdProto, StringStringEntryProto, TensorProto,
+        TensorShapeProto, TypeProto, ValueInfoProto,
     };
 
     fn valid_metadata() -> BTreeMap<String, String> {
@@ -1146,7 +1150,7 @@ mod tests {
 
     #[test]
     fn production_stream_is_partition_invariant_resettable_and_exact_length() {
-        let (_directory, path) = write_identity_model();
+        let (_directory, path) = write_scaled_model(0.25);
         let config = OnnxModelConfig {
             path,
             sample_rate: SAMPLE_RATE,
@@ -1275,16 +1279,91 @@ mod tests {
         assert_eq!(owned.finish().unwrap(), borrowed.finish().unwrap());
     }
 
+    #[test]
+    fn native_owned_multichannel_hops_match_independent_mono_streams() {
+        let (_directory, path) = write_scaled_model(0.25);
+        let config = OnnxModelConfig {
+            path,
+            sample_rate: SAMPLE_RATE,
+        };
+        let model = DpdfnetModel::load(&config).unwrap();
+        let mut stereo = StreamingProcessor::new_with_model(&model, SAMPLE_RATE, 2).unwrap();
+        let mut mono = [
+            StreamingProcessor::new_with_model(&model, SAMPLE_RATE, 1).unwrap(),
+            StreamingProcessor::new_with_model(&model, SAMPLE_RATE, 1).unwrap(),
+        ];
+        let mut stereo_output = [Vec::new(), Vec::new()];
+        for hop_index in 0..8 {
+            let left: Vec<f64> = (0..HOP_SIZE)
+                .map(|index| {
+                    let position = hop_index * HOP_SIZE + index;
+                    (std::f64::consts::TAU * 521.0 * position as f64 / SAMPLE_RATE as f64).sin()
+                        * 0.2
+                })
+                .collect();
+            let right: Vec<f64> = (0..HOP_SIZE)
+                .map(|index| {
+                    let position = hop_index * HOP_SIZE + index;
+                    if hop_index % 2 == 0 {
+                        0.0
+                    } else {
+                        -(std::f64::consts::TAU * 733.0 * position as f64 / SAMPLE_RATE as f64)
+                            .sin()
+                            * 0.15
+                    }
+                })
+                .collect();
+            let expected_left = mono[0].process_block(&[left.clone()]).unwrap();
+            let expected_right = mono[1].process_block(&[right.clone()]).unwrap();
+            let owned = vec![left, right];
+            let outer_ptr = owned.as_ptr();
+            let channel_ptrs = [owned[0].as_ptr(), owned[1].as_ptr()];
+            let actual = stereo.process_owned_block(owned).unwrap();
+            assert_eq!(actual.as_ptr(), outer_ptr);
+            assert_eq!(actual[0].as_ptr(), channel_ptrs[0]);
+            assert_eq!(actual[1].as_ptr(), channel_ptrs[1]);
+            assert_eq!(actual[0], expected_left[0]);
+            assert_eq!(actual[1], expected_right[0]);
+            stereo_output[0].extend_from_slice(&actual[0]);
+            stereo_output[1].extend_from_slice(&actual[1]);
+        }
+        let tail = stereo.finish().unwrap();
+        let mono_tail = [mono[0].finish().unwrap(), mono[1].finish().unwrap()];
+        for channel in 0..2 {
+            assert_eq!(tail[channel], mono_tail[channel][0]);
+            stereo_output[channel].extend_from_slice(&tail[channel]);
+        }
+        assert_eq!(stereo_output[0].len(), 8 * HOP_SIZE);
+        assert_eq!(stereo_output[1].len(), 8 * HOP_SIZE);
+        assert!(stereo_output[0].iter().any(|sample| sample.abs() > 1e-4));
+
+        stereo.reset();
+        mono[0].reset();
+        mono[1].reset();
+        let left = vec![0.125; HOP_SIZE];
+        let right = vec![-0.125; HOP_SIZE];
+        let expected_left = mono[0].process_block(&[left.clone()]).unwrap();
+        let expected_right = mono[1].process_block(&[right.clone()]).unwrap();
+        let actual = stereo.process_owned_block(vec![left, right]).unwrap();
+        assert_eq!(actual[0], expected_left[0]);
+        assert_eq!(actual[1], expected_right[0]);
+        assert_eq!(stereo.finish().unwrap().len(), 2);
+    }
+
     fn write_identity_model() -> (tempfile::TempDir, std::path::PathBuf) {
+        write_scaled_model(1.0)
+    }
+
+    fn write_scaled_model(scale: f32) -> (tempfile::TempDir, std::path::PathBuf) {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("dpdfnet-identity.onnx");
+        let path = directory.path().join("dpdfnet-scaled.onnx");
         let mut bytes = Vec::new();
-        identity_model().encode(&mut bytes).unwrap();
+        scaled_model(scale).encode(&mut bytes).unwrap();
         std::fs::write(&path, bytes).unwrap();
         (directory, path)
     }
 
-    fn identity_model() -> ModelProto {
+    fn scaled_model(scale: f32) -> ModelProto {
         let shapes: [(&str, &str, &[i64]); 2] = [
             ("spectrum", "enhanced", &[1, 1, BINS as i64, 2]),
             ("state", "state_out", &[DPDFNET2_STATE_SIZE as i64]),
@@ -1297,17 +1376,39 @@ mod tests {
             }],
             producer_name: "denoize-test".into(),
             graph: Some(GraphProto {
-                name: "dpdfnet-identity".into(),
-                node: shapes
-                    .iter()
-                    .map(|(input, output, _)| NodeProto {
-                        input: vec![(*input).into()],
-                        output: vec![(*output).into()],
-                        name: format!("{input}_identity"),
+                name: "dpdfnet-scaled".into(),
+                node: vec![
+                    NodeProto {
+                        input: vec!["spectrum".into(), "scale".into()],
+                        output: vec!["enhanced".into()],
+                        name: "spectrum_scale".into(),
+                        op_type: "Mul".into(),
+                        ..Default::default()
+                    },
+                    NodeProto {
+                        output: vec!["state_out".into()],
+                        name: "state_identity".into(),
+                        input: vec!["state".into()],
                         op_type: "Identity".into(),
                         ..Default::default()
-                    })
-                    .collect(),
+                    },
+                    NodeProto {
+                        output: vec!["scale".into()],
+                        name: "scale_constant".into(),
+                        op_type: "Constant".into(),
+                        attribute: vec![AttributeProto {
+                            name: "value".into(),
+                            r#type: attribute_proto::AttributeType::Tensor as i32,
+                            t: Some(TensorProto {
+                                data_type: tensor_proto::DataType::Float as i32,
+                                float_data: vec![scale],
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                ],
                 input: shapes
                     .iter()
                     .map(|(input, _, shape)| value_info(input, shape))
