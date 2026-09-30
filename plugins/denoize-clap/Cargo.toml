@@ -29,6 +29,9 @@ crossbeam-queue = "0.3.12"
 denoize-plugin-editor = { path = "../denoize-plugin-editor" }
 serde_json = "1.0"
 
+[dev-dependencies]
+libc = "0.2"
+
 [features]
 default = []
 # DPDFNet HQ is deliberately absent from normal release-format builds until

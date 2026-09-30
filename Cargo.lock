@@ -1157,6 +1157,7 @@ dependencies = [
  "crossbeam-queue",
  "denoize",
  "denoize-plugin-editor",
+ "libc",
  "serde_json",
 ]
 
