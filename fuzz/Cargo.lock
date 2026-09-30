@@ -263,7 +263,7 @@ checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 
 [[package]]
 name = "denoize"
-version = "0.86.0"
+version = "0.90.2"
 dependencies = [
  "base64",
  "claxon",
@@ -275,6 +275,7 @@ dependencies = [
  "hound",
  "libc",
  "lofty",
+ "mach2",
  "minisign-verify",
  "mp4",
  "nanomp3",
@@ -300,7 +301,7 @@ dependencies = [
 
 [[package]]
 name = "denoize-c"
-version = "0.86.0"
+version = "0.90.2"
 dependencies = [
  "denoize",
 ]
@@ -756,6 +757,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
+name = "mach2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d640282b302c0bb0a2a8e0233ead9035e3bed871f0b7e81fe4a1ec829765db44"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "md-5"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1098,9 +1108,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.43"
+version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
+checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "log",
  "once_cell",
