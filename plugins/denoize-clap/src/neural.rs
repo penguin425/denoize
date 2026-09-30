@@ -1220,17 +1220,17 @@ impl DpdfnetProcessor {
                 "DPDFNet model is unavailable ({error}); run `denoize models install dpdfnet` before activating denoize Neural HQ"
             )
         })?;
-        let mut options = BackendOptions {
+        let options = BackendOptions {
             onnx: Some(OnnxModelConfig {
                 path,
                 sample_rate: model.sample_rate,
             }),
             deterministic: true,
+            // HQ must enhance both L/R signals, including anti-phase side
+            // noise. StereoLinked intentionally preserves side unchanged.
+            channel_mode: ChannelMode::Independent,
             ..BackendOptions::default()
         };
-        if channels == 2 {
-            options.channel_mode = ChannelMode::StereoLinked;
-        }
         let accelerator = select_accelerator_for_options(Backend::Dpdfnet, &options)?;
         let Some(model_config) = options.onnx.as_ref() else {
             return Err("internal DPDFNet model options are unavailable".to_owned());
@@ -1322,6 +1322,13 @@ struct NeuralEngine<'a> {
     worker_started: bool,
     finished_gracefully: bool,
     metrics: &'a NeuralShared,
+    #[cfg(test)]
+    profile_rx: Option<mpsc::Receiver<WorkerProfileTrace>>,
+    // Diagnostic control only: ordinary tests and production always notify.
+    #[cfg(test)]
+    callback_notifications_enabled: bool,
+    #[cfg(test)]
+    callback_notifications_sent: std::cell::Cell<u64>,
 }
 
 impl<'a> NeuralEngine<'a> {
@@ -1393,6 +1400,29 @@ impl<'a> NeuralEngine<'a> {
     where
         F: FnOnce() -> Result<Box<dyn BlockProcessor>, String> + Send + 'static,
     {
+        Self::new_with_factory_inner(
+            sample_rate,
+            channels,
+            metrics,
+            factory,
+            #[cfg(test)]
+            None,
+            #[cfg(test)]
+            WorkerParkConfig::default(),
+        )
+    }
+
+    fn new_with_factory_inner<F>(
+        sample_rate: f64,
+        channels: usize,
+        metrics: &'a NeuralShared,
+        factory: F,
+        #[cfg(test)] profile_epoch: Option<std::time::Instant>,
+        #[cfg(test)] park_config: WorkerParkConfig,
+    ) -> Result<Self, String>
+    where
+        F: FnOnce() -> Result<Box<dyn BlockProcessor>, String> + Send + 'static,
+    {
         if !(1..=2).contains(&channels) {
             return Err("neural plug-in supports one or two channels".into());
         }
@@ -1452,6 +1482,13 @@ impl<'a> NeuralEngine<'a> {
         let worker_output = Arc::clone(&output_queue);
         let worker_errors = Arc::clone(&metrics.worker_errors);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        #[cfg(test)]
+        let (profile, profile_rx) = if let Some(epoch) = profile_epoch {
+            let (tx, rx) = mpsc::sync_channel(1);
+            (Some((WorkerProfileRecorder::new(epoch), tx)), Some(rx))
+        } else {
+            (None, None)
+        };
         let worker = thread::Builder::new()
             .name("denoize-neural".to_owned())
             .spawn(move || {
@@ -1464,6 +1501,13 @@ impl<'a> NeuralEngine<'a> {
                         Ok((processor, priority_guard, worker_buffers))
                     }) {
                         Ok(initialized) => {
+                            // Consume any sticky token left by model startup,
+                            // then enter the actual OS wait path before a
+                            // callback can first notify this worker. macOS's
+                            // semaphore may otherwise allocate its kernel
+                            // wait resource lazily on the first unpark.
+                            thread::park_timeout(WORKER_POLL);
+                            thread::park_timeout(WORKER_POLL);
                             let _ = ready_tx.send(Ok(()));
                             initialized
                         }
@@ -1480,6 +1524,10 @@ impl<'a> NeuralEngine<'a> {
                     worker_output,
                     worker_running,
                     worker_errors,
+                    #[cfg(test)]
+                    profile,
+                    #[cfg(test)]
+                    park_config,
                 );
                 drop(priority_guard);
             })
@@ -1553,6 +1601,12 @@ impl<'a> NeuralEngine<'a> {
             worker_started,
             finished_gracefully,
             metrics,
+            #[cfg(test)]
+            profile_rx,
+            #[cfg(test)]
+            callback_notifications_enabled: true,
+            #[cfg(test)]
+            callback_notifications_sent: std::cell::Cell::new(0),
         })
     }
 
@@ -1651,7 +1705,9 @@ impl<'a> NeuralEngine<'a> {
         if let Some(result) = self.playback.take() {
             self.recycle(result.block);
         }
+        let mut released_output = false;
         while let Some(result) = self.output_queue.pop() {
+            released_output = true;
             if result.block.generation != self.generation {
                 self.recycle(result.block);
             } else if self.ready.len() < BLOCK_POOL_SIZE {
@@ -1660,6 +1716,9 @@ impl<'a> NeuralEngine<'a> {
                 self.metrics.overload_blocks.fetch_add(1, Ordering::Relaxed);
                 self.recycle(result.block);
             }
+        }
+        if released_output {
+            self.wake_worker();
         }
         if self.input_frame < u64::from(self.latency_frames) {
             return;
@@ -1715,7 +1774,10 @@ impl<'a> NeuralEngine<'a> {
             return;
         };
         match self.input_queue.push(completed) {
-            Ok(()) => self.capture = Some(replacement),
+            Ok(()) => {
+                self.capture = Some(replacement);
+                self.wake_worker();
+            }
             Err(mut returned) => {
                 self.metrics.overload_blocks.fetch_add(1, Ordering::Relaxed);
                 returned.frames = 0;
@@ -1724,6 +1786,30 @@ impl<'a> NeuralEngine<'a> {
             }
         }
         self.capture_frames = 0;
+    }
+
+    #[inline]
+    fn wake_worker(&self) {
+        #[cfg(test)]
+        if !self.callback_notifications_enabled {
+            return;
+        }
+        #[cfg(test)]
+        if self.worker.is_some() {
+            self.callback_notifications_sent
+                .set(self.callback_notifications_sent.get().saturating_add(1));
+        }
+        self.notify_worker();
+    }
+
+    #[inline]
+    fn notify_worker(&self) {
+        if let Some(worker) = self.worker.as_ref() {
+            // Borrow the already initialized thread handle: no callback
+            // allocation, queue retry, or wait. A sticky unpark token also
+            // covers publication racing the worker's empty/full check.
+            worker.thread().unpark();
+        }
     }
 
     #[inline]
@@ -1756,17 +1842,29 @@ impl<'a> NeuralEngine<'a> {
         while let Some(result) = self.output_queue.pop() {
             self.recycle(result.block);
         }
+        // Reset is not part of the callback-notification diagnostic switch.
+        self.notify_worker();
     }
 
     fn stop(&mut self) {
         self.running.store(false, Ordering::Release);
-        if let Some(worker) = self.worker.take()
-            && worker.join().is_err()
-        {
-            self.finished_gracefully = false;
-            self.metrics.worker_errors.fetch_add(1, Ordering::Relaxed);
-            eprintln!("denoize Neural worker panicked during shutdown");
+        if let Some(worker) = self.worker.take() {
+            worker.thread().unpark();
+            if worker.join().is_err() {
+                self.finished_gracefully = false;
+                self.metrics.worker_errors.fetch_add(1, Ordering::Relaxed);
+                eprintln!("denoize Neural worker panicked during shutdown");
+            }
         }
+    }
+
+    #[cfg(test)]
+    fn take_profile_trace(&mut self) -> Option<WorkerProfileTrace> {
+        assert!(
+            self.worker.is_none(),
+            "join worker before reading its profile"
+        );
+        self.profile_rx.take()?.try_recv().ok()
     }
 }
 
@@ -1871,6 +1969,8 @@ fn worker_loop(
     output: Arc<ArrayQueue<ProcessedBlock>>,
     running: Arc<AtomicBool>,
     worker_errors: Arc<AtomicU64>,
+    #[cfg(test)] profile: Option<(WorkerProfileRecorder, mpsc::SyncSender<WorkerProfileTrace>)>,
+    #[cfg(test)] park_config: WorkerParkConfig,
 ) {
     let mut generation = 0u64;
     let mut next_start = 0u64;
@@ -1882,26 +1982,72 @@ fn worker_loop(
     } = worker_buffers;
     let channels = planar.len();
     let mut failed = false;
+    #[cfg(test)]
+    let (mut profile_cycles, profile_tx) = match profile {
+        Some((recorder, sender)) => (Some(recorder), Some(sender)),
+        None => (None, None),
+    };
 
     while running.load(Ordering::Acquire) {
         if let Some(result) = completed.pop_front()
             && let Err(result) = output.push(result)
         {
             completed.push_front(result);
+            #[cfg(not(test))]
             thread::park_timeout(WORKER_POLL);
+            #[cfg(test)]
+            profile_worker_park(&mut profile_cycles, true, &park_config, &running);
             continue;
         }
         let Some(block) = input.pop() else {
+            // A discontinuity can complete several pending blocks at once.
+            // Publish every bounded result before waiting for new input;
+            // output backpressure is handled by the branch above.
+            if !completed.is_empty() {
+                continue;
+            }
+            #[cfg(not(test))]
             thread::park_timeout(WORKER_POLL);
+            #[cfg(test)]
+            profile_worker_park(&mut profile_cycles, false, &park_config, &running);
             continue;
         };
         // Once a block has been dequeued, all deadline-bound preparation,
         // inference, and output assembly belongs to the same Audio Work
         // Interval. Queue exchange and diagnostics stay outside the interval.
+        #[cfg(test)]
+        let mut cycle_profile = profile_cycles.as_ref().map(|recorder| WorkerProfileCycle {
+            input_pop_ns: recorder.wall_ns(),
+            generation: block.generation,
+            start_frame: block.start_frame,
+            next_expected: next_start,
+            input_len_before: input.len(),
+            output_len_before: output.len(),
+            pending_len_before: pending.len(),
+            completed_len_before: completed.len(),
+            ready_frames_before: ready.first().map_or(0, VecDeque::len),
+            reset_reason: if generation == 0 {
+                "initial_generation"
+            } else if block.generation != generation {
+                "generation_change"
+            } else if block.start_frame != next_start {
+                "input_gap"
+            } else {
+                "none"
+            },
+            missing_input_frames: if block.generation == generation {
+                block.start_frame.saturating_sub(next_start)
+            } else {
+                0
+            },
+            ..WorkerProfileCycle::default()
+        });
         let cycle_failure = priority_guard.run_inference_cycle(|| {
             let mut cycle_failure = None;
             let discontinuity = block.generation != generation || block.start_frame != next_start;
             if discontinuity {
+                #[cfg(test)]
+                let reset_started = profile_phase_start(&mut profile_cycles);
                 generation = block.generation;
                 ready.iter_mut().for_each(VecDeque::clear);
                 while let Some(pending_block) = pending.pop_front() {
@@ -1918,6 +2064,10 @@ fn worker_loop(
                 } else {
                     false
                 };
+                #[cfg(test)]
+                if let Some(cycle) = cycle_profile.as_mut() {
+                    cycle.reset = profile_phase_finish(&mut profile_cycles, reset_started);
+                }
             }
             next_start = block.start_frame.saturating_add(block.frames as u64);
             if failed {
@@ -1929,8 +2079,30 @@ fn worker_loop(
                 return cycle_failure;
             }
 
-            let processed = fill_planar(&block, channels, &mut planar)
-                .and_then(|()| processor.process(std::mem::take(&mut planar)));
+            #[cfg(test)]
+            let copy_started = profile_phase_start(&mut profile_cycles);
+            let filled = fill_planar(&block, channels, &mut planar);
+            #[cfg(test)]
+            if let Some(cycle) = cycle_profile.as_mut() {
+                cycle.copy = profile_phase_finish(&mut profile_cycles, copy_started);
+            }
+            let processed = filled.and_then(|()| {
+                #[cfg(test)]
+                let process_started = profile_phase_start(&mut profile_cycles);
+                let result = processor.process(std::mem::take(&mut planar));
+                #[cfg(test)]
+                if let Some(cycle) = cycle_profile.as_mut() {
+                    cycle.processor = profile_phase_finish(&mut profile_cycles, process_started);
+                    cycle.returned_frames = result
+                        .as_ref()
+                        .ok()
+                        .and_then(|channels| channels.first())
+                        .map_or(0, Vec::len);
+                }
+                result
+            });
+            #[cfg(test)]
+            let assembly_started = profile_phase_start(&mut profile_cycles);
             let processed = processed.and_then(|processed| {
                 let appended = append_ready(&mut ready, &processed, channels)
                     .map_err(|()| "neural worker returned invalid channel geometry".to_owned());
@@ -1961,10 +2133,253 @@ fn worker_loop(
                     ready.iter_mut().for_each(VecDeque::clear);
                 }
             }
+            #[cfg(test)]
+            if let Some(cycle) = cycle_profile.as_mut() {
+                cycle.assembly = profile_phase_finish(&mut profile_cycles, assembly_started);
+            }
             cycle_failure
         });
         if let Some((operation, error)) = cycle_failure {
             eprintln!("denoize Neural worker {operation} error: {error}");
+        }
+        #[cfg(test)]
+        if let (Some(recorder), Some(mut cycle)) = (profile_cycles.as_mut(), cycle_profile) {
+            cycle.cycle_end_ns = recorder.wall_ns();
+            cycle.pending_len_after = pending.len();
+            cycle.completed_len_after = completed.len();
+            cycle.ready_frames_after = ready.first().map_or(0, VecDeque::len);
+            recorder.record(cycle);
+        }
+    }
+    #[cfg(test)]
+    if let (Some(sender), Some(recorder)) = (profile_tx, profile_cycles) {
+        let _ = sender.try_send(recorder.trace);
+    }
+}
+
+// Explicitly enabled test-only diagnostics. The recorders are preallocated
+// before activation publishes readiness and never grow in the hot path.
+#[cfg(test)]
+struct WorkerParkConfig {
+    timeout: Duration,
+    // 0 = not waiting, 1 = input empty, 2 = output full. Reaching this probe
+    // means the predicate was checked, not that the OS has already slept.
+    entered: Option<Arc<AtomicU64>>,
+    before_park_gate: Option<Arc<AtomicBool>>,
+}
+
+#[cfg(test)]
+impl Default for WorkerParkConfig {
+    fn default() -> Self {
+        Self {
+            timeout: WORKER_POLL,
+            entered: None,
+            before_park_gate: None,
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+struct WorkerProfileCycle {
+    input_pop_ns: u64,
+    generation: u64,
+    start_frame: u64,
+    next_expected: u64,
+    input_len_before: usize,
+    output_len_before: usize,
+    pending_len_before: usize,
+    completed_len_before: usize,
+    ready_frames_before: usize,
+    reset_reason: &'static str,
+    missing_input_frames: u64,
+    reset: Option<WorkerProfilePhase>,
+    copy: Option<WorkerProfilePhase>,
+    processor: Option<WorkerProfilePhase>,
+    assembly: Option<WorkerProfilePhase>,
+    cycle_end_ns: u64,
+    pending_len_after: usize,
+    completed_len_after: usize,
+    ready_frames_after: usize,
+    returned_frames: usize,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+struct WorkerProfilePhase {
+    wall_ns: u64,
+    thread_cpu_ns: Option<u64>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct WorkerProfileTrace {
+    cycles: Vec<WorkerProfileCycle>,
+    dropped_cycles: u64,
+    cpu_clock_failures: u64,
+    input_empty_parks: u64,
+    input_empty_park_wall_ns: u64,
+    output_full_parks: u64,
+    output_full_park_wall_ns: u64,
+}
+
+#[cfg(test)]
+struct WorkerProfileRecorder {
+    epoch: std::time::Instant,
+    trace: WorkerProfileTrace,
+}
+
+#[cfg(test)]
+impl WorkerProfileRecorder {
+    fn new(epoch: std::time::Instant) -> Self {
+        let mut cycles = Vec::new();
+        cycles
+            .try_reserve_exact(8192)
+            .expect("profile recorder allocation");
+        Self {
+            epoch,
+            trace: WorkerProfileTrace {
+                cycles,
+                ..WorkerProfileTrace::default()
+            },
+        }
+    }
+
+    fn wall_ns(&self) -> u64 {
+        self.epoch.elapsed().as_nanos() as u64
+    }
+
+    fn thread_cpu_ns(&mut self) -> Option<u64> {
+        let value = thread_cpu_time_ns();
+        if value.is_none() {
+            self.trace.cpu_clock_failures += 1;
+        }
+        value
+    }
+
+    fn record(&mut self, cycle: WorkerProfileCycle) {
+        if self.trace.cycles.len() == 8192 {
+            self.trace.dropped_cycles = self.trace.dropped_cycles.saturating_add(1);
+        } else {
+            self.trace.cycles.push(cycle);
+        }
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[allow(unsafe_code)]
+fn thread_cpu_time_ns() -> Option<u64> {
+    let mut value = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: value is valid writable storage with the platform's timespec
+    // layout; clock_gettime does not retain the pointer.
+    if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut value) } != 0 {
+        return None;
+    }
+    if value.tv_sec < 0 || !(0..1_000_000_000).contains(&value.tv_nsec) {
+        return None;
+    }
+    u64::try_from(value.tv_sec)
+        .ok()?
+        .checked_mul(1_000_000_000)?
+        .checked_add(u64::try_from(value.tv_nsec).ok()?)
+}
+
+#[cfg(all(test, windows))]
+#[allow(unsafe_code)]
+fn thread_cpu_time_ns() -> Option<u64> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
+
+    let mut created = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut exited = created;
+    let mut kernel = created;
+    let mut user = created;
+    // SAFETY: this pseudo handle refers to the calling live worker thread.
+    // All four FILETIME pointers are valid distinct writable storage and are
+    // not retained. The pseudo handle must not be closed.
+    if unsafe {
+        GetThreadTimes(
+            GetCurrentThread(),
+            &mut created,
+            &mut exited,
+            &mut kernel,
+            &mut user,
+        )
+    } == 0
+    {
+        return None;
+    }
+    let ticks =
+        |value: FILETIME| (u64::from(value.dwHighDateTime) << 32) | u64::from(value.dwLowDateTime);
+    ticks(kernel).checked_add(ticks(user))?.checked_mul(100)
+}
+
+#[cfg(all(test, not(any(target_os = "linux", target_os = "macos", windows))))]
+fn thread_cpu_time_ns() -> Option<u64> {
+    None
+}
+
+#[cfg(test)]
+fn profile_phase_start(
+    recorder: &mut Option<WorkerProfileRecorder>,
+) -> Option<(std::time::Instant, Option<u64>)> {
+    recorder
+        .as_mut()
+        .map(|recorder| (std::time::Instant::now(), recorder.thread_cpu_ns()))
+}
+
+#[cfg(test)]
+fn profile_phase_finish(
+    recorder: &mut Option<WorkerProfileRecorder>,
+    started: Option<(std::time::Instant, Option<u64>)>,
+) -> Option<WorkerProfilePhase> {
+    let (wall, cpu) = started?;
+    let recorder = recorder.as_mut()?;
+    let cpu_end = recorder.thread_cpu_ns();
+    Some(WorkerProfilePhase {
+        wall_ns: wall.elapsed().as_nanos() as u64,
+        thread_cpu_ns: cpu
+            .zip(cpu_end)
+            .and_then(|(start, end)| end.checked_sub(start)),
+    })
+}
+
+#[cfg(test)]
+fn profile_worker_park(
+    recorder: &mut Option<WorkerProfileRecorder>,
+    output_full: bool,
+    config: &WorkerParkConfig,
+    running: &AtomicBool,
+) {
+    let started = recorder.as_ref().map(|_| std::time::Instant::now());
+    if let Some(entered) = &config.entered {
+        entered.store(if output_full { 2 } else { 1 }, Ordering::Release);
+    }
+    if let Some(gate) = &config.before_park_gate {
+        while gate.load(Ordering::Acquire) && running.load(Ordering::Acquire) {
+            thread::yield_now();
+        }
+    }
+    // Keep the same check-to-park race as production: stopping must leave
+    // a token that also wakes a worker which has not entered park yet.
+    thread::park_timeout(config.timeout);
+    if let Some(entered) = &config.entered {
+        entered.store(0, Ordering::Release);
+    }
+    if let (Some(recorder), Some(started)) = (recorder, started) {
+        let wall_ns = started.elapsed().as_nanos() as u64;
+        if output_full {
+            recorder.trace.output_full_parks += 1;
+            recorder.trace.output_full_park_wall_ns += wall_ns;
+        } else {
+            recorder.trace.input_empty_parks += 1;
+            recorder.trace.input_empty_park_wall_ns += wall_ns;
         }
     }
 }
@@ -2083,11 +2498,15 @@ mod tests {
 
     #[allow(unsafe_code)]
     mod allocation_counter {
-        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::alloc::{GlobalAlloc, Layout};
         use std::cell::Cell;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         pub(super) struct CountingAllocator;
+        #[cfg(feature = "diagnostic-mimalloc")]
+        static UPSTREAM_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+        #[cfg(not(feature = "diagnostic-mimalloc"))]
+        static UPSTREAM_ALLOCATOR: std::alloc::System = std::alloc::System;
 
         thread_local! {
             static RECORDING: Cell<bool> = const { Cell::new(false) };
@@ -2098,24 +2517,24 @@ mod tests {
             unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
                 record();
                 // SAFETY: the allocation request is forwarded unchanged.
-                unsafe { System.alloc(layout) }
+                unsafe { UPSTREAM_ALLOCATOR.alloc(layout) }
             }
 
             unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
-                // SAFETY: the allocation originated from the system allocator.
-                unsafe { System.dealloc(pointer, layout) }
+                // SAFETY: every allocation uses this same compile-time backend.
+                unsafe { UPSTREAM_ALLOCATOR.dealloc(pointer, layout) }
             }
 
             unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
                 record();
                 // SAFETY: the allocation request is forwarded unchanged.
-                unsafe { System.alloc_zeroed(layout) }
+                unsafe { UPSTREAM_ALLOCATOR.alloc_zeroed(layout) }
             }
 
             unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
                 record();
-                // SAFETY: the allocation originated from the system allocator.
-                unsafe { System.realloc(pointer, layout, new_size) }
+                // SAFETY: every allocation uses this same compile-time backend.
+                unsafe { UPSTREAM_ALLOCATOR.realloc(pointer, layout, new_size) }
             }
         }
 
@@ -2145,6 +2564,24 @@ mod tests {
 
     struct IdentityProcessor;
 
+    #[test]
+    fn worker_profile_recorder_is_bounded() {
+        let mut recorder = WorkerProfileRecorder::new(Instant::now());
+        let capacity = recorder.trace.cycles.capacity();
+        for start_frame in 0..8_200 {
+            recorder.record(WorkerProfileCycle {
+                start_frame,
+                ..WorkerProfileCycle::default()
+            });
+        }
+        assert_eq!(recorder.trace.cycles.len(), 8_192);
+        assert_eq!(recorder.trace.dropped_cycles, 8);
+        assert_eq!(recorder.trace.cycles.capacity(), capacity);
+        assert_eq!(recorder.trace.cycles.last().unwrap().start_frame, 8_191);
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+        assert!(thread_cpu_time_ns().is_some());
+    }
+
     impl BlockProcessor for IdentityProcessor {
         fn process(&mut self, channels: Vec<Vec<f64>>) -> Result<Vec<Vec<f64>>, String> {
             Ok(channels)
@@ -2153,6 +2590,251 @@ mod tests {
         fn reset(&mut self) -> Result<(), String> {
             Ok(())
         }
+    }
+
+    struct TwoChunkProcessor {
+        pending: Vec<Vec<f64>>,
+        warming_up: bool,
+    }
+
+    impl BlockProcessor for TwoChunkProcessor {
+        fn process(&mut self, channels: Vec<Vec<f64>>) -> Result<Vec<Vec<f64>>, String> {
+            if self.warming_up {
+                self.warming_up = false;
+                return Ok(channels);
+            }
+            if self.pending.is_empty() {
+                self.pending = channels;
+                return Ok(self.pending.iter().map(|_| Vec::new()).collect());
+            }
+            let mut output = Vec::with_capacity(channels.len());
+            for (old, current) in self.pending.drain(..).zip(channels) {
+                let mut joined = old;
+                joined.extend(current);
+                output.push(joined);
+            }
+            Ok(output)
+        }
+
+        fn reset(&mut self) -> Result<(), String> {
+            self.pending.clear();
+            Ok(())
+        }
+    }
+
+    fn wait_until(deadline: Instant, mut condition: impl FnMut() -> bool) {
+        while Instant::now() < deadline {
+            if condition() {
+                return;
+            }
+            thread::yield_now();
+        }
+        assert!(condition(), "condition did not become true before deadline");
+    }
+
+    #[test]
+    fn diagnostic_callback_notification_switch_does_not_mask_shutdown() {
+        let entered = Arc::new(AtomicU64::new(0));
+        let gate = Arc::new(AtomicBool::new(true));
+        let shared = NeuralShared::new().unwrap();
+        let mut engine = NeuralEngine::new_with_factory_inner(
+            48_000.0,
+            1,
+            &shared,
+            || Ok(Box::new(IdentityProcessor)),
+            None,
+            WorkerParkConfig {
+                timeout: Duration::from_secs(5),
+                entered: Some(Arc::clone(&entered)),
+                before_park_gate: Some(Arc::clone(&gate)),
+            },
+        )
+        .unwrap();
+        assert!(engine.worker_started);
+        wait_until(Instant::now() + Duration::from_secs(1), || {
+            entered.load(Ordering::Acquire) == 1
+        });
+        engine.callback_notifications_enabled = false;
+        let parameters = RuntimeParameters::from(NeuralParameters::default());
+        for _ in 0..960 {
+            engine.process_frame([0.0, 0.0], parameters);
+        }
+        // The worker is held before its park, so a spurious timeout cannot
+        // turn this into an unreliable negative timing assertion. Observe
+        // actual notification publication directly instead.
+        assert_eq!(engine.callback_notifications_sent.get(), 0);
+        assert_eq!(engine.input_queue.len(), 2);
+        assert!(engine.output_queue.is_empty());
+        engine.callback_notifications_enabled = true;
+        engine.wake_worker();
+        assert_eq!(engine.callback_notifications_sent.get(), 1);
+        gate.store(false, Ordering::Release);
+        wait_until(Instant::now() + Duration::from_secs(1), || {
+            engine.output_queue.len() == 2 && entered.load(Ordering::Acquire) == 1
+        });
+        engine.callback_notifications_enabled = false;
+        let stopped = Instant::now();
+        engine.stop();
+        assert!(stopped.elapsed() < Duration::from_secs(1));
+        assert!(engine.finished_gracefully);
+    }
+
+    #[test]
+    fn input_empty_wake_coalesces_capture_notifications() {
+        let entered = Arc::new(AtomicU64::new(0));
+        let gate = Arc::new(AtomicBool::new(true));
+        let shared = NeuralShared::new().unwrap();
+        let mut engine = NeuralEngine::new_with_factory_inner(
+            48_000.0,
+            1,
+            &shared,
+            || Ok(Box::new(IdentityProcessor)),
+            None,
+            WorkerParkConfig {
+                timeout: Duration::from_secs(5),
+                entered: Some(Arc::clone(&entered)),
+                before_park_gate: Some(Arc::clone(&gate)),
+            },
+        )
+        .unwrap();
+        assert!(engine.worker_started);
+        wait_until(Instant::now() + Duration::from_secs(1), || {
+            entered.load(Ordering::Acquire) == 1
+        });
+        let parameters = RuntimeParameters::from(NeuralParameters::default());
+        for _ in 0..960 {
+            engine.process_frame([0.0, 0.0], parameters);
+        }
+        gate.store(false, Ordering::Release);
+        wait_until(Instant::now() + Duration::from_secs(1), || {
+            engine.output_queue.len() == 2 && entered.load(Ordering::Acquire) == 1
+        });
+        let started = Instant::now();
+        engine.stop();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(engine.finished_gracefully);
+    }
+
+    #[test]
+    fn output_slot_release_wakes_completed_backlog() {
+        let entered = Arc::new(AtomicU64::new(0));
+        let gate = Arc::new(AtomicBool::new(true));
+        let shared = NeuralShared::new().unwrap();
+        let mut engine = NeuralEngine::new_with_factory_inner(
+            48_000.0,
+            1,
+            &shared,
+            || Ok(Box::new(IdentityProcessor)),
+            None,
+            WorkerParkConfig {
+                timeout: Duration::from_secs(5),
+                entered: Some(Arc::clone(&entered)),
+                before_park_gate: Some(Arc::clone(&gate)),
+            },
+        )
+        .unwrap();
+        assert!(engine.worker_started);
+        wait_until(Instant::now() + Duration::from_secs(1), || {
+            entered.load(Ordering::Acquire) == 1
+        });
+        let generation = engine.generation;
+        // Seed a full output queue while the worker is gated at its first
+        // input-empty wait. The single setup notification below must then
+        // be consumed by that wait, not the later output-full wait.
+        for index in 0..QUEUE_BLOCKS {
+            let mut block = engine.free_blocks.pop().unwrap();
+            block.generation = generation;
+            block.start_frame = (index * 480) as u64;
+            block.frames = 480;
+            assert!(
+                engine
+                    .output_queue
+                    .push(ProcessedBlock {
+                        block,
+                        valid: true,
+                        invalid_output: false,
+                    })
+                    .is_ok()
+            );
+        }
+        let mut block = engine.free_blocks.pop().unwrap();
+        block.generation = generation;
+        block.start_frame = (QUEUE_BLOCKS * 480) as u64;
+        block.frames = 480;
+        assert!(engine.input_queue.push(block).is_ok());
+        engine.wake_worker();
+        gate.store(false, Ordering::Release);
+        wait_until(Instant::now() + Duration::from_secs(1), || {
+            entered.load(Ordering::Acquire) == 2 && engine.input_queue.is_empty()
+        });
+        engine.begin_output_chunk();
+        wait_until(Instant::now() + Duration::from_secs(1), || {
+            engine.output_queue.len() == 1
+        });
+        wait_until(Instant::now() + Duration::from_secs(1), || {
+            entered.load(Ordering::Acquire) == 1
+        });
+        // Fill the output queue again without draining it, then stop from
+        // output-full waiting. Joining must not wait for the 5-second timer.
+        for index in QUEUE_BLOCKS + 1..QUEUE_BLOCKS * 2 + 1 {
+            let mut block = engine.free_blocks.pop().unwrap();
+            block.generation = generation;
+            block.start_frame = (index * 480) as u64;
+            block.frames = 480;
+            assert!(engine.input_queue.push(block).is_ok());
+        }
+        engine.wake_worker();
+        wait_until(Instant::now() + Duration::from_secs(1), || {
+            entered.load(Ordering::Acquire) == 2 && engine.input_queue.is_empty()
+        });
+        let stopped = Instant::now();
+        engine.stop();
+        assert!(stopped.elapsed() < Duration::from_secs(1));
+        assert!(engine.finished_gracefully);
+    }
+
+    #[test]
+    fn completed_backlog_publishes_without_another_input_callback() {
+        let entered = Arc::new(AtomicU64::new(0));
+        let shared = NeuralShared::new().unwrap();
+        let mut engine = NeuralEngine::new_with_factory_inner(
+            48_000.0,
+            1,
+            &shared,
+            || {
+                Ok(Box::new(TwoChunkProcessor {
+                    pending: Vec::new(),
+                    warming_up: true,
+                }))
+            },
+            None,
+            WorkerParkConfig {
+                timeout: Duration::from_secs(5),
+                entered: Some(Arc::clone(&entered)),
+                before_park_gate: None,
+            },
+        )
+        .unwrap();
+        assert!(engine.worker_started);
+        // Ensure the input notification is consumed by this first wait,
+        // rather than accidentally waking the later completed-backlog wait.
+        wait_until(Instant::now() + Duration::from_secs(1), || {
+            entered.load(Ordering::Acquire) == 1
+        });
+        let generation = engine.generation;
+        for index in 0..2 {
+            let mut block = engine.free_blocks.pop().unwrap();
+            block.generation = generation;
+            block.start_frame = (index * 480) as u64;
+            block.frames = 480;
+            assert!(engine.input_queue.push(block).is_ok());
+        }
+        engine.wake_worker();
+        wait_until(Instant::now() + Duration::from_secs(1), || {
+            engine.output_queue.len() == 2 && engine.input_queue.is_empty()
+        });
+        engine.stop();
+        assert!(engine.finished_gracefully);
     }
 
     struct StalledProcessor;
@@ -2720,15 +3402,517 @@ mod tests {
     #[test]
     #[ignore = "requires the pinned managed DPDFNet model and cargo test --release"]
     #[cfg(feature = "experimental-dpdfnet-hq")]
+    fn pinned_dpdfnet2_stereo_matches_independent_mono() {
+        let mut stereo = DpdfnetProcessor::new(48_000, 2).unwrap();
+        let mut mono = [
+            DpdfnetProcessor::new(48_000, 1).unwrap(),
+            DpdfnetProcessor::new(48_000, 1).unwrap(),
+        ];
+        let fixture = stereo_worker_fixture(9_613);
+        for case in 0..5 {
+            stereo.reset().unwrap();
+            for stream in &mut mono {
+                stream.reset().unwrap();
+            }
+            let input: Vec<[f64; 2]> = fixture
+                .iter()
+                .map(|&[left, right]| match case {
+                    0 => [left, right],
+                    1 => [left, 0.0],
+                    2 => [left, left],
+                    3 => [left, -left],
+                    _ => [right, left],
+                })
+                .collect();
+            let mut output = [Vec::new(), Vec::new()];
+            let mut position = 0usize;
+            let mut block = 0usize;
+            let pattern = [1, 127, 480, 1_024, 31, 511, 97];
+            while position < input.len() {
+                let end = (position + pattern[block % pattern.len()]).min(input.len());
+                let planar: Vec<Vec<f64>> = (0..2)
+                    .map(|channel| {
+                        input[position..end]
+                            .iter()
+                            .map(|frame| frame[channel])
+                            .collect()
+                    })
+                    .collect();
+                let expected = [
+                    mono[0].process(vec![planar[0].clone()]).unwrap(),
+                    mono[1].process(vec![planar[1].clone()]).unwrap(),
+                ];
+                let actual = stereo.process(planar).unwrap();
+                for channel in 0..2 {
+                    assert_eq!(
+                        actual[channel], expected[channel][0],
+                        "case={case}, channel={channel}, block={block}"
+                    );
+                    output[channel].extend_from_slice(&actual[channel]);
+                }
+                position = end;
+                block += 1;
+            }
+            let tail = stereo.0.finish().unwrap();
+            let expected_tail = [mono[0].0.finish().unwrap(), mono[1].0.finish().unwrap()];
+            for channel in 0..2 {
+                assert_eq!(tail[channel], expected_tail[channel][0]);
+                output[channel].extend_from_slice(&tail[channel]);
+                assert_eq!(output[channel].len(), input.len());
+                assert!(output[channel].iter().all(|sample| sample.is_finite()));
+                if case != 1 || channel == 0 {
+                    assert!(
+                        output[channel]
+                            .iter()
+                            .zip(&input)
+                            .any(|(enhanced, original)| (enhanced - original[channel]).abs()
+                                > 1.0e-6),
+                        "case={case}, channel={channel} was not enhanced"
+                    );
+                }
+            }
+            if case == 3 {
+                assert!(
+                    input.iter().zip(output[0].iter().zip(&output[1])).any(
+                        |(original, (left, right))| ((left - right) - (original[0] - original[1]))
+                            .abs()
+                            > 1.0e-6
+                    ),
+                    "anti-phase side signal was passed through unchanged"
+                );
+                let input_energy: f64 = input
+                    .iter()
+                    .map(|frame| (frame[0] - frame[1]).powi(2))
+                    .sum();
+                let output_energy: f64 = output[0]
+                    .iter()
+                    .zip(&output[1])
+                    .map(|(left, right)| (left - right).powi(2))
+                    .sum();
+                assert!(
+                    output_energy < input_energy,
+                    "anti-phase noise was not reduced: {output_energy} >= {input_energy}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the pinned managed DPDFNet model and cargo test --release"]
+    #[cfg(feature = "experimental-dpdfnet-hq")]
     fn pinned_dpdfnet2_release_worker_meets_sustained_deadlines() {
-        assert_pinned_release_worker(NeuralDawModel::Dpdfnet2, true);
+        assert_pinned_stereo_release_worker(true);
     }
 
     #[test]
     #[ignore = "requires the pinned managed DPDFNet model and cargo test --release"]
     #[cfg(feature = "experimental-dpdfnet-hq")]
     fn pinned_dpdfnet2_release_worker_measures_lowest_tier_capacity() {
-        assert_pinned_release_worker(NeuralDawModel::Dpdfnet2, false);
+        assert_pinned_stereo_release_worker(false);
+    }
+
+    #[test]
+    #[ignore = "release-only diagnostic; requires the pinned model and a private profile path"]
+    #[cfg(feature = "experimental-dpdfnet-hq")]
+    fn pinned_dpdfnet2_release_worker_profiles_deadline_failure() {
+        assert!(
+            !cfg!(debug_assertions),
+            "profile the release worker, not debug inference"
+        );
+        let path = std::env::var("DENOIZE_NEURAL_WORKER_PROFILE")
+            .expect("set a private, new DENOIZE_NEURAL_WORKER_PROFILE path");
+        let geometry = std::env::var("DENOIZE_NEURAL_PROFILE_CALLBACK_FRAMES")
+            .unwrap_or_else(|_| "1024".to_owned());
+        let geometries: Vec<usize> = geometry
+            .split(',')
+            .map(|value| {
+                value
+                    .parse()
+                    .expect("profile callback sizes must be comma-separated integers")
+            })
+            .collect();
+        assert!((1..=3).contains(&geometries.len()));
+        let seconds = worker_paced_seconds();
+        for callback_frames in &geometries {
+            assert!([144, 480, 1_024].contains(callback_frames));
+            let run_path = if geometries.len() == 1 {
+                path.clone()
+            } else {
+                format!("{path}.{callback_frames}.json")
+            };
+            profile_pinned_stereo_worker(*callback_frames, seconds, &run_path);
+        }
+    }
+
+    #[test]
+    #[ignore = "release-only ABBA diagnostic; requires pinned model and private profile path"]
+    #[cfg(feature = "experimental-dpdfnet-hq")]
+    fn pinned_dpdfnet2_release_worker_compares_callback_notifications() {
+        assert!(!cfg!(debug_assertions));
+        let path = std::env::var("DENOIZE_NEURAL_WORKER_PROFILE")
+            .expect("set a private, new DENOIZE_NEURAL_WORKER_PROFILE path");
+        let seconds = worker_paced_seconds();
+        // Same process, graph, fixture, priority, warmup, timeout and geometry.
+        // Stop/reset notifications remain enabled in all four runs. ABBA
+        // reduces, but cannot eliminate, time/order and external-load effects.
+        for (index, enabled) in [true, false, false, true].into_iter().enumerate() {
+            let label = if enabled { "on" } else { "off" };
+            let run_path = format!("{path}.callback-wakes-{index}-{label}.json");
+            profile_pinned_stereo_worker_with_notifications(480, seconds, &run_path, enabled);
+        }
+    }
+
+    #[cfg(feature = "experimental-dpdfnet-hq")]
+    fn profile_pinned_stereo_worker(callback_frames: usize, seconds: usize, path: &str) {
+        profile_pinned_stereo_worker_with_notifications(callback_frames, seconds, path, true);
+    }
+
+    #[cfg(feature = "experimental-dpdfnet-hq")]
+    fn profile_pinned_stereo_worker_with_notifications(
+        callback_frames: usize,
+        seconds: usize,
+        path: &str,
+        notifications_enabled: bool,
+    ) {
+        let test_binary_sha256 = diagnostic_test_binary_sha256();
+        let requested_frames = 11_520 + seconds * 48_000;
+        let callback_calls = requested_frames.div_ceil(callback_frames);
+        let frames = callback_calls * callback_frames;
+        let shared = NeuralShared::new_for_model(NeuralDawModel::Dpdfnet2).unwrap();
+        let epoch = Instant::now();
+        let mut engine = NeuralEngine::new_with_factory_inner(
+            48_000.0,
+            2,
+            &shared,
+            || {
+                DpdfnetProcessor::new(48_000, 2)
+                    .map(|processor| Box::new(processor) as Box<dyn BlockProcessor>)
+            },
+            Some(epoch),
+            WorkerParkConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(engine.channels, 2);
+        assert_eq!(engine.latency_frames, 11_520);
+        assert!(engine.profile_rx.is_some());
+        engine.callback_notifications_enabled = notifications_enabled;
+        let parameters = RuntimeParameters::from(NeuralParameters::default());
+        let callback_capacity = callback_calls.min(32_000);
+        let mut callbacks = Vec::with_capacity(callback_capacity);
+        let mut dropped_callbacks = 0usize;
+        let mut finite_frames = 0usize;
+        let mut neural_frames = [0usize; 2];
+        // Match the strict worker gate's activation-before-fixture order.
+        // Both fixture preparation and trace storage remain off cadence.
+        let inputs = stereo_worker_fixture(frames);
+        let measurement_started = Instant::now();
+        let measurement_start_ns = measurement_started.duration_since(epoch).as_nanos() as u64;
+        for callback in 0..callback_calls {
+            let start_frame = callback * callback_frames;
+            pace_to_frame(measurement_started, start_frame);
+            let callback_started = epoch.elapsed().as_nanos() as u64;
+            let before = shared.worker_metrics();
+            let input_queue_before = engine.input_queue.len();
+            engine.record_callback(callback_frames);
+            for frame in start_frame..start_frame + callback_frames {
+                let output = engine.process_frame(inputs[frame], parameters);
+                finite_frames += usize::from(output.iter().all(|sample| sample.is_finite()));
+                if frame >= 11_520 {
+                    for channel in 0..2 {
+                        neural_frames[channel] += usize::from(
+                            (output[channel] - inputs[frame - 11_520][channel]).abs() > 1.0e-6,
+                        );
+                    }
+                }
+            }
+            let callback_finished = epoch.elapsed().as_nanos() as u64;
+            let after = shared.worker_metrics();
+            if callbacks.len() < callback_capacity {
+                callbacks.push((
+                    start_frame,
+                    callback_started,
+                    callback_finished,
+                    before,
+                    after,
+                    input_queue_before,
+                    engine.input_queue.len(),
+                ));
+            } else {
+                dropped_callbacks += 1;
+            }
+        }
+        pace_to_frame(measurement_started, frames);
+        let measurement_wall_seconds = measurement_started.elapsed().as_secs_f64();
+        engine.stop();
+        let trace = engine
+            .take_profile_trace()
+            .expect("joined worker must return its real trace");
+        assert!(!trace.cycles.is_empty());
+        assert!(trace.cycles.iter().any(|cycle| cycle.processor.is_some()));
+        let phase_json = |phase: Option<WorkerProfilePhase>| {
+            phase.map(|phase| {
+            serde_json::json!({"wall_ns": phase.wall_ns, "thread_cpu_ns": phase.thread_cpu_ns})
+        })
+        };
+        let metrics_json = |metrics: WorkerMetrics| {
+            serde_json::json!({
+                "overload_blocks": metrics.overload_blocks,
+                "late_blocks": metrics.late_blocks,
+                "invalid_blocks": metrics.invalid_blocks,
+                "worker_errors": metrics.worker_errors,
+            })
+        };
+        // Keep nested row macros separate from the document macro so adding
+        // diagnostic metadata does not exhaust serde_json's recursion budget.
+        let cycles_json = trace
+            .cycles
+            .iter()
+            .map(|cycle| {
+                serde_json::json!({
+                    "input_pop_ns": cycle.input_pop_ns,
+                    "generation": cycle.generation,
+                    "start_frame": cycle.start_frame,
+                    "next_expected": cycle.next_expected,
+                    "input_len_before": cycle.input_len_before,
+                    "output_len_before": cycle.output_len_before,
+                    "pending_len_before": cycle.pending_len_before,
+                    "completed_len_before": cycle.completed_len_before,
+                    "ready_frames_before": cycle.ready_frames_before,
+                    "reset_reason": cycle.reset_reason,
+                    "missing_input_frames": cycle.missing_input_frames,
+                    "reset": phase_json(cycle.reset),
+                    "copy": phase_json(cycle.copy),
+                    "processor": phase_json(cycle.processor),
+                    "assembly": phase_json(cycle.assembly),
+                    "cycle_end_ns": cycle.cycle_end_ns,
+                    "pending_len_after": cycle.pending_len_after,
+                    "completed_len_after": cycle.completed_len_after,
+                    "ready_frames_after": cycle.ready_frames_after,
+                    "returned_frames": cycle.returned_frames,
+                })
+            })
+            .collect::<Vec<_>>();
+        let callbacks_json = callbacks.iter().map(|(frame, start, end, before, after, input_before, input_after)| {
+            serde_json::json!({
+                "start_frame": frame,
+                "scheduled_ns": measurement_start_ns + (*frame as u64 * 1_000_000_000 / 48_000),
+                "started_ns": start,
+                "finished_ns": end,
+                "metrics_before": metrics_json(*before),
+                "metrics_after": metrics_json(*after),
+                "input_queue_before": input_before,
+                "input_queue_after": input_after,
+            })
+        }).collect::<Vec<_>>();
+        let document = serde_json::json!({
+            "schema": "denoize-dpdfnet-worker-profile-diagnostic-v1",
+            "diagnostic_only": true,
+            "model_id": NeuralDawModel::Dpdfnet2.model_id(),
+            "model_sha256": NeuralDawModel::Dpdfnet2.model_sha256(),
+            "channels": 2,
+            "channel_mode": "independent",
+            "fixture_preparation_order": "activation_then_fixture_then_measurement",
+            "test_binary_sha256": test_binary_sha256,
+            "test_allocator": if cfg!(feature = "diagnostic-mimalloc") { "mimalloc" } else { "std-system" },
+            "diagnostic_mimalloc_feature": cfg!(feature = "diagnostic-mimalloc"),
+            "mimalloc_wrapper_version": if cfg!(feature = "diagnostic-mimalloc") { Some("0.1.52") } else { None },
+            "mimalloc_sys_version": if cfg!(feature = "diagnostic-mimalloc") { Some("0.1.49") } else { None },
+            "mimalloc_c_version": if cfg!(feature = "diagnostic-mimalloc") { Some("3.3.2") } else { None },
+            "allocator_override": false,
+            "callback_notifications_enabled": notifications_enabled,
+            "callback_notifications_sent": engine.callback_notifications_sent.get(),
+            "source_commit": std::env::var("DENOIZE_EVIDENCE_SOURCE_COMMIT").unwrap_or_default(),
+            "cpu_clock": if cfg!(windows) { "GetThreadTimes" }
+                else if cfg!(any(target_os = "linux", target_os = "macos")) { "CLOCK_THREAD_CPUTIME_ID" }
+                else { "unsupported" },
+            "cpu_clock_may_be_quantized": cfg!(windows),
+            "callback_frames": callback_frames,
+            "requested_seconds": seconds,
+            "measured_frames": frames,
+            "measurement_start_ns": measurement_start_ns,
+            "measurement_wall_seconds": measurement_wall_seconds,
+            "finite_frames": finite_frames,
+            "neural_frames_per_channel": neural_frames,
+            "metrics": metrics_json(shared.worker_metrics()),
+            "cycles": cycles_json,
+            "callbacks": callbacks_json,
+            "dropped_cycles": trace.dropped_cycles,
+            "dropped_callbacks": dropped_callbacks,
+            "cpu_clock_failures": trace.cpu_clock_failures,
+            "input_empty_parks": trace.input_empty_parks,
+            "input_empty_park_wall_ns": trace.input_empty_park_wall_ns,
+            "output_full_parks": trace.output_full_parks,
+            "output_full_park_wall_ns": trace.output_full_park_wall_ns,
+        });
+        write_worker_evidence_document(path, &document);
+        assert_eq!(finite_frames, frames);
+        assert_eq!(shared.worker_metrics().worker_errors, 0);
+        // Scheduling misses remain data, not a passed promotion gate.
+        eprintln!(
+            "diagnostic profile written to {path}: {}",
+            document["metrics"]
+        );
+    }
+
+    #[cfg(feature = "experimental-dpdfnet-hq")]
+    fn assert_pinned_stereo_release_worker(require_zero_scheduling_counters: bool) {
+        assert!(
+            !cfg!(debug_assertions),
+            "the sustained neural deadline gate must exercise the release profile"
+        );
+        let paced_seconds = worker_paced_seconds();
+        let mut runs = Vec::new();
+        for callback_frames in [144, 480, 1_024] {
+            let shared = NeuralShared::new_for_model(NeuralDawModel::Dpdfnet2).unwrap();
+            let mut engine =
+                NeuralEngine::new_model(NeuralDawModel::Dpdfnet2, 48_000.0, 2, &shared).unwrap();
+            assert!(engine.worker_started);
+            assert_eq!(engine.channels, 2);
+            assert_eq!(engine.chunk_frames, 480);
+            assert_eq!(engine.latency_frames, 11_520);
+            assert_eq!(shared.worker_metrics(), WorkerMetrics::default());
+            let parameters = RuntimeParameters::from(NeuralParameters::default());
+            let latency = engine.latency_frames as usize;
+            let requested_frames = latency + paced_seconds * 48_000;
+            let callback_calls = requested_frames.div_ceil(callback_frames);
+            let frames = callback_calls * callback_frames;
+            // Do not put 10 ms sleeps inside a larger host callback. The
+            // worker sees precisely the same burst geometry as the host.
+            let inputs = stereo_worker_fixture(frames);
+            let mut finite_frames = 0usize;
+            let mut neural_frames = [0usize; 2];
+            let measurement_started = Instant::now();
+            for callback in 0..callback_calls {
+                pace_to_frame(measurement_started, callback * callback_frames);
+                engine.record_callback(callback_frames);
+                let start = callback * callback_frames;
+                for frame in start..start + callback_frames {
+                    let output = engine.process_frame(inputs[frame], parameters);
+                    finite_frames += usize::from(output.iter().all(|sample| sample.is_finite()));
+                    if frame >= latency {
+                        for channel in 0..2 {
+                            neural_frames[channel] += usize::from(
+                                (output[channel] - inputs[frame - latency][channel]).abs() > 1.0e-6,
+                            );
+                        }
+                    }
+                }
+            }
+            // Include the final complete callback interval in wall accounting.
+            pace_to_frame(measurement_started, frames);
+            let measurement_wall_seconds = measurement_started.elapsed().as_secs_f64();
+            assert_eq!(engine.callback_calls, callback_calls as u64);
+            assert_eq!(engine.callback_min_frames, callback_frames as u32);
+            assert_eq!(engine.callback_max_frames, callback_frames as u32);
+            // Join outside the measured callback cadence, then include any
+            // shutdown panic in this run's processing-error evidence.
+            engine.stop();
+            let metrics = shared.worker_metrics();
+            runs.push(serde_json::json!({
+                "callback_frames": callback_frames,
+                "callback_calls": callback_calls,
+                "paced_blocks": paced_seconds * 100,
+                "measured_frames": frames,
+                "finite_frames": finite_frames,
+                "neural_frames_per_channel": neural_frames,
+                "measurement_wall_seconds": measurement_wall_seconds,
+                "metrics": {
+                    "overload_blocks": metrics.overload_blocks,
+                    "late_blocks": metrics.late_blocks,
+                    "invalid_blocks": metrics.invalid_blocks,
+                    "worker_errors": metrics.worker_errors,
+                },
+                "queues_after_run": {
+                    "input": engine.input_queue.len(),
+                    "output": engine.output_queue.len(),
+                    "ready": engine.ready.len(),
+                },
+            }));
+            // Every geometry is retained, including rejected ones. Never
+            // stop at the first miss and lose evidence for the other runs.
+        }
+        write_stereo_worker_evidence(&runs);
+        for run in &runs {
+            assert_eq!(run["finite_frames"], run["measured_frames"]);
+            let neural = run["neural_frames_per_channel"].as_array().unwrap();
+            assert!(
+                neural.iter().all(|frames| frames.as_u64().unwrap() >= 480),
+                "both channels must produce neural output: {run}"
+            );
+            let metrics = WorkerMetrics {
+                overload_blocks: run["metrics"]["overload_blocks"].as_u64().unwrap(),
+                late_blocks: run["metrics"]["late_blocks"].as_u64().unwrap(),
+                invalid_blocks: run["metrics"]["invalid_blocks"].as_u64().unwrap(),
+                worker_errors: run["metrics"]["worker_errors"].as_u64().unwrap(),
+            };
+            assert!(
+                worker_metrics_pass(metrics, require_zero_scheduling_counters),
+                "stereo host callback geometry failed: {run}"
+            );
+        }
+    }
+
+    fn worker_paced_seconds() -> usize {
+        let seconds = std::env::var("DENOIZE_NEURAL_WORKER_SECONDS")
+            .map(|value| {
+                value
+                    .parse::<usize>()
+                    .expect("DENOIZE_NEURAL_WORKER_SECONDS must be an integer")
+            })
+            .unwrap_or(1);
+        assert!(
+            (1..=3_600).contains(&seconds),
+            "DENOIZE_NEURAL_WORKER_SECONDS must be between 1 and 3600"
+        );
+        seconds
+    }
+
+    #[cfg(feature = "experimental-dpdfnet-hq")]
+    fn pace_to_frame(started: Instant, frame: usize) {
+        let due = started + Duration::from_secs_f64(frame as f64 / 48_000.0);
+        if let Some(delay) = due.checked_duration_since(Instant::now()) {
+            thread::sleep(delay);
+        }
+    }
+
+    #[cfg(feature = "experimental-dpdfnet-hq")]
+    fn stereo_worker_fixture(frames: usize) -> Vec<[f64; 2]> {
+        let mut state = 0x5eed_1234_9876_abcd_u64;
+        (0..frames)
+            .map(|frame| {
+                let phase = frame as f64 * 440.0 * std::f64::consts::TAU / 48_000.0;
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                let side = (f64::from((state >> 32) as u32) / f64::from(u32::MAX) - 0.5) * 0.08;
+                [phase.sin() * 0.03 + side, phase.sin() * 0.03 - side]
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "experimental-dpdfnet-hq")]
+    fn write_stereo_worker_evidence(runs: &[serde_json::Value]) {
+        let Ok(path) = std::env::var("DENOIZE_NEURAL_WORKER_EVIDENCE") else {
+            return;
+        };
+        let model = NeuralDawModel::Dpdfnet2;
+        let mut document = serde_json::json!({
+            "schema": "denoize-dpdfnet-worker-run-v2",
+            "schema_version": 2,
+            "source_commit": std::env::var("DENOIZE_EVIDENCE_SOURCE_COMMIT").unwrap_or_default(),
+            "model_id": model.model_id(),
+            "model_sha256": model.model_sha256(),
+            "plugin_id": model.plugin_id(),
+            "sample_rate_hz": 48_000,
+            "channels": 2,
+            "channel_mode": "independent",
+            "chunk_frames": 480,
+            "latency_frames": 11_520,
+            "runs": runs,
+            "environment": worker_evidence_environment(),
+        });
+        mark_test_allocator_diagnostic(&mut document);
+        write_worker_evidence_document(&path, &document);
     }
 
     fn assert_pinned_release_worker(model: NeuralDawModel, require_zero_scheduling_counters: bool) {
@@ -2748,17 +3932,7 @@ mod tests {
         assert_eq!(shared.late_blocks.load(Ordering::Relaxed), 0);
         assert_eq!(shared.invalid_blocks.load(Ordering::Relaxed), 0);
 
-        let paced_seconds = std::env::var("DENOIZE_NEURAL_WORKER_SECONDS")
-            .map(|value| {
-                value
-                    .parse::<usize>()
-                    .expect("DENOIZE_NEURAL_WORKER_SECONDS must be an integer")
-            })
-            .unwrap_or(1);
-        assert!(
-            (1..=3_600).contains(&paced_seconds),
-            "DENOIZE_NEURAL_WORKER_SECONDS must be between 1 and 3600"
-        );
+        let paced_seconds = worker_paced_seconds();
         let paced_blocks = paced_seconds * 100;
         let latency = engine.latency_frames as usize;
         assert_eq!(
@@ -2858,7 +4032,7 @@ mod tests {
         let Ok(path) = std::env::var("DENOIZE_NEURAL_WORKER_EVIDENCE") else {
             return;
         };
-        let document = serde_json::json!({
+        let mut document = serde_json::json!({
             "schema": "denoize-dpdfnet-worker-run-v1",
             "schema_version": 1,
             "source_commit": std::env::var("DENOIZE_EVIDENCE_SOURCE_COMMIT").unwrap_or_default(),
@@ -2885,7 +4059,72 @@ mod tests {
                 "output": engine.output_queue.len(),
                 "ready": engine.ready.len(),
             },
-            "environment": {
+            "environment": worker_evidence_environment(),
+        });
+        mark_test_allocator_diagnostic(&mut document);
+        write_worker_evidence_document(&path, &document);
+    }
+
+    fn mark_test_allocator_diagnostic(document: &mut serde_json::Value) {
+        if !cfg!(feature = "diagnostic-mimalloc") {
+            return;
+        }
+        // A test-only allocator is not the allocator of the shipped plugin.
+        // Deliberately use an unsupported promotion schema even if a caller
+        // accidentally supplies a portable/lowest-tier environment label.
+        document["schema"] = "denoize-neural-worker-allocator-diagnostic-v1".into();
+        document["schema_version"] = 1.into();
+        document["diagnostic_only"] = true.into();
+        document["test_allocator"] = "mimalloc".into();
+        document["test_binary_sha256"] = diagnostic_test_binary_sha256().into();
+        document["diagnostic_mimalloc_feature"] = true.into();
+        document["mimalloc_wrapper_version"] = "0.1.52".into();
+        document["mimalloc_sys_version"] = "0.1.49".into();
+        document["mimalloc_c_version"] = "3.3.2".into();
+        document["allocator_override"] = false.into();
+    }
+
+    fn diagnostic_test_binary_sha256() -> String {
+        use sha2::{Digest as _, Sha256};
+        use std::io::Read;
+
+        let mut executable = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
+        let mut hasher = Sha256::new();
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let count = executable.read(&mut buffer).unwrap();
+            if count == 0 {
+                break;
+            }
+            hasher.update(&buffer[..count]);
+        }
+        format!("{:x}", hasher.finalize())
+    }
+
+    #[test]
+    fn test_allocator_worker_evidence_cannot_impersonate_production() {
+        let mut document = serde_json::json!({
+            "schema": "denoize-dpdfnet-worker-run-v2",
+            "schema_version": 2,
+        });
+        mark_test_allocator_diagnostic(&mut document);
+        if cfg!(feature = "diagnostic-mimalloc") {
+            assert_eq!(
+                document["schema"],
+                "denoize-neural-worker-allocator-diagnostic-v1"
+            );
+            assert_eq!(document["diagnostic_only"], true);
+            assert_eq!(document["test_allocator"], "mimalloc");
+            assert_eq!(document["test_binary_sha256"].as_str().unwrap().len(), 64);
+        } else {
+            assert_eq!(document["schema"], "denoize-dpdfnet-worker-run-v2");
+            assert_eq!(document["schema_version"], 2);
+            assert!(document.get("diagnostic_only").is_none());
+        }
+    }
+
+    fn worker_evidence_environment() -> serde_json::Value {
+        serde_json::json!({
                 "os": std::env::consts::OS,
                 "arch": std::env::consts::ARCH,
                 "logical_parallelism": std::thread::available_parallelism()
@@ -2895,13 +4134,15 @@ mod tests {
                 "cpu_model": std::env::var("DENOIZE_EVIDENCE_CPU_MODEL").unwrap_or_default(),
                 "hardware_tier": std::env::var("DENOIZE_EVIDENCE_HARDWARE_TIER").unwrap_or_default(),
                 "runner_label": std::env::var("DENOIZE_EVIDENCE_RUNNER_LABEL").unwrap_or_default(),
-            },
-        });
-        let bytes = serde_json::to_vec_pretty(&document).expect("encode worker evidence");
+        })
+    }
+
+    fn write_worker_evidence_document(path: &str, document: &serde_json::Value) {
+        let bytes = serde_json::to_vec_pretty(document).expect("encode worker evidence");
         let mut destination = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&path)
+            .open(path)
             .unwrap_or_else(|error| panic!("create worker evidence {path}: {error}"));
         destination
             .write_all(&bytes)

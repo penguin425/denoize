@@ -206,7 +206,8 @@ jobs:
               "$DENOIZE_EVIDENCE_DIR/stress-run.log"
           fi
 
-      - name: Exercise paced experimental CLAP worker
+      - name: Exercise stereo CLAP worker at actual 144, 480, and 1024-frame callbacks
+        id: worker_gate
         shell: bash
         env:
           DENOIZE_NEURAL_WORKER_EVIDENCE: ${{ runner.temp }}/dpdfnet-evidence/worker.json
@@ -215,7 +216,15 @@ jobs:
           OMP_NUM_THREADS: "1"
         run: |
           cargo test --locked --release --target "${{ matrix.target }}" \
-            -p denoize-clap --features experimental-dpdfnet-hq \
+            -p denoize --lib --no-default-features --features dpdfnet,gtcrn \
+            backend::dpdfnet::tests::pinned_dpdfnet2_runtime_reuse_matches_fresh_inference \
+            -- --ignored --exact --nocapture
+          cargo test --locked --release --target "${{ matrix.target }}" \
+            -p denoize-clap --lib --features experimental-dpdfnet-hq \
+            neural::tests::pinned_dpdfnet2_stereo_matches_independent_mono \
+            -- --ignored --exact --nocapture
+          cargo test --locked --release --target "${{ matrix.target }}" \
+            -p denoize-clap --lib --features experimental-dpdfnet-hq \
             neural::tests::pinned_dpdfnet2_release_worker_meets_sustained_deadlines \
             -- --ignored --exact --nocapture
 
@@ -226,6 +235,201 @@ jobs:
             --stress "$DENOIZE_EVIDENCE_DIR/stress.json" \
             --worker "$DENOIZE_EVIDENCE_DIR/worker.json" \
             --output "$DENOIZE_EVIDENCE_DIR/platform.json"
+
+      - name: Profile a rejected stereo worker without changing its gate result
+        if: failure() && steps.worker_gate.outcome == 'failure'
+        continue-on-error: true
+        shell: bash
+        env:
+          DENOIZE_NEURAL_WORKER_PROFILE: ${{ runner.temp }}/dpdfnet-evidence/worker-profile
+          DENOIZE_NEURAL_PROFILE_CALLBACK_FRAMES: "144,480,1024"
+          DENOIZE_NEURAL_WORKER_SECONDS: ${{ inputs.stress_seconds || '60' }}
+          RAYON_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+        run: |
+          # Diagnostic-only, real worker/feeder traces. The failed strict
+          # worker.json is retained unchanged and still rejects this job.
+          cargo test --locked --release --target "${{ matrix.target }}" \
+            -p denoize-clap --lib --features experimental-dpdfnet-hq \
+            neural::tests::pinned_dpdfnet2_release_worker_profiles_deadline_failure \
+            -- --ignored --exact --nocapture
+
+      - name: Profile rejected optimized model operations separately from its gate
+        if: failure() && steps.worker_gate.outcome == 'failure'
+        continue-on-error: true
+        shell: bash
+        env:
+          DENOIZE_DPDFNET_OP_PROFILE: ${{ runner.temp }}/dpdfnet-evidence/model-op-profile.json
+          RAYON_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+        run: |
+          cargo test --locked --release --target "${{ matrix.target }}" \
+            --lib --no-default-features --features dpdfnet,gtcrn \
+            backend::dpdfnet::tests::pinned_dpdfnet2_op_profile_diagnostic \
+            -- --ignored --exact --nocapture
+
+      - name: Compare rejected Windows callback notifications on the same runner
+        if: failure() && runner.os == 'Windows' && steps.worker_gate.outcome == 'failure'
+        continue-on-error: true
+        shell: bash
+        env:
+          DENOIZE_NEURAL_WORKER_PROFILE: ${{ runner.temp }}/dpdfnet-evidence/worker-profile-comparison
+          DENOIZE_NEURAL_WORKER_SECONDS: ${{ inputs.stress_seconds || '60' }}
+          RAYON_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+        run: |
+          # ABBA diagnostic only; no result replaces the rejected strict gate.
+          cargo test --locked --release --target "${{ matrix.target }}" \
+            -p denoize-clap --lib --features experimental-dpdfnet-hq \
+            neural::tests::pinned_dpdfnet2_release_worker_compares_callback_notifications \
+            -- --ignored --exact --nocapture
+
+      - name: Compare rejected Windows System and mimalloc diagnostics
+        if: failure() && runner.os == 'Windows' && steps.worker_gate.outcome == 'failure'
+        continue-on-error: true
+        shell: bash
+        env:
+          DENOIZE_DIAGNOSTIC_SECONDS: ${{ inputs.stress_seconds || '60' }}
+          RAYON_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+        run: |
+          set -euo pipefail
+          umask 077
+          evidence="$DENOIZE_EVIDENCE_DIR/allocator-comparison"
+          bin_dir=$(mktemp -d "$RUNNER_TEMP/dpdfnet-allocator-binaries.XXXXXX")
+          mkdir -p "$evidence"
+          manifest="$evidence/allocator-comparison-manifest.json"
+          built=()
+
+          build_test_binary() {
+            local key="$1" package="$2" features="$3" test_name="$4"
+            local log="$evidence/build-${key}.jsonl"
+            local target="${{ matrix.target }}"
+            local cargo_args=(test --locked --release --target "$target" -p "$package" --lib \
+              --no-run --message-format=json)
+            if [[ "$package" == denoize ]]; then
+              cargo_args+=(--no-default-features)
+            fi
+            cargo_args+=(--features "$features")
+            cargo "${cargo_args[@]}" > "$log" 2> "$evidence/build-${key}.stderr.log"
+            local exe
+            exe=$(jq -br --arg test "$test_name" \
+              'select(.reason=="compiler-artifact" and .profile.test==true and .target.name==$test) | .executable // empty' \
+              "$log" | sort -u)
+            test "$(printf '%s\n' "$exe" | sed '/^$/d' | wc -l)" -eq 1
+            local raw="$exe"; local unix_path win
+            unix_path=$(cygpath -u "$raw")
+            test -f "$unix_path"
+            local copy="$bin_dir/$key.exe"
+            test ! -e "$copy" && test ! -L "$copy"
+            cp --no-clobber "$unix_path" "$copy"
+            win=$(cygpath -w "$copy")
+            built+=("$key|$package|$features|$test_name|$copy|$win")
+          }
+
+          # Resolve every compiler artifact before starting any measurement.
+          build_test_binary core-system denoize 'dpdfnet,gtcrn' denoize
+          build_test_binary core-mimalloc denoize 'dpdfnet,gtcrn,diagnostic-mimalloc' denoize
+          build_test_binary clap-system denoize-clap experimental-dpdfnet-hq denoize_clap
+          build_test_binary clap-mimalloc denoize-clap 'experimental-dpdfnet-hq,diagnostic-mimalloc' denoize_clap
+
+          lookup_binary() {
+            local wanted="$1" entry key package features test_name copy win
+            for entry in "${built[@]}"; do
+              IFS='|' read -r key package features test_name copy win <<< "$entry"
+              if [[ "$key" == "$wanted" ]]; then printf '%s\n' "$copy"; return 0; fi
+            done
+            return 1
+          }
+
+          # The copied test binaries are diagnostic-only and never enter the
+          # attested production artifact directory.
+          manifest_parts=()
+          for entry in "${built[@]}"; do
+            IFS='|' read -r key package features test_name copy win <<< "$entry"
+            binary_sha=$(sha256sum < "$copy" | awk '{print $1}')
+            part="$evidence/manifest-${key}.json"
+            jq -n --arg variant "$key" --arg package "$package" --arg features "$features" \
+              --arg target "${{ matrix.target }}" --arg binary "$win" --arg binary_sha "$binary_sha" \
+              --arg source "$GITHUB_SHA" --arg model "$DPDFNET_MODEL_SHA256" \
+              '{variant:$variant,package:$package,features:$features,target:$target,binary:$binary,binary_sha256:$binary_sha,source_sha:$source,model_sha256:$model,diagnostic_only:true,allocator_override:false}' > "$part"
+            manifest_parts+=("$part")
+          done
+          core_system_sha=$(sha256sum < "$(lookup_binary core-system)" | awk '{print $1}')
+          core_mimalloc_sha=$(sha256sum < "$(lookup_binary core-mimalloc)" | awk '{print $1}')
+          clap_system_sha=$(sha256sum < "$(lookup_binary clap-system)" | awk '{print $1}')
+          clap_mimalloc_sha=$(sha256sum < "$(lookup_binary clap-mimalloc)" | awk '{print $1}')
+          set -o noclobber
+          jq -s --arg source "$GITHUB_SHA" --arg model "$DPDFNET_MODEL_SHA256" \
+            --arg rust "$(rustc --version)" --arg cargo "$(cargo --version)" \
+            --arg rustflags "${RUSTFLAGS-}" --arg encoded_rustflags "${CARGO_ENCODED_RUSTFLAGS-}" \
+            --arg flags "--locked --release --lib --no-run --message-format=json; root --no-default-features; per-variant target/features below" \
+            --arg order "core-system,core-mimalloc,clap-system,clap-mimalloc; measurements: core-0-system,core-1-mimalloc,core-2-mimalloc,core-3-system; worker-0-system,worker-1-mimalloc,worker-2-mimalloc,worker-3-system" \
+            --arg core_system_sha "$core_system_sha" --arg core_mimalloc_sha "$core_mimalloc_sha" \
+            --arg clap_system_sha "$clap_system_sha" --arg clap_mimalloc_sha "$clap_mimalloc_sha" \
+            '{diagnostic_only:true,source_sha:$source,model_sha256:$model,rust_toolchain:$rust,cargo_version:$cargo,rustflags:$rustflags,encoded_rustflags:$encoded_rustflags,compiler_flags:$flags,execution_order:$order,allocator_override:false,mimalloc_wrapper_version:"0.1.52",mimalloc_sys_version:"0.1.49",legacy_mimalloc_c_version:"3.3.2 diagnostic-only; not a production candidate",formal_gate_substitute:false,rss_measured:false,whole_process_cpu_measured:false,binary_sha256:{core_system:$core_system_sha,core_mimalloc:$core_mimalloc_sha,clap_system:$clap_system_sha,clap_mimalloc:$clap_mimalloc_sha},variants:.}' \
+            "${manifest_parts[@]}" > "$manifest"
+          set +o noclobber
+
+          # Run the normal CLAP ignored checks before profiling; they are not
+          # replaced by the diagnostic worker measurements.
+          for entry in "${built[@]}"; do
+            IFS='|' read -r key package features test_name copy win <<< "$entry"
+            [[ "$package" == denoize-clap ]] || continue
+            DENOIZE_MODEL_DIR="$DENOIZE_MODEL_DIR" "$copy" --nocapture 2>&1 | tee "$evidence/normal-${key}.log"
+            DENOIZE_MODEL_DIR="$DENOIZE_MODEL_DIR" "$copy" \
+              neural::tests::pinned_dpdfnet2_stereo_matches_independent_mono \
+              --ignored --exact --nocapture 2>&1 | tee "$evidence/stereo-${key}.log"
+          done
+
+          core_order=(core-system core-mimalloc core-mimalloc core-system)
+          for index in 0 1 2 3; do
+            key="${core_order[$index]}"
+            copy=$(lookup_binary "$key")
+            profile="$evidence/allocator-core-${index}-$( [[ "$key" == *mimalloc ]] && echo mimalloc || echo system ).json"
+            DENOIZE_MODEL_DIR="$DENOIZE_MODEL_DIR" \
+              DENOIZE_DPDFNET_OP_PROFILE="$(cygpath -w "$profile")" \
+              "$copy" backend::dpdfnet::tests::pinned_dpdfnet2_op_profile_diagnostic \
+              --ignored --exact --nocapture 2>&1 | tee "$evidence/core-${index}.log"
+            expected_allocator=std-system
+            expected_sha="$core_system_sha"
+            if [[ "$key" == *mimalloc ]]; then
+              expected_allocator=mimalloc
+              expected_sha="$core_mimalloc_sha"
+            fi
+            jq -e --arg source "$GITHUB_SHA" --arg model "$DPDFNET_MODEL_SHA256" \
+              --arg allocator "$expected_allocator" --arg binary_sha "$expected_sha" \
+              '.source_commit==$source and .model_sha256==$model and .test_allocator==$allocator and .test_binary_sha256==$binary_sha and .actual_hops==300 and .reference_bit_exact_hops==304 and (.output_checksum_sha256|type=="string" and test("^[0-9a-f]{64}$"))' \
+              "$profile"
+          done
+          jq -s -e 'length==4 and ([.[].output_checksum_sha256]|unique|length)==1' \
+            "$evidence/allocator-core-0-system.json" "$evidence/allocator-core-1-mimalloc.json" \
+            "$evidence/allocator-core-2-mimalloc.json" "$evidence/allocator-core-3-system.json"
+          worker_order=(clap-system clap-mimalloc clap-mimalloc clap-system)
+          for index in 0 1 2 3; do
+            key="${worker_order[$index]}"
+            copy=$(lookup_binary "$key")
+            profile="$evidence/allocator-worker-${index}-$( [[ "$key" == *mimalloc ]] && echo mimalloc || echo system )"
+            DENOIZE_MODEL_DIR="$DENOIZE_MODEL_DIR" \
+              DENOIZE_NEURAL_PROFILE_CALLBACK_FRAMES="144,480,1024" \
+              DENOIZE_NEURAL_WORKER_SECONDS="$DENOIZE_DIAGNOSTIC_SECONDS" \
+              DENOIZE_NEURAL_WORKER_PROFILE="$(cygpath -w "$profile")" \
+              "$copy" neural::tests::pinned_dpdfnet2_release_worker_profiles_deadline_failure \
+              --ignored --exact --nocapture 2>&1 | tee "$evidence/worker-${index}.log"
+            expected_allocator=std-system
+            expected_sha="$clap_system_sha"
+            if [[ "$key" == *mimalloc ]]; then
+              expected_allocator=mimalloc
+              expected_sha="$clap_mimalloc_sha"
+            fi
+            for callback_frames in 144 480 1024; do
+              jq -e --arg source "$GITHUB_SHA" --arg allocator "$expected_allocator" \
+                --arg binary_sha "$expected_sha" --argjson callback_frames "$callback_frames" \
+                --argjson seconds "$DENOIZE_DIAGNOSTIC_SECONDS" \
+                '.source_commit==$source and .test_allocator==$allocator and .test_binary_sha256==$binary_sha and .diagnostic_only==true and .callback_frames==$callback_frames and .requested_seconds==$seconds and .callback_notifications_enabled==true' \
+                "$profile.$callback_frames.json"
+            done
+          done
 
       - name: Preserve rejected platform diagnostics
         if: failure()
@@ -243,7 +447,7 @@ jobs:
           cargo build --locked --release --target "${{ matrix.target }}" \
             -p denoize-clap --features experimental-dpdfnet-hq
           cargo test --locked --release --target "${{ matrix.target }}" \
-            -p denoize-clap --features experimental-dpdfnet-hq \
+            -p denoize-clap --lib --features experimental-dpdfnet-hq \
             tests::bundle_exposes_stable_realtime_and_neural_plugin_ids -- --exact
           archive=$(bash scripts/package-dpdfnet-experimental-clap.sh \
             "${{ matrix.target }}" "$GITHUB_SHA" "$DENOIZE_EVIDENCE_DIR" \
@@ -300,6 +504,49 @@ jobs:
         run: |
           cp "${{ steps.attest.outputs.bundle-path }}" \
             "$DENOIZE_EVIDENCE_DIR/dpdfnet-${{ matrix.target }}.sigstore.json"
+
+      - name: Record verifier GitHub CLI version
+        if: github.event_name != 'pull_request'
+        shell: bash
+        run: |
+          gh --version | tee "$RUNNER_TEMP/dpdfnet-gh-version-${{ matrix.target }}.txt"
+
+      - name: Verify local attestation bundle subjects
+        if: github.event_name != 'pull_request'
+        id: verify-local-attestation
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bundle="$DENOIZE_EVIDENCE_DIR/dpdfnet-${{ matrix.target }}.sigstore.json"
+          test -f "$bundle"
+          subjects=()
+          shopt -s nullglob dotglob
+          for subject in "$DENOIZE_EVIDENCE_DIR"/*; do
+            [[ -f "$subject" ]] || continue
+            [[ "$subject" == "$bundle" ]] && continue
+            subjects+=("$subject")
+          done
+          test "${#subjects[@]}" -gt 0
+          for subject in "${subjects[@]}"; do
+            gh attestation verify "$subject" \
+              --repo penguin425/denoize \
+              --bundle "$bundle" \
+              --signer-workflow penguin425/denoize/.github/workflows/dpdfnet-promotion.yml \
+              --source-digest "$GITHUB_SHA"
+          done
+
+      - name: Preserve rejected local attestation diagnostics
+        if: failure() && steps.verify-local-attestation.outcome == 'failure'
+        # actions/upload-artifact v6.
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: dpdfnet-rejected-attestation-${{ matrix.target }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/dpdfnet-evidence
+            ${{ runner.temp }}/dpdfnet-gh-version-${{ matrix.target }}.txt
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Upload experimental artifact and evidence
         # actions/upload-artifact v6.

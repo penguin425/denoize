@@ -486,8 +486,8 @@ impl StreamingProcessor {
         Ok(output)
     }
 
-    /// Process an owned block while reusing its mono native-rate storage for
-    /// the result when the caller already prepared one exact model hop.
+    /// Process an owned block while reusing its native-rate storage for the
+    /// result when the caller already prepared one exact model hop.
     pub(crate) fn process_owned_block(
         &mut self,
         mut input: Vec<Vec<f64>>,
@@ -497,7 +497,6 @@ impl StreamingProcessor {
         }
         let frames = validate_stream_block(&input, self.channels)?;
         if !self.native_rate
-            || self.channels != 1
             || frames != HOP_SIZE
             || self
                 .pending_model_rate
@@ -515,18 +514,22 @@ impl StreamingProcessor {
             .model_input_frames
             .checked_add(frames)
             .ok_or_else(|| "DPDFNet model input length overflow".to_string())?;
-        for (&source, destination) in input[0].iter().zip(&mut self.hop_scratch[0]) {
-            *destination = crate::audio::sanitize_sample(source) as f32;
+        for (channel, hop) in input.iter().zip(&mut self.hop_scratch) {
+            for (&source, destination) in channel.iter().zip(hop) {
+                *destination = crate::audio::sanitize_sample(source) as f32;
+            }
         }
 
         let remaining = self
             .model_input_frames
             .checked_sub(self.model_output_frames)
             .ok_or_else(|| "DPDFNet model output exceeded its input clock".to_string())?;
-        input[0].clear();
-        input[0]
-            .try_reserve(remaining.min(HOP_SIZE))
-            .map_err(|_| "unable to reserve DPDFNet output samples".to_string())?;
+        for channel in &mut input {
+            channel.clear();
+            channel
+                .try_reserve(remaining.min(HOP_SIZE))
+                .map_err(|_| "unable to reserve DPDFNet output samples".to_string())?;
+        }
         self.process_scratch_hop(&mut input)?;
 
         let produced = validate_stream_block(&input, self.channels)?;
@@ -1006,6 +1009,12 @@ fn load_model(
     runtime: AcceleratorRuntime,
     state_size: usize,
 ) -> Result<SharedRunnable, String> {
+    let mut model = load_typed_model(path, state_size)?;
+    super::tract_runtime::reset_plain_scans_for_reuse(&mut model);
+    super::tract_runtime::prepare(model, runtime, "DPDFNet 48 kHz model")
+}
+
+fn load_typed_model(path: &Path, state_size: usize) -> Result<TypedModel, String> {
     let mut model = tract_onnx::onnx()
         .model_for_path(path)
         .map_err(|error| format!("failed to load DPDFNet model {}: {error}", path.display()))?;
@@ -1022,8 +1031,7 @@ fn load_model(
             .set_output_fact(index, f32::fact(*shape).into())
             .map_err(tract_error)?;
     }
-    let model = model.into_typed().map_err(tract_error)?;
-    super::tract_runtime::prepare(model, runtime, "DPDFNet 48 kHz model")
+    model.into_typed().map_err(tract_error)
 }
 
 fn tract_error(error: impl std::fmt::Display) -> String {
@@ -1034,10 +1042,97 @@ fn tract_error(error: impl std::fmt::Display) -> String {
 mod tests {
     use super::*;
     use prost::Message;
+    use std::alloc::{GlobalAlloc, Layout};
+    use std::cell::Cell;
+    use std::io::Write;
+    use std::time::Instant;
     use tract_onnx::pb::{
-        tensor_proto, tensor_shape_proto, type_proto, GraphProto, ModelProto, NodeProto,
-        OperatorSetIdProto, StringStringEntryProto, TensorShapeProto, TypeProto, ValueInfoProto,
+        attribute_proto, tensor_proto, tensor_shape_proto, type_proto, AttributeProto, GraphProto,
+        ModelProto, NodeProto, OperatorSetIdProto, StringStringEntryProto, TensorProto,
+        TensorShapeProto, TypeProto, ValueInfoProto,
     };
+    use tract_onnx::tract_core::internal::DimLike;
+
+    struct ProfileAllocator;
+    #[cfg(feature = "diagnostic-mimalloc")]
+    static PROFILE_UPSTREAM_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+    #[cfg(not(feature = "diagnostic-mimalloc"))]
+    static PROFILE_UPSTREAM_ALLOCATOR: std::alloc::System = std::alloc::System;
+    #[derive(Clone, Copy, Default)]
+    struct ProfileRow {
+        nanos: u128,
+        allocations: u64,
+        bytes: u64,
+        calls: u64,
+    }
+    #[derive(Clone, Copy, Default)]
+    struct ProfileCounters {
+        allocations: u64,
+        bytes: u64,
+    }
+    thread_local! {
+        static PROFILE_COUNTERS: Cell<Option<ProfileCounters>> = const { Cell::new(None) };
+    }
+
+    struct ProfileAllocationScope;
+
+    impl ProfileAllocationScope {
+        fn start() -> Self {
+            PROFILE_COUNTERS.with(|c| {
+                assert!(c.replace(Some(ProfileCounters::default())).is_none());
+            });
+            Self
+        }
+
+        fn finish(self) -> ProfileCounters {
+            PROFILE_COUNTERS.with(|c| c.replace(None).unwrap())
+        }
+    }
+
+    impl Drop for ProfileAllocationScope {
+        fn drop(&mut self) {
+            PROFILE_COUNTERS.with(|c| c.set(None));
+        }
+    }
+
+    unsafe impl GlobalAlloc for ProfileAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let _ = PROFILE_COUNTERS.try_with(|c| {
+                if let Some(mut counters) = c.get() {
+                    counters.allocations += 1;
+                    counters.bytes += layout.size() as u64;
+                    c.set(Some(counters));
+                }
+            });
+            unsafe { PROFILE_UPSTREAM_ALLOCATOR.alloc(layout) }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { PROFILE_UPSTREAM_ALLOCATOR.dealloc(ptr, layout) }
+        }
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            let _ = PROFILE_COUNTERS.try_with(|c| {
+                if let Some(mut counters) = c.get() {
+                    counters.allocations += 1;
+                    counters.bytes += layout.size() as u64;
+                    c.set(Some(counters));
+                }
+            });
+            unsafe { PROFILE_UPSTREAM_ALLOCATOR.alloc_zeroed(layout) }
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+            let _ = PROFILE_COUNTERS.try_with(|c| {
+                if let Some(mut counters) = c.get() {
+                    counters.allocations += 1;
+                    counters.bytes += size as u64;
+                    c.set(Some(counters));
+                }
+            });
+            unsafe { PROFILE_UPSTREAM_ALLOCATOR.realloc(ptr, layout, size) }
+        }
+    }
+
+    #[global_allocator]
+    static TEST_PROFILE_ALLOCATOR: ProfileAllocator = ProfileAllocator;
 
     fn valid_metadata() -> BTreeMap<String, String> {
         let mut metadata: BTreeMap<String, String> = [
@@ -1073,6 +1168,328 @@ mod tests {
                 .join(","),
         );
         metadata
+    }
+
+    #[test]
+    #[ignore = "requires the pinned managed DPDFNet model and cargo test --release"]
+    fn pinned_dpdfnet2_runtime_reuse_matches_fresh_inference() {
+        use sha2::{Digest as _, Sha256};
+
+        assert!(!cfg!(debug_assertions));
+        let model_directory = std::env::var_os("DENOIZE_MODEL_DIR")
+            .expect("DENOIZE_MODEL_DIR must contain the authenticated managed model");
+        let path = Path::new(&model_directory).join("dpdfnet2-48khz-hr/dpdfnet2_48khz_hr.onnx");
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&bytes)),
+            "7f0575a5cec0ba4ffd8f8bd657e06d007e4ccdd955d76faab922b9d3291dc14b"
+        );
+        let model = DpdfnetModel::load(&OnnxModelConfig {
+            path: path.clone(),
+            sample_rate: SAMPLE_RATE,
+        })
+        .unwrap();
+        let original = super::super::tract_runtime::prepare(
+            load_typed_model(&path, DPDFNET2_STATE_SIZE).unwrap(),
+            AcceleratorRuntime::Cpu,
+            "original DPDFNet fresh-run reference",
+        )
+        .unwrap();
+        for (label, runnable) in [("original", &original), ("candidate", &model.model)] {
+            for node in runnable.typed_model().unwrap().nodes() {
+                if !node.op().is_stateless() {
+                    eprintln!(
+                        "{label} non-stateless node: {} ({})",
+                        node.name,
+                        node.op().name()
+                    );
+                }
+            }
+            eprintln!(
+                "{label} reuse_runtime_state={}",
+                super::super::tract_runtime::supports_state_reuse(runnable)
+            );
+        }
+        let mut reference = std::array::from_fn::<_, 2, _>(|_| {
+            let mut stream =
+                DpdfnetStream::from_model(Arc::clone(&original), Arc::clone(&model.initial_state))
+                    .unwrap();
+            stream.reuse_runtime_state = false;
+            stream
+        });
+        let mut candidate = [model.stream().unwrap(), model.stream().unwrap()];
+        assert!(candidate.iter().all(|stream| stream.reuse_runtime_state));
+        for case in 0..5 {
+            for stream in reference.iter_mut().chain(candidate.iter_mut()) {
+                stream.reset();
+            }
+            for hop in 0..24 {
+                // Alternate lane order as well as lane input, so hidden Scan
+                // state cannot silently leak through the shared runtime cache.
+                for channel in if hop % 2 == 0 { [0, 1] } else { [1, 0] } {
+                    let sign = if channel == 1 && case == 3 { -1.0 } else { 1.0 };
+                    let silent = case == 0 || (case == 1 && channel == 1);
+                    for index in 0..BINS * 2 {
+                        let lane = if case == 2 || case == 3 { 0 } else { channel };
+                        let phase = (index * 13 + hop * 7 + lane * 19) as f32 * 0.017;
+                        let input = if silent {
+                            0.0
+                        } else {
+                            phase.sin() * sign * 0.1
+                        };
+                        reference[channel].model_input[index] = input;
+                        candidate[channel].model_input[index] = input;
+                    }
+                    let expected = reference[channel].infer().unwrap();
+                    let actual = candidate[channel].infer().unwrap();
+                    let bits = |value: &TValue| -> Vec<u32> {
+                        value
+                            .try_as_plain()
+                            .unwrap()
+                            .as_slice::<f32>()
+                            .unwrap()
+                            .iter()
+                            .map(|sample| sample.to_bits())
+                            .collect()
+                    };
+                    assert_eq!(
+                        bits(&actual),
+                        bits(&expected),
+                        "spectrum: case={case}, hop={hop}, channel={channel}"
+                    );
+                    assert_eq!(bits(&actual).len(), BINS * 2);
+                    let expected_state: Vec<u32> = reference[channel]
+                        .state
+                        .try_as_plain()
+                        .unwrap()
+                        .as_slice::<f32>()
+                        .unwrap()
+                        .iter()
+                        .map(|sample| sample.to_bits())
+                        .collect();
+                    let actual_state: Vec<u32> = candidate[channel]
+                        .state
+                        .try_as_plain()
+                        .unwrap()
+                        .as_slice::<f32>()
+                        .unwrap()
+                        .iter()
+                        .map(|sample| sample.to_bits())
+                        .collect();
+                    assert_eq!(actual_state.len(), DPDFNET2_STATE_SIZE);
+                    assert_eq!(
+                        actual_state, expected_state,
+                        "state: case={case}, hop={hop}, channel={channel}"
+                    );
+                    assert!(actual
+                        .try_as_plain()
+                        .unwrap()
+                        .as_slice::<f32>()
+                        .unwrap()
+                        .iter()
+                        .all(|sample| sample.is_finite()));
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic: requires pinned model, release test, and DENOIZE_DPDFNET_OP_PROFILE=<new-json-path>"]
+    fn pinned_dpdfnet2_op_profile_diagnostic() {
+        use sha2::{Digest as _, Sha256};
+        use std::io::Read;
+
+        let profile_path = std::env::var_os("DENOIZE_DPDFNET_OP_PROFILE")
+            .expect("DENOIZE_DPDFNET_OP_PROFILE must name a new private JSON output path");
+        assert!(!cfg!(debug_assertions));
+        // Stream the executable digest before warmup, without keeping a large
+        // file buffer alive or mixing hashing into any measured operation.
+        let mut executable = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
+        let mut executable_hash = Sha256::new();
+        let mut hash_buffer = [0u8; 64 * 1024];
+        loop {
+            let count = executable.read(&mut hash_buffer).unwrap();
+            if count == 0 {
+                break;
+            }
+            executable_hash.update(&hash_buffer[..count]);
+        }
+        let test_binary_sha256 = format!("{:x}", executable_hash.finalize());
+        let directory = std::env::var_os("DENOIZE_MODEL_DIR")
+            .expect("DENOIZE_MODEL_DIR must contain the authenticated managed model");
+        let path = Path::new(&directory).join("dpdfnet2-48khz-hr/dpdfnet2_48khz_hr.onnx");
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&bytes)),
+            "7f0575a5cec0ba4ffd8f8bd657e06d007e4ccdd955d76faab922b9d3291dc14b"
+        );
+
+        let loaded = DpdfnetModel::load(&OnnxModelConfig {
+            path: path.clone(),
+            sample_rate: SAMPLE_RATE,
+        })
+        .unwrap();
+        let typed = loaded.model.typed_model().unwrap().clone();
+        let plan = Arc::clone(loaded.model.typed_plan().expect("CPU typed plan"));
+        let source_commit = std::env::var("DENOIZE_EVIDENCE_SOURCE_COMMIT")
+            .expect("bind the diagnostic to DENOIZE_EVIDENCE_SOURCE_COMMIT");
+        assert_eq!(source_commit.len(), 40);
+        assert!(source_commit.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        let initial = loaded.initial_state;
+        let mut state = plan.spawn().unwrap();
+        let mut reference_state = plan.spawn().unwrap();
+        let mut recurrent = initial.as_ref().clone().into_arc_tensor();
+        let mut reference_recurrent = initial.as_ref().clone().into_arc_tensor();
+        let mut rows = vec![ProfileRow::default(); typed.nodes().len()];
+        let mut input = vec![0.0f32; BINS * 2];
+        const WARMUP_HOPS: usize = 4;
+        const MEASURED_HOPS: usize = 300;
+        let mut hop_wall_ns = Vec::with_capacity(MEASURED_HOPS);
+        let mut reference_wall_ns = Vec::with_capacity(MEASURED_HOPS);
+        let mut output_checksum = Sha256::new();
+        for hop in 0..WARMUP_HOPS + MEASURED_HOPS {
+            for (index, value) in input.iter_mut().enumerate() {
+                *value = ((index * 17 + hop * 11) as f32 * 0.013).sin() * 0.1;
+            }
+            // Move external recurrent state exactly as production does, and
+            // create a separate spectrum for the reference. Holding cloned
+            // measured inputs could force extra copy-on-write allocations.
+            let inputs = tvec!(
+                Tensor::from_shape(&[1, 1, BINS, 2], &input)
+                    .unwrap()
+                    .into_tvalue(),
+                recurrent.into_tvalue(),
+            );
+            let reference_inputs = tvec!(
+                Tensor::from_shape(&[1, 1, BINS, 2], &input)
+                    .unwrap()
+                    .into_tvalue(),
+                reference_recurrent.into_tvalue(),
+            );
+            let started = Instant::now();
+            let outputs = if hop < WARMUP_HOPS {
+                state.run(inputs).unwrap()
+            } else {
+                state
+                    .run_plan_with_eval(inputs, |session, op_state, node, inputs| {
+                        let scope = ProfileAllocationScope::start();
+                        let started = Instant::now();
+                        let output =
+                            tract_onnx::tract_core::plan::eval(session, op_state, node, inputs);
+                        let nanos = started.elapsed().as_nanos();
+                        let counters = scope.finish();
+                        let row = &mut rows[node.id];
+                        row.nanos += nanos;
+                        row.allocations += counters.allocations;
+                        row.bytes += counters.bytes;
+                        row.calls += 1;
+                        output
+                    })
+                    .unwrap()
+            };
+            if hop >= WARMUP_HOPS {
+                hop_wall_ns.push(started.elapsed().as_nanos() as u64);
+            }
+            let reference_started = Instant::now();
+            let expected = reference_state.run(reference_inputs).unwrap();
+            if hop >= WARMUP_HOPS {
+                reference_wall_ns.push(reference_started.elapsed().as_nanos() as u64);
+            }
+            let actual_bits = |value: &TValue| {
+                value
+                    .try_as_plain()
+                    .unwrap()
+                    .as_slice::<f32>()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(outputs.len(), 2);
+            assert_eq!(expected.len(), 2);
+            for output in 0..2 {
+                assert_eq!(
+                    actual_bits(&outputs[output]),
+                    actual_bits(&expected[output]),
+                    "instrumented graph differs at hop={hop}, output={output}"
+                );
+                for sample in outputs[output]
+                    .try_as_plain()
+                    .unwrap()
+                    .as_slice::<f32>()
+                    .unwrap()
+                {
+                    output_checksum.update(sample.to_bits().to_le_bytes());
+                }
+            }
+            recurrent = outputs.into_iter().nth(1).unwrap().into_arc_tensor();
+            reference_recurrent = expected.into_iter().nth(1).unwrap().into_arc_tensor();
+        }
+        assert_eq!(hop_wall_ns.len(), MEASURED_HOPS);
+        assert!(rows.iter().any(|row| row.calls == MEASURED_HOPS as u64));
+        let nodes: Vec<_> = typed.nodes().iter().map(|node| {
+            let row = rows[node.id];
+            let facts = typed.node_input_facts(node.id).unwrap();
+            let scan = node.op().downcast_ref::<tract_onnx::tract_core::ops::scan::OptScan>()
+                .map(|scan| serde_json::json!({
+                    "iterations": scan.iteration_count(&facts).and_then(|n| n.to_usize().ok()),
+                    "input_mapping": format!("{:?}", scan.input_mapping),
+                    "output_mapping": format!("{:?}", scan.output_mapping),
+                    "body_nodes": scan.plan.model().nodes().len(),
+                    "boundary_copy_estimate_bytes": null,
+                    "boundary_copy_estimate_reason": "not isolated: inclusive Scan timing/allocation includes the body",
+                }));
+            serde_json::json!({
+                "id": node.id,
+                "name": node.name,
+                "op": node.op().name(),
+                "input_shapes": facts.iter().map(|fact| format!("{:?}", fact.shape)).collect::<Vec<_>>(),
+                "output_shapes": node.outputs.iter().map(|outlet| format!("{:?}", outlet.fact.shape)).collect::<Vec<_>>(),
+                "inclusive_ns": row.nanos as u64,
+                "calls": row.calls,
+                "allocations": row.allocations,
+                "allocation_requested_bytes": row.bytes,
+                "scan": scan,
+            })
+        }).collect();
+        let document = serde_json::json!({
+            "schema": "denoize-dpdfnet-op-profile-diagnostic-v1",
+            "diagnostic_only": true,
+            "source_commit": source_commit,
+            "test_binary_sha256": test_binary_sha256,
+            "test_allocator": if cfg!(feature = "diagnostic-mimalloc") { "mimalloc" } else { "std-system" },
+            "diagnostic_mimalloc_feature": cfg!(feature = "diagnostic-mimalloc"),
+            "mimalloc_wrapper_version": if cfg!(feature = "diagnostic-mimalloc") { Some("0.1.52") } else { None },
+            "mimalloc_sys_version": if cfg!(feature = "diagnostic-mimalloc") { Some("0.1.49") } else { None },
+            "mimalloc_c_version": if cfg!(feature = "diagnostic-mimalloc") { Some("3.3.2") } else { None },
+            "allocator_override": false,
+            "model_sha256": "7f0575a5cec0ba4ffd8f8bd657e06d007e4ccdd955d76faab922b9d3291dc14b",
+            "warmup_hops": WARMUP_HOPS,
+            "actual_hops": MEASURED_HOPS,
+            "reference_bit_exact_hops": WARMUP_HOPS + MEASURED_HOPS,
+            "output_checksum_sha256": format!("{:x}", output_checksum.finalize()),
+            "output_checksum_scope": "all 304 hops, spectrum then recurrent state, each f32 bit pattern little-endian",
+            "static_input_shape": [1, 1, BINS, 2],
+            "hop_wall_ns": hop_wall_ns,
+            "reference_wall_ns": reference_wall_ns,
+            "reference_execution_order": "instrumented then uninstrumented, interleaved on the same thread; not an unbiased performance gate",
+            "recurrent_storage": "Arc<Tensor>, Const input, into_arc_tensor output as in production",
+            "clock": "Instant",
+            "allocator_scope": "current-thread, eval and timer reads only; excludes plan glue, input construction, metadata and reference; requested bytes are not copy bytes or peak RSS",
+            "timing_scope": "top-level inclusive eval; Scan includes its body; instrumentation overhead is not a gate result",
+            "optimized_nodes": nodes,
+        });
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&profile_path)
+            .expect("DENOIZE_DPDFNET_OP_PROFILE must be a new private JSON path");
+        serde_json::to_writer_pretty(&mut output, &document).unwrap();
+        output.write_all(b"\n").unwrap();
+        eprintln!(
+            "diagnostic profile written to {}",
+            Path::new(&profile_path).display()
+        );
     }
 
     #[test]
@@ -1146,7 +1563,7 @@ mod tests {
 
     #[test]
     fn production_stream_is_partition_invariant_resettable_and_exact_length() {
-        let (_directory, path) = write_identity_model();
+        let (_directory, path) = write_scaled_model(0.25);
         let config = OnnxModelConfig {
             path,
             sample_rate: SAMPLE_RATE,
@@ -1275,16 +1692,91 @@ mod tests {
         assert_eq!(owned.finish().unwrap(), borrowed.finish().unwrap());
     }
 
+    #[test]
+    fn native_owned_multichannel_hops_match_independent_mono_streams() {
+        let (_directory, path) = write_scaled_model(0.25);
+        let config = OnnxModelConfig {
+            path,
+            sample_rate: SAMPLE_RATE,
+        };
+        let model = DpdfnetModel::load(&config).unwrap();
+        let mut stereo = StreamingProcessor::new_with_model(&model, SAMPLE_RATE, 2).unwrap();
+        let mut mono = [
+            StreamingProcessor::new_with_model(&model, SAMPLE_RATE, 1).unwrap(),
+            StreamingProcessor::new_with_model(&model, SAMPLE_RATE, 1).unwrap(),
+        ];
+        let mut stereo_output = [Vec::new(), Vec::new()];
+        for hop_index in 0..8 {
+            let left: Vec<f64> = (0..HOP_SIZE)
+                .map(|index| {
+                    let position = hop_index * HOP_SIZE + index;
+                    (std::f64::consts::TAU * 521.0 * position as f64 / SAMPLE_RATE as f64).sin()
+                        * 0.2
+                })
+                .collect();
+            let right: Vec<f64> = (0..HOP_SIZE)
+                .map(|index| {
+                    let position = hop_index * HOP_SIZE + index;
+                    if hop_index % 2 == 0 {
+                        0.0
+                    } else {
+                        -(std::f64::consts::TAU * 733.0 * position as f64 / SAMPLE_RATE as f64)
+                            .sin()
+                            * 0.15
+                    }
+                })
+                .collect();
+            let expected_left = mono[0].process_block(&[left.clone()]).unwrap();
+            let expected_right = mono[1].process_block(&[right.clone()]).unwrap();
+            let owned = vec![left, right];
+            let outer_ptr = owned.as_ptr();
+            let channel_ptrs = [owned[0].as_ptr(), owned[1].as_ptr()];
+            let actual = stereo.process_owned_block(owned).unwrap();
+            assert_eq!(actual.as_ptr(), outer_ptr);
+            assert_eq!(actual[0].as_ptr(), channel_ptrs[0]);
+            assert_eq!(actual[1].as_ptr(), channel_ptrs[1]);
+            assert_eq!(actual[0], expected_left[0]);
+            assert_eq!(actual[1], expected_right[0]);
+            stereo_output[0].extend_from_slice(&actual[0]);
+            stereo_output[1].extend_from_slice(&actual[1]);
+        }
+        let tail = stereo.finish().unwrap();
+        let mono_tail = [mono[0].finish().unwrap(), mono[1].finish().unwrap()];
+        for channel in 0..2 {
+            assert_eq!(tail[channel], mono_tail[channel][0]);
+            stereo_output[channel].extend_from_slice(&tail[channel]);
+        }
+        assert_eq!(stereo_output[0].len(), 8 * HOP_SIZE);
+        assert_eq!(stereo_output[1].len(), 8 * HOP_SIZE);
+        assert!(stereo_output[0].iter().any(|sample| sample.abs() > 1e-4));
+
+        stereo.reset();
+        mono[0].reset();
+        mono[1].reset();
+        let left = vec![0.125; HOP_SIZE];
+        let right = vec![-0.125; HOP_SIZE];
+        let expected_left = mono[0].process_block(&[left.clone()]).unwrap();
+        let expected_right = mono[1].process_block(&[right.clone()]).unwrap();
+        let actual = stereo.process_owned_block(vec![left, right]).unwrap();
+        assert_eq!(actual[0], expected_left[0]);
+        assert_eq!(actual[1], expected_right[0]);
+        assert_eq!(stereo.finish().unwrap().len(), 2);
+    }
+
     fn write_identity_model() -> (tempfile::TempDir, std::path::PathBuf) {
+        write_scaled_model(1.0)
+    }
+
+    fn write_scaled_model(scale: f32) -> (tempfile::TempDir, std::path::PathBuf) {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("dpdfnet-identity.onnx");
+        let path = directory.path().join("dpdfnet-scaled.onnx");
         let mut bytes = Vec::new();
-        identity_model().encode(&mut bytes).unwrap();
+        scaled_model(scale).encode(&mut bytes).unwrap();
         std::fs::write(&path, bytes).unwrap();
         (directory, path)
     }
 
-    fn identity_model() -> ModelProto {
+    fn scaled_model(scale: f32) -> ModelProto {
         let shapes: [(&str, &str, &[i64]); 2] = [
             ("spectrum", "enhanced", &[1, 1, BINS as i64, 2]),
             ("state", "state_out", &[DPDFNET2_STATE_SIZE as i64]),
@@ -1297,17 +1789,39 @@ mod tests {
             }],
             producer_name: "denoize-test".into(),
             graph: Some(GraphProto {
-                name: "dpdfnet-identity".into(),
-                node: shapes
-                    .iter()
-                    .map(|(input, output, _)| NodeProto {
-                        input: vec![(*input).into()],
-                        output: vec![(*output).into()],
-                        name: format!("{input}_identity"),
+                name: "dpdfnet-scaled".into(),
+                node: vec![
+                    NodeProto {
+                        input: vec!["spectrum".into(), "scale".into()],
+                        output: vec!["enhanced".into()],
+                        name: "spectrum_scale".into(),
+                        op_type: "Mul".into(),
+                        ..Default::default()
+                    },
+                    NodeProto {
+                        output: vec!["state_out".into()],
+                        name: "state_identity".into(),
+                        input: vec!["state".into()],
                         op_type: "Identity".into(),
                         ..Default::default()
-                    })
-                    .collect(),
+                    },
+                    NodeProto {
+                        output: vec!["scale".into()],
+                        name: "scale_constant".into(),
+                        op_type: "Constant".into(),
+                        attribute: vec![AttributeProto {
+                            name: "value".into(),
+                            r#type: attribute_proto::AttributeType::Tensor as i32,
+                            t: Some(TensorProto {
+                                data_type: tensor_proto::DataType::Float as i32,
+                                float_data: vec![scale],
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                ],
                 input: shapes
                     .iter()
                     .map(|(input, _, shape)| value_info(input, shape))

@@ -136,6 +136,8 @@ mossformer2 = ["onnx", "dep:rustfft", "dep:kaldi-native-fbank"]
 sgmse = ["onnx", "dep:rustfft"]
 gtcrn = ["onnx", "dep:rustfft"]
 dpdfnet = ["onnx", "dep:rustfft"]
+# A/B comparison in unit-test executables only; never changes a shipped allocator.
+diagnostic-mimalloc = []
 accelerators = ["onnx", "dep:tract-metal", "dep:metal", "dep:tract-cuda", "dep:cudarc"]
 visqol = ["dep:audio_samples", "dep:audio_samples_qoe", "dep:ndarray"]
 m4a-encode = ["dep:oxideav-aac-encoder"]
@@ -144,6 +146,8 @@ fdk-aac-encoder = ["m4a-encode", "dep:fdk-aac-rust"]
 full = ["rnnoise", "deepfilter", "onnx", "aec", "mpsenet", "bsrnn", "mossformer2", "sgmse", "gtcrn", "dpdfnet", "accelerators", "m4a-encode", "visqol", "live"]
 
 [dev-dependencies]
+libmimalloc-sys = { version = "=0.1.49", default-features = false }
+mimalloc = { version = "=0.1.52", default-features = false }
 minisign = "0.9.1"
 prost = "0.14"
 

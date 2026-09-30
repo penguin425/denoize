@@ -1,0 +1,288 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-dpdfnet-worker-run-v2.schema.json",
+  "title": "denoize DPDFNet paced independent stereo worker runs v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "source_commit",
+    "model_id",
+    "model_sha256",
+    "plugin_id",
+    "sample_rate_hz",
+    "channels",
+    "channel_mode",
+    "chunk_frames",
+    "latency_frames",
+    "runs",
+    "environment"
+  ],
+  "properties": {
+    "schema": {
+      "const": "denoize-dpdfnet-worker-run-v2"
+    },
+    "schema_version": {
+      "const": 2
+    },
+    "source_commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "model_id": {
+      "const": "dpdfnet2-48khz-hr"
+    },
+    "model_sha256": {
+      "const": "7f0575a5cec0ba4ffd8f8bd657e06d007e4ccdd955d76faab922b9d3291dc14b"
+    },
+    "plugin_id": {
+      "const": "org.penguin425.denoize.neural-hq"
+    },
+    "sample_rate_hz": {
+      "const": 48000
+    },
+    "channels": {
+      "const": 2
+    },
+    "channel_mode": {
+      "const": "independent"
+    },
+    "chunk_frames": {
+      "const": 480
+    },
+    "latency_frames": {
+      "const": 11520
+    },
+    "runs": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": {
+        "$ref": "#/$defs/run"
+      }
+    },
+    "environment": {
+      "$ref": "#/$defs/environment"
+    }
+  },
+  "$defs": {
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "callback_frames",
+        "callback_calls",
+        "paced_blocks",
+        "measured_frames",
+        "finite_frames",
+        "neural_frames_per_channel",
+        "measurement_wall_seconds",
+        "metrics",
+        "queues_after_run"
+      ],
+      "properties": {
+        "callback_frames": {
+          "enum": [
+            144,
+            480,
+            1024
+          ]
+        },
+        "callback_calls": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100000000
+        },
+        "paced_blocks": {
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 10000000
+        },
+        "measured_frames": {
+          "type": "integer",
+          "minimum": 12000,
+          "maximum": 4800000000
+        },
+        "finite_frames": {
+          "type": "integer",
+          "minimum": 12000,
+          "maximum": 4800000000
+        },
+        "neural_frames_per_channel": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "prefixItems": [
+            {
+              "type": "integer",
+              "minimum": 480,
+              "maximum": 4800000000
+            },
+            {
+              "type": "integer",
+              "minimum": 480,
+              "maximum": 4800000000
+            }
+          ],
+          "items": false
+        },
+        "measurement_wall_seconds": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 1000000
+        },
+        "metrics": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "overload_blocks",
+            "late_blocks",
+            "invalid_blocks",
+            "worker_errors"
+          ],
+          "properties": {
+            "overload_blocks": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "late_blocks": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "invalid_blocks": {
+              "const": 0
+            },
+            "worker_errors": {
+              "const": 0
+            }
+          }
+        },
+        "queues_after_run": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "input",
+            "output",
+            "ready"
+          ],
+          "properties": {
+            "input": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 56
+            },
+            "output": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 56
+            },
+            "ready": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 56
+            }
+          }
+        }
+      }
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "os",
+        "arch",
+        "logical_parallelism",
+        "target",
+        "cpu_model",
+        "hardware_tier",
+        "runner_label"
+      ],
+      "properties": {
+        "os": {
+          "enum": [
+            "linux",
+            "macos",
+            "windows"
+          ]
+        },
+        "arch": {
+          "enum": [
+            "x86_64",
+            "aarch64"
+          ]
+        },
+        "logical_parallelism": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1024
+        },
+        "target": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.-]{3,128}$"
+        },
+        "cpu_model": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "hardware_tier": {
+          "enum": [
+            "portable-ci",
+            "lowest-supported"
+          ]
+        },
+        "runner_label": {
+          "enum": [
+            "ubuntu-24.04",
+            "macos-14",
+            "macos-15",
+            "windows-2025",
+            "ubuntu-slim"
+          ]
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "environment": {
+            "properties": {
+              "hardware_tier": {
+                "const": "portable-ci"
+              }
+            },
+            "required": [
+              "hardware_tier"
+            ]
+          }
+        },
+        "required": [
+          "environment"
+        ]
+      },
+      "then": {
+        "properties": {
+          "runs": {
+            "items": {
+              "properties": {
+                "metrics": {
+                  "properties": {
+                    "overload_blocks": {
+                      "const": 0
+                    },
+                    "late_blocks": {
+                      "const": 0
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

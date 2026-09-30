@@ -80,7 +80,7 @@ def generate(args: argparse.Namespace) -> bool:
     worker, worker_payload = load(args.worker, "worker run")
     if stress.get("schema") != "denoize-dpdfnet-gtcrn-stress-v1":
         raise EvidenceError("unsupported stress-run schema")
-    if stress.get("model") != "dpdfnet2_48khz_stereo_linked_daw_path":
+    if stress.get("model") != "dpdfnet2_48khz_stereo_independent_daw_path":
         raise EvidenceError("stress run did not exercise the production DPDFNet DAW path")
     if stress.get("model_file_sha256") != MODEL_SHA256 or stress.get("state_size") != 56_436:
         raise EvidenceError("stress run did not bind the pinned DPDFNet-2 model")
@@ -242,7 +242,7 @@ def generate(args: argparse.Namespace) -> bool:
     if any(item.get("exact_length") is not True or item.get("all_finite") is not True for item in finite_geometry):
         raise EvidenceError("one or more sample-rate robustness probes failed")
 
-    if worker.get("schema") != "denoize-dpdfnet-worker-run-v1" or worker.get("schema_version") != 1:
+    if worker.get("schema") != "denoize-dpdfnet-worker-run-v2" or worker.get("schema_version") != 2:
         raise EvidenceError("unsupported paced-worker schema")
     if worker.get("source_commit") != source_commit:
         raise EvidenceError("stress and worker evidence bind different commits")
@@ -252,8 +252,11 @@ def generate(args: argparse.Namespace) -> bool:
         or worker.get("plugin_id") != "org.penguin425.denoize.neural-hq"
     ):
         raise EvidenceError("worker run did not bind the pinned DPDFNet model")
-    if worker.get("sample_rate_hz") != 48_000 or worker.get("channels") != 1:
-        raise EvidenceError("worker run did not exercise the 48 kHz mono gate geometry")
+    for field, expected in (("sample_rate_hz", 48_000), ("channels", 2), ("chunk_frames", 480), ("latency_frames", 11_520)):
+        if isinstance(worker.get(field), bool) or not isinstance(worker.get(field), int) or worker.get(field) != expected:
+            raise EvidenceError(f"worker {field} must be integer {expected}")
+    if worker.get("channel_mode") != "independent":
+        raise EvidenceError("worker run did not exercise the 48 kHz independent stereo gate geometry")
     worker_environment = worker.get("environment")
     if not isinstance(worker_environment, dict) or worker_environment.get("os") != operating_system:
         raise EvidenceError("stress and worker evidence bind different operating systems")
@@ -270,53 +273,49 @@ def generate(args: argparse.Namespace) -> bool:
             raise EvidenceError(
                 f"stress and worker evidence bind different {name} values"
             )
-    metrics = worker.get("metrics")
-    if not isinstance(metrics, dict):
-        raise EvidenceError("worker run lacks metrics")
-    metric_values = {
-        name: integer(metrics.get(name), f"worker {name}")
-        for name in (
-            "overload_blocks",
-            "late_blocks",
-            "invalid_blocks",
-            "worker_errors",
-        )
-    }
-    scheduling_metric_total = (
-        metric_values["overload_blocks"] + metric_values["late_blocks"]
-    )
-    processing_metric_total = (
-        metric_values["invalid_blocks"] + metric_values["worker_errors"]
-    )
-    metric_total = scheduling_metric_total + processing_metric_total
-    paced_blocks = integer(worker.get("paced_blocks"), "paced_blocks")
-    measured_frames = integer(worker.get("measured_frames"), "measured_frames")
-    finite_frames = integer(worker.get("finite_frames"), "finite_frames")
-    neural_frames = integer(worker.get("neural_frames"), "neural_frames")
-    chunk_frames = integer(worker.get("chunk_frames"), "worker chunk_frames")
-    latency_frames = integer(worker.get("latency_frames"), "worker latency_frames")
-    if chunk_frames != 480 or latency_frames != 11_520:
-        raise EvidenceError("worker run did not exercise the fixed 24x10 ms scheduler")
-    worker_wall_seconds = number(
-        worker.get("measurement_wall_seconds"), "worker measurement_wall_seconds"
-    )
-    expected_worker_frames = latency_frames + paced_blocks * chunk_frames
-    if measured_frames != expected_worker_frames:
-        raise EvidenceError("paced worker frame accounting is inconsistent")
-    expected_worker_wall_seconds = expected_worker_frames / 48_000
-    minimum_worker_wall_seconds = expected_worker_wall_seconds * WORKER_WALL_LOWER_RATIO
-    maximum_worker_wall_seconds = (
-        expected_worker_wall_seconds * WORKER_WALL_UPPER_RATIO
-        + WORKER_WALL_UPPER_SLACK_SECONDS
-    )
-    if worker_wall_seconds < minimum_worker_wall_seconds:
-        raise EvidenceError(
-            "paced worker completed too quickly to represent its absolute real-time schedule"
-        )
-    if worker_wall_seconds > maximum_worker_wall_seconds:
-        raise EvidenceError(
-            "paced worker completed too slowly to represent its absolute real-time schedule"
-        )
+    runs = worker.get("runs")
+    if not isinstance(runs, list) or len(runs) != 3 or sorted(run.get("callback_frames") for run in runs if isinstance(run, dict)) != [144, 480, 1024]:
+        raise EvidenceError("worker run must contain exactly one 144, 480, and 1024-frame run")
+    aggregate_neural = [0, 0]
+    aggregate_scheduling = aggregate_processing = aggregate_total = 0
+    paced_blocks = None
+    for run in runs:
+        callback_frames = integer(run.get("callback_frames"), "worker callback_frames")
+        callback_calls = integer(run.get("callback_calls"), "worker callback_calls")
+        paced = integer(run.get("paced_blocks"), "worker paced_blocks")
+        measured = integer(run.get("measured_frames"), "worker measured_frames")
+        finite_count = integer(run.get("finite_frames"), "worker finite_frames")
+        neural = run.get("neural_frames_per_channel")
+        if not isinstance(neural, list) or len(neural) != 2:
+            raise EvidenceError("worker run lacks two per-channel neural frame counts")
+        neural = [integer(value, "worker neural_frames_per_channel") for value in neural]
+        if measured != callback_calls * callback_frames or measured != math.ceil((11_520 + paced * 480) / callback_frames) * callback_frames:
+            raise EvidenceError("paced worker frame accounting is inconsistent")
+        if finite_count != measured or any(value < 480 or value > measured - 11_520 for value in neural):
+            raise EvidenceError("worker finite or per-channel neural frame gate failed")
+        expected_wall = measured / 48_000
+        actual_wall = number(run.get("measurement_wall_seconds"), "worker measurement_wall_seconds")
+        if actual_wall < expected_wall * WORKER_WALL_LOWER_RATIO or actual_wall > expected_wall * WORKER_WALL_UPPER_RATIO + WORKER_WALL_UPPER_SLACK_SECONDS:
+            raise EvidenceError("paced worker wall time does not represent its real-time schedule")
+        metrics = run.get("metrics")
+        if not isinstance(metrics, dict):
+            raise EvidenceError("worker run lacks metrics")
+        values = {name: integer(metrics.get(name), f"worker {name}") for name in ("overload_blocks", "late_blocks", "invalid_blocks", "worker_errors")}
+        if any(value < 0 or value > 9_007_199_254_740_991 for value in values.values()):
+            raise EvidenceError("worker metric counters must be non-negative safe integers")
+        queues = run.get("queues_after_run")
+        if not isinstance(queues, dict):
+            raise EvidenceError("worker run lacks queues_after_run")
+        for queue_name in ("input", "output", "ready"):
+            queue_value = queues.get(queue_name)
+            if isinstance(queue_value, bool) or not isinstance(queue_value, int) or not 0 <= queue_value <= 56:
+                raise EvidenceError(f"worker queue {queue_name} must be an integer in 0..56")
+        scheduling = values["overload_blocks"] + values["late_blocks"]
+        processing = values["invalid_blocks"] + values["worker_errors"]
+        aggregate_scheduling += scheduling; aggregate_processing += processing; aggregate_total += scheduling + processing
+        paced_blocks = paced if paced_blocks is None else min(paced_blocks, paced)
+        # The aggregate gate reports the weakest channel across geometries.
+        aggregate_neural = [min(aggregate_neural[index], neural[index]) for index in range(2)] if any(aggregate_neural) else neural
     # The released CLAP path exposes a 24-chunk/240 ms buffered worker
     # contract, not each synchronous 10 ms model invocation as a host
     # deadline. Retain the direct-call distribution as capacity diagnostics,
@@ -341,17 +340,18 @@ def generate(args: argparse.Namespace) -> bool:
                 if wall_clock_worker_gate_eligible
                 else "worker-processing-errors"
             ),
-            metric_total if wall_clock_worker_gate_eligible else processing_metric_total,
+            aggregate_total if wall_clock_worker_gate_eligible else aggregate_processing,
             "less-or-equal",
             0,
         ),
-        check("worker-finite-frames", finite_frames, "greater-or-equal", measured_frames),
-        check("worker-neural-frames", neural_frames, "greater-or-equal", 480),
+        check("worker-stereo-finite-frames", 1, "greater-or-equal", 1),
+        check("worker-independent-stereo", 1, "greater-or-equal", 1),
+        check("worker-neural-frames-per-channel", min(aggregate_neural), "greater-or-equal", 480),
     ]
     accepted = all(item["passed"] for item in checks)
     document = {
-        "schema": "denoize-dpdfnet-platform-evidence-v2",
-        "schema_version": 2,
+        "schema": "denoize-dpdfnet-platform-evidence-v3",
+        "schema_version": 3,
         "source_commit": source_commit,
         "model_id": "dpdfnet2-48khz-hr",
         "model_sha256": MODEL_SHA256,
@@ -386,11 +386,14 @@ def generate(args: argparse.Namespace) -> bool:
             "wall_deadline_misses": wall_calls_over_budget,
             "wall_summed_compute_rtf": wall_summed_rtf,
             "peak_rss_bytes": peak_rss,
+            "worker_channels": 2,
+            "worker_channel_mode": "independent",
+            "worker_callback_frames": [144, 480, 1024],
+            "worker_neural_frames_per_channel": aggregate_neural,
             "paced_worker_blocks": paced_blocks,
-            "worker_neural_frames": neural_frames,
-            "worker_error_counter_total": metric_total,
-            "worker_scheduling_counter_total": scheduling_metric_total,
-            "worker_processing_error_count": processing_metric_total,
+            "worker_error_counter_total": aggregate_total,
+            "worker_scheduling_counter_total": aggregate_scheduling,
+            "worker_processing_error_count": aggregate_processing,
         },
         "checks": checks,
         "accepted": accepted,

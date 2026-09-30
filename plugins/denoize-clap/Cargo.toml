@@ -29,12 +29,23 @@ crossbeam-queue = "0.3.12"
 denoize-plugin-editor = { path = "../denoize-plugin-editor" }
 serde_json = "1.0"
 
+[dev-dependencies]
+libc = "0.2"
+libmimalloc-sys = { version = "=0.1.49", default-features = false }
+mimalloc = { version = "=0.1.52", default-features = false }
+sha2 = "0.10.9"
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
 [features]
 default = []
 # DPDFNet HQ is deliberately absent from normal release-format builds until
 # the Windows/REAPER, listening, and lower-tier hardware gates are complete.
 # This opt-in builds the third descriptor for direct experimental CLAP use.
 experimental-dpdfnet-hq = ["denoize/dpdfnet"]
+# A/B comparison in the unit-test executable, not the distributable plugin.
+diagnostic-mimalloc = []
 
 [lints.rust]
 unsafe_code = "deny"

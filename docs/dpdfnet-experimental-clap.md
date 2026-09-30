@@ -7,6 +7,16 @@ It adds one CLAP-only plug-in, `denoize Neural HQ`
 `dpdfnet2-48khz-hr` model. VST3, AUv3, and LV2 are not expanded by this
 experiment, and `denoize Neural` continues to use GTCRN.
 
+HQ stereo processing enhances left and right independently, sharing the model
+graph but keeping separate recurrent and overlap-add state. Both channels,
+including anti-phase side noise, pass through the model. This replaces the
+mid-only stereo-linked behavior of previews 1–3, which preserved the side
+signal unchanged. Existing HQ sessions therefore have a changed stereo audio
+result; the saved-state format, channel count, 240 ms latency, and fallback
+policy are unchanged. Independent nonlinear enhancement does not guarantee
+bit-exact stereo width or correlation preservation. GTCRN's stereo-linked
+behavior is unchanged.
+
 ## Run it
 
 1. Verify the archive with `gh attestation verify ARCHIVE --repo penguin425/denoize`.
