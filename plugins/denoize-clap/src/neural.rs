@@ -3660,6 +3660,48 @@ mod tests {
                 "worker_errors": metrics.worker_errors,
             })
         };
+        // Keep nested row macros separate from the document macro so adding
+        // diagnostic metadata does not exhaust serde_json's recursion budget.
+        let cycles_json = trace
+            .cycles
+            .iter()
+            .map(|cycle| {
+                serde_json::json!({
+                    "input_pop_ns": cycle.input_pop_ns,
+                    "generation": cycle.generation,
+                    "start_frame": cycle.start_frame,
+                    "next_expected": cycle.next_expected,
+                    "input_len_before": cycle.input_len_before,
+                    "output_len_before": cycle.output_len_before,
+                    "pending_len_before": cycle.pending_len_before,
+                    "completed_len_before": cycle.completed_len_before,
+                    "ready_frames_before": cycle.ready_frames_before,
+                    "reset_reason": cycle.reset_reason,
+                    "missing_input_frames": cycle.missing_input_frames,
+                    "reset": phase_json(cycle.reset),
+                    "copy": phase_json(cycle.copy),
+                    "processor": phase_json(cycle.processor),
+                    "assembly": phase_json(cycle.assembly),
+                    "cycle_end_ns": cycle.cycle_end_ns,
+                    "pending_len_after": cycle.pending_len_after,
+                    "completed_len_after": cycle.completed_len_after,
+                    "ready_frames_after": cycle.ready_frames_after,
+                    "returned_frames": cycle.returned_frames,
+                })
+            })
+            .collect::<Vec<_>>();
+        let callbacks_json = callbacks.iter().map(|(frame, start, end, before, after, input_before, input_after)| {
+            serde_json::json!({
+                "start_frame": frame,
+                "scheduled_ns": measurement_start_ns + (*frame as u64 * 1_000_000_000 / 48_000),
+                "started_ns": start,
+                "finished_ns": end,
+                "metrics_before": metrics_json(*before),
+                "metrics_after": metrics_json(*after),
+                "input_queue_before": input_before,
+                "input_queue_after": input_after,
+            })
+        }).collect::<Vec<_>>();
         let document = serde_json::json!({
             "schema": "denoize-dpdfnet-worker-profile-diagnostic-v1",
             "diagnostic_only": true,
@@ -3685,40 +3727,8 @@ mod tests {
             "finite_frames": finite_frames,
             "neural_frames_per_channel": neural_frames,
             "metrics": metrics_json(shared.worker_metrics()),
-            "cycles": trace.cycles.iter().map(|cycle| serde_json::json!({
-                "input_pop_ns": cycle.input_pop_ns,
-                "generation": cycle.generation,
-                "start_frame": cycle.start_frame,
-                "next_expected": cycle.next_expected,
-                "input_len_before": cycle.input_len_before,
-                "output_len_before": cycle.output_len_before,
-                "pending_len_before": cycle.pending_len_before,
-                "completed_len_before": cycle.completed_len_before,
-                "ready_frames_before": cycle.ready_frames_before,
-                "reset_reason": cycle.reset_reason,
-                "missing_input_frames": cycle.missing_input_frames,
-                "reset": phase_json(cycle.reset),
-                "copy": phase_json(cycle.copy),
-                "processor": phase_json(cycle.processor),
-                "assembly": phase_json(cycle.assembly),
-                "cycle_end_ns": cycle.cycle_end_ns,
-                "pending_len_after": cycle.pending_len_after,
-                "completed_len_after": cycle.completed_len_after,
-                "ready_frames_after": cycle.ready_frames_after,
-                "returned_frames": cycle.returned_frames,
-            })).collect::<Vec<_>>(),
-            "callbacks": callbacks.iter().map(|(frame, start, end, before, after, input_before, input_after)| {
-                serde_json::json!({
-                    "start_frame": frame,
-                    "scheduled_ns": measurement_start_ns + (*frame as u64 * 1_000_000_000 / 48_000),
-                    "started_ns": start,
-                    "finished_ns": end,
-                    "metrics_before": metrics_json(*before),
-                    "metrics_after": metrics_json(*after),
-                    "input_queue_before": input_before,
-                    "input_queue_after": input_after,
-                })
-            }).collect::<Vec<_>>(),
+            "cycles": cycles_json,
+            "callbacks": callbacks_json,
             "dropped_cycles": trace.dropped_cycles,
             "dropped_callbacks": dropped_callbacks,
             "cpu_clock_failures": trace.cpu_clock_failures,
